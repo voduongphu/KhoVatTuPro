@@ -1,0 +1,8 @@
+{
+  "name": "Hệ Thống Quản Lý Nhập Xuất Tồn Vật Tư Thiết Bị",
+  "description": "Ứng dụng chuyên sâu quản trị kho, theo dõi nhập - xuất - tồn vật tư, thiết bị kỹ thuật với bộ lọc đa điều kiện thông minh, cảnh báo định mức và báo cáo thẻ kho.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
