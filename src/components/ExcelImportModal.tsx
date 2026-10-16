@@ -265,30 +265,11 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
             i => i.code.toLowerCase() === itemCode.toLowerCase()
           );
 
-          // Extract additional optional item info if introducing new item in Goods Receipt
-          const rawItemName = getCleanVal(
-            row,
-            'Tên Vật Tư / Thiết Bị',
-            'Tên Vật Tư',
-            'Tên Hàng',
-            'Tên',
-            'Item Name',
-            'Name',
-            'ten_vt'
-          );
-          const rawUnit = getCleanVal(row, 'Đơn Vị Tính', 'ĐVT', 'Unit', 'don_vi_tinh') || 'Cái';
-          const rawCat = getCleanVal(row, 'Danh Mục', 'Nhóm Ngành', 'Category', 'danh_muc') || 'Cơ điện & Vật tư công trình';
-          const rawLoc = getCleanVal(row, 'Vị Trí Kệ', 'Vị Trí', 'Location', 'vi_tri') || 'Khu vực tiếp nhận';
-
-          const isNewItem = !matchedItem && type === 'NHAP_KHO';
-
           const errors: string[] = [];
           if (!itemCode) {
             errors.push(`Dòng ${idx + 2}: Thiếu mã SKU vật tư`);
           } else if (!matchedItem) {
-            if (type !== 'NHAP_KHO') {
-              errors.push(`Dòng ${idx + 2}: Không tìm thấy mã SKU "${itemCode}" trong kho để xuất`);
-            }
+            errors.push(`Dòng ${idx + 2}: Không tìm thấy mã SKU "${itemCode}" trong kho`);
           }
 
           if (qty <= 0) {
@@ -311,16 +292,13 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
           const lineItem: TransactionLineItem = {
             itemId: matchedItem?.id || '',
             itemCode: itemCode || 'CHƯA_RÕ',
-            itemName: matchedItem?.name || String(rawItemName || itemCode),
-            unit: matchedItem?.unit || String(rawUnit),
+            itemName: matchedItem?.name || 'Vật tư chưa xác định',
+            unit: matchedItem?.unit || 'Cái',
             quantity: qty,
             unitPrice,
             amount: qty * unitPrice,
             serialNumber: serial,
             note,
-            isNewItem,
-            category: String(rawCat),
-            location: String(rawLoc),
           };
 
           if (groupedMap.has(groupKey)) {

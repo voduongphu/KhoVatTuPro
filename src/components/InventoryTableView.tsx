@@ -12,7 +12,6 @@ import {
   CheckSquare,
   Square,
   X,
-  FileSpreadsheet,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
 import { InventoryItem } from '../types/inventory';
@@ -34,7 +33,6 @@ interface InventoryTableViewProps {
   onEditItem: (item: InventoryItem) => void;
   onOpenCreateItem: () => void;
   onQuickGoodsIn: (item: InventoryItem) => void;
-  onOpenImportItems?: () => void;
 }
 
 export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
@@ -42,7 +40,6 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
   onEditItem,
   onOpenCreateItem,
   onQuickGoodsIn,
-  onOpenImportItems,
 }) => {
   const {
     filteredItems,
@@ -180,25 +177,13 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
           </button>
 
           {canManage && (
-            <>
-              <button
-                type="button"
-                onClick={onOpenImportItems}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-colors whitespace-nowrap shadow-2xs"
-                title="Import danh mục vật tư từ file Excel (.xlsx / .csv)"
-              >
-                <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Import Excel</span>
-              </button>
-
-              <button
-                onClick={onOpenCreateItem}
-                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors shadow-sm whitespace-nowrap"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Thêm vật tư / TB</span>
-              </button>
-            </>
+            <button
+              onClick={onOpenCreateItem}
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors shadow-sm whitespace-nowrap"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Thêm vật tư / TB</span>
+            </button>
           )}
         </div>
       </div>

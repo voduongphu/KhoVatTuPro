@@ -61,10 +61,6 @@ interface InventoryContextType {
   updateItem: (id: string, updates: Partial<InventoryItem>) => void;
   deleteItem: (id: string) => void;
   deleteItemsBatch: (ids: string[]) => { success: boolean; count: number };
-  importItemsBatch: (
-    itemsList: Omit<InventoryItem, 'id' | 'updatedAt'>[],
-    updateExisting?: boolean
-  ) => { success: boolean; addedCount: number; updatedCount: number; errors: string[] };
 
   // CRUD Transactions
   createTransaction: (data: Omit<Transaction, 'id' | 'code'>) => {
@@ -649,13 +645,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setItems(prev => {
       const updated = [...prev];
       for (const line of data.items) {
-        // Find existing item by id or SKU code (case-insensitive)
-        let idx = updated.findIndex(
-          i =>
-            (line.itemId && i.id === line.itemId) ||
-            (line.itemCode && i.code.trim().toLowerCase() === line.itemCode.trim().toLowerCase())
-        );
-
+        const idx = updated.findIndex(i => i.id === line.itemId);
         if (idx !== -1) {
           const item = updated[idx];
           const qtyDelta = data.type === 'NHAP_KHO' ? line.quantity : -line.quantity;
@@ -678,36 +668,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             currentStock: newStock,
             unitPrice,
             condition,
-            supplierDefault:
-              item.supplierDefault || (data.type === 'NHAP_KHO' && data.partnerName ? data.partnerName : item.supplierDefault),
             updatedAt: new Date().toISOString().replace('T', ' ').substring(0, 16),
           };
-          line.itemId = item.id;
-        } else if (data.type === 'NHAP_KHO') {
-          // Tự động thêm vật tư mới vào danh mục vật tư khi lập phiếu nhập kho
-          const newItemId = `ITEM-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-          line.itemId = newItemId;
-          const cleanCode = (line.itemCode || `VT-${Date.now().toString().slice(-4)}`).trim().toUpperCase();
-          const newItem: InventoryItem = {
-            id: newItemId,
-            code: cleanCode,
-            name: (line.itemName || 'Vật tư nhập mới').trim(),
-            type: line.type || 'VAT_TU',
-            category: (line.category || 'Vật tư nhập mới').trim(),
-            unit: (line.unit || 'Cái').trim(),
-            warehouseId: data.warehouseId,
-            location: (line.location || 'Khu vực tiếp nhận').trim(),
-            minStock: line.minStock !== undefined && line.minStock >= 0 ? line.minStock : 5,
-            maxStock: line.maxStock !== undefined && line.maxStock > 0 ? line.maxStock : 200,
-            currentStock: Math.max(0, line.quantity),
-            unitPrice: Math.max(0, line.unitPrice || 0),
-            serialOrLot: (line.serialNumber || '').trim(),
-            condition: line.condition || 'SAN_SANG',
-            supplierDefault: data.partnerName.trim(),
-            spec: (line.spec || '').trim(),
-            updatedAt: new Date().toISOString().replace('T', ' ').substring(0, 16),
-          };
-          updated.unshift(newItem);
         }
       }
       return updated;
@@ -802,64 +764,6 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     };
   };
 
-  // Batch Import Items / Materials Catalog
-  const importItemsBatch = (
-    itemsList: Omit<InventoryItem, 'id' | 'updatedAt'>[],
-    updateExisting: boolean = true
-  ): { success: boolean; addedCount: number; updatedCount: number; errors: string[] } => {
-    let addedCount = 0;
-    let updatedCount = 0;
-    const errors: string[] = [];
-
-    setItems(prev => {
-      const updated = [...prev];
-      const now = new Date().toISOString().replace('T', ' ').substring(0, 16);
-
-      for (let i = 0; i < itemsList.length; i++) {
-        const row = itemsList[i];
-        if (!row.code || !row.name) {
-          errors.push(`Dòng ${i + 1}: Thiếu mã SKU hoặc tên vật tư.`);
-          continue;
-        }
-
-        const cleanCode = row.code.trim().toUpperCase();
-        const existingIdx = updated.findIndex(
-          it => it.code.trim().toUpperCase() === cleanCode
-        );
-
-        if (existingIdx !== -1) {
-          if (updateExisting) {
-            updated[existingIdx] = {
-              ...updated[existingIdx],
-              ...row,
-              code: cleanCode,
-              updatedAt: now,
-            };
-            updatedCount++;
-          }
-        } else {
-          const newItem: InventoryItem = {
-            ...row,
-            code: cleanCode,
-            id: `ITEM-${Date.now()}-${i}`,
-            updatedAt: now,
-          };
-          updated.unshift(newItem);
-          addedCount++;
-        }
-      }
-
-      return updated;
-    });
-
-    return {
-      success: addedCount > 0 || updatedCount > 0,
-      addedCount,
-      updatedCount,
-      errors,
-    };
-  };
-
   // Generate Chronological Stock Ledger for an Item
   const getItemLedger = (itemId: string): StockLedgerEntry[] => {
     const sorted = [...transactions].sort(
@@ -937,7 +841,6 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         updateItem,
         deleteItem,
         deleteItemsBatch,
-        importItemsBatch,
         createTransaction,
         updateTransaction,
         deleteTransaction,
