@@ -6,7 +6,6 @@ import {
   PackageMinus,
   AlertTriangle,
   Users,
-  FileSpreadsheet,
   Plus,
   LogOut,
   RotateCcw,
@@ -32,7 +31,7 @@ interface HeaderProps {
   setActiveTab: (tab: ActiveTabType) => void;
   onOpenCreateItem: () => void;
   onOpenCreateTransaction: (type: 'NHAP_KHO' | 'XUAT_KHO') => void;
-  onOpenImportExcel: () => void;
+  onOpenImportExcel?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -40,7 +39,6 @@ export const Header: React.FC<HeaderProps> = ({
   setActiveTab,
   onOpenCreateItem,
   onOpenCreateTransaction,
-  onOpenImportExcel,
 }) => {
   const {
     items,
@@ -284,17 +282,6 @@ export const Header: React.FC<HeaderProps> = ({
 
             {canManage && (
               <>
-                {/* Excel Import button */}
-                <button
-                  type="button"
-                  onClick={onOpenImportExcel}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-colors whitespace-nowrap shadow-2xs"
-                  title="Import phiếu từ file Excel (.xlsx / .csv)"
-                >
-                  <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
-                  <span className="hidden sm:inline">Import Excel</span>
-                </button>
-
                 {/* Create Dropdown / Quick Create */}
                 <div className="relative">
                   <button

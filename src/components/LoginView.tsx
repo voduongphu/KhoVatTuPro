@@ -5,10 +5,7 @@ import {
   User as UserIcon,
   Eye,
   EyeOff,
-  ShieldCheck,
-  CheckCircle2,
   AlertCircle,
-  KeyRound,
   ArrowRight,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
@@ -33,12 +30,6 @@ export const LoginView: React.FC = () => {
         setError(res.error || 'Đăng nhập không thành công.');
       }
     }, 200);
-  };
-
-  const handleQuickFill = (u: string, p: string) => {
-    setUsername(u);
-    setPassword(p);
-    setError('');
   };
 
   return (
@@ -127,86 +118,6 @@ export const LoginView: React.FC = () => {
               </button>
             </div>
           </form>
-
-          {/* Quick Demo Switcher */}
-          <div className="mt-6 pt-6 border-t border-slate-700/60">
-            <p className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3 text-center">
-              Chọn tài khoản thử nghiệm nhanh (Role Demo):
-            </p>
-            <div className="space-y-2">
-              {/* Admin */}
-              <button
-                type="button"
-                onClick={() => handleQuickFill('admin', 'admin123')}
-                className={`w-full text-left p-2.5 rounded-xl border transition-all text-xs flex items-center justify-between ${
-                  username === 'admin'
-                    ? 'bg-indigo-950/60 border-indigo-500/60 text-white'
-                    : 'bg-slate-900/60 border-slate-700/60 text-slate-300 hover:bg-slate-900'
-                }`}
-              >
-                <div>
-                  <div className="font-semibold text-indigo-300 flex items-center gap-1.5">
-                    <ShieldCheck className="w-3.5 h-3.5" />
-                    <span>admin (Quản trị viên)</span>
-                  </div>
-                  <div className="text-[11px] text-slate-400 mt-0.5">
-                    Toàn quyền: Thêm/Sửa/Xóa Phiếu Nhập Xuất, Quản lý User
-                  </div>
-                </div>
-                <span className="font-mono text-[11px] text-slate-400 bg-slate-800 px-2 py-0.5 rounded">
-                  admin123
-                </span>
-              </button>
-
-              {/* Thủ kho */}
-              <button
-                type="button"
-                onClick={() => handleQuickFill('thukho_hn', 'thukho123')}
-                className={`w-full text-left p-2.5 rounded-xl border transition-all text-xs flex items-center justify-between ${
-                  username === 'thukho_hn'
-                    ? 'bg-emerald-950/60 border-emerald-500/60 text-white'
-                    : 'bg-slate-900/60 border-slate-700/60 text-slate-300 hover:bg-slate-900'
-                }`}
-              >
-                <div>
-                  <div className="font-semibold text-emerald-300 flex items-center gap-1.5">
-                    <KeyRound className="w-3.5 h-3.5" />
-                    <span>thukho_hn (Thủ kho Hà Nội)</span>
-                  </div>
-                  <div className="text-[11px] text-slate-400 mt-0.5">
-                    Quyền lập/sửa phiếu, xem báo cáo kho (không xóa phiếu)
-                  </div>
-                </div>
-                <span className="font-mono text-[11px] text-slate-400 bg-slate-800 px-2 py-0.5 rounded">
-                  thukho123
-                </span>
-              </button>
-
-              {/* Nhân viên kỹ thuật */}
-              <button
-                type="button"
-                onClick={() => handleQuickFill('kythuat_vien', '123456')}
-                className={`w-full text-left p-2.5 rounded-xl border transition-all text-xs flex items-center justify-between ${
-                  username === 'kythuat_vien'
-                    ? 'bg-blue-950/60 border-blue-500/60 text-white'
-                    : 'bg-slate-900/60 border-slate-700/60 text-slate-300 hover:bg-slate-900'
-                }`}
-              >
-                <div>
-                  <div className="font-semibold text-blue-300 flex items-center gap-1.5">
-                    <UserIcon className="w-3.5 h-3.5" />
-                    <span>kythuat_vien (Kỹ thuật viên)</span>
-                  </div>
-                  <div className="text-[11px] text-slate-400 mt-0.5">
-                    Quyền xem tồn kho, xem thẻ kho (Chỉ đọc)
-                  </div>
-                </div>
-                <span className="font-mono text-[11px] text-slate-400 bg-slate-800 px-2 py-0.5 rounded">
-                  123456
-                </span>
-              </button>
-            </div>
-          </div>
         </div>
       </div>
     </div>
