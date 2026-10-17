@@ -15,7 +15,7 @@ import {
   Warehouse,
 } from '../types/inventory';
 import { getStockStatus } from '../utils/formatters';
-import { SyncStatus, CloudProvider, centralSyncService } from '../services/centralSyncService';
+import { SyncStatus, CloudProvider, CentralDataPayload, centralSyncService } from '../services/centralSyncService';
 import { supabaseRealtimeService, RealtimeConnectionState } from '../services/supabaseRealtimeService';
 
 interface InventoryContextType {
@@ -217,6 +217,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             setTransactions(remoteData.transactions);
           if (Array.isArray(remoteData.warehouses) && remoteData.warehouses.length > 0)
             setWarehouses(remoteData.warehouses);
+          if (Array.isArray(remoteData.users) && remoteData.users.length > 0)
+            setUsers(remoteData.users);
           setLastServerTimestamp(remoteData.lastUpdated);
           setLastSyncedAt(new Date());
           setSyncStatus('synced');
@@ -241,6 +243,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
       if (Array.isArray(payload.warehouses) && payload.warehouses.length > 0) {
         setWarehouses(payload.warehouses);
+      }
+      if (Array.isArray(payload.users) && payload.users.length > 0) {
+        setUsers(payload.users);
       }
 
       setLastServerTimestamp(payload.lastUpdated);
@@ -294,6 +299,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           if (Array.isArray(directPayload.warehouses) && directPayload.warehouses.length > 0) {
             setWarehouses(directPayload.warehouses);
           }
+          if (Array.isArray(directPayload.users) && directPayload.users.length > 0) {
+            setUsers(directPayload.users);
+          }
           setLastServerTimestamp(directPayload.lastUpdated);
           setLastSyncedAt(new Date());
           setSyncStatus('synced');
@@ -318,6 +326,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           }
           if (Array.isArray(result.payload.warehouses) && result.payload.warehouses.length > 0) {
             setWarehouses(result.payload.warehouses);
+          }
+          if (Array.isArray(result.payload.users) && result.payload.users.length > 0) {
+            setUsers(result.payload.users);
           }
           setLastServerTimestamp(result.payload.lastUpdated);
           setTimeout(() => {
@@ -364,16 +375,23 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   // Push local changes to cloud datastore (Supabase Realtime / Vercel KV)
   const pushLocalChanges = useCallback(
-    (newItems: InventoryItem[], newTransactions: Transaction[], newWarehouses: Warehouse[]) => {
+    (
+      newItems: InventoryItem[],
+      newTransactions: Transaction[],
+      newWarehouses: Warehouse[],
+      newUsers?: User[]
+    ) => {
       if (isRemoteUpdatingRef.current) return;
       if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
       pushTimerRef.current = setTimeout(() => {
-        const fullPayload = {
+        const usersToPush = newUsers || users;
+        const fullPayload: CentralDataPayload = {
           version: Date.now(),
           lastUpdated: new Date().toISOString(),
           items: newItems,
           transactions: newTransactions,
           warehouses: newWarehouses,
+          users: usersToPush,
           source: 'web-client',
         };
 
@@ -394,6 +412,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             items: newItems,
             transactions: newTransactions,
             warehouses: newWarehouses,
+            users: usersToPush,
           })
           .then((res) => {
             if (res.success && res.payload) {
@@ -403,9 +422,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             }
           })
           .catch(() => {});
-      }, 500);
+      }, 400);
     },
-    []
+    [users]
   );
 
   // Simulate Google AI generating new inventory numbers & broadcast instantly
@@ -458,12 +477,13 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setItems(newItems);
     setTransactions(newTransactions);
 
-    const payload = {
+    const payload: CentralDataPayload = {
       version: Date.now(),
       lastUpdated: new Date().toISOString(),
       items: newItems,
       transactions: newTransactions,
       warehouses: warehouses,
+      users: users,
       source: 'google-ai',
       lastUpdatedBy: 'Google AI Gemini',
     };
@@ -478,6 +498,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       items: newItems,
       transactions: newTransactions,
       warehouses: warehouses,
+      users: users,
       source: 'google-ai',
       lastUpdatedBy: 'Google AI Gemini',
     }).catch(() => {});
@@ -491,7 +512,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     setLastRealtimeUpdateMessage(resultMessage);
     return { success: true, message: resultMessage };
-  }, [items, transactions, warehouses]);
+  }, [items, transactions, warehouses, users]);
 
   // Sync to local storage & push to Cloud
   useEffect(() => {
@@ -500,8 +521,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch {
       // ignore
     }
-    pushLocalChanges(items, transactions, warehouses);
-  }, [items, pushLocalChanges, transactions, warehouses]);
+    pushLocalChanges(items, transactions, warehouses, users);
+  }, [items, pushLocalChanges, transactions, warehouses, users]);
 
   useEffect(() => {
     try {
@@ -509,8 +530,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch {
       // ignore
     }
-    pushLocalChanges(items, transactions, warehouses);
-  }, [transactions, pushLocalChanges, items, warehouses]);
+    pushLocalChanges(items, transactions, warehouses, users);
+  }, [transactions, pushLocalChanges, items, warehouses, users]);
 
   useEffect(() => {
     try {
@@ -518,7 +539,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch {
       // ignore
     }
-  }, [users]);
+    pushLocalChanges(items, transactions, warehouses, users);
+  }, [users, pushLocalChanges, items, transactions, warehouses]);
 
   useEffect(() => {
     try {
@@ -526,8 +548,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch {
       // ignore
     }
-    pushLocalChanges(items, transactions, warehouses);
-  }, [warehouses, pushLocalChanges, items, transactions]);
+    pushLocalChanges(items, transactions, warehouses, users);
+  }, [warehouses, pushLocalChanges, items, transactions, users]);
 
   // Auth Operations
   const login = (username: string, password: string): { success: boolean; error?: string } => {
@@ -578,7 +600,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       createdAt: new Date().toISOString().replace('T', ' ').substring(0, 16),
     };
 
-    setUsers(prev => [...prev, newUser]);
+    const updatedUsers = [...users, newUser];
+    setUsers(updatedUsers);
+    pushLocalChanges(items, transactions, warehouses, updatedUsers);
     return { success: true };
   };
 
@@ -594,20 +618,20 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
     }
 
-    setUsers(prev =>
-      prev.map(u => {
-        if (u.id === id) {
-          const updated = { ...u, ...updates };
-          // If updating self, sync currentUser
-          if (currentUser.id === id) {
-            setCurrentUser(updated);
-          }
-          return updated;
+    const updatedUsers = users.map(u => {
+      if (u.id === id) {
+        const updated = { ...u, ...updates };
+        // If updating self, sync currentUser
+        if (currentUser.id === id) {
+          setCurrentUser(updated);
         }
-        return u;
-      })
-    );
+        return updated;
+      }
+      return u;
+    });
 
+    setUsers(updatedUsers);
+    pushLocalChanges(items, transactions, warehouses, updatedUsers);
     return { success: true };
   };
 
@@ -620,7 +644,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Không thể xóa chính tài khoản bạn đang đăng nhập!' };
     }
 
-    setUsers(prev => prev.filter(u => u.id !== id));
+    const updatedUsers = users.filter(u => u.id !== id);
+    setUsers(updatedUsers);
+    pushLocalChanges(items, transactions, warehouses, updatedUsers);
     return { success: true };
   };
 

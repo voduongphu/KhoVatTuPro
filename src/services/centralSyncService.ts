@@ -1,4 +1,4 @@
-import { InventoryItem, Transaction, Warehouse } from '../types/inventory';
+import { InventoryItem, Transaction, User, Warehouse } from '../types/inventory';
 
 export type SyncStatus = 'synced' | 'syncing' | 'offline' | 'error';
 export type CloudProvider = 'vercel-edge-config' | 'vercel-kv' | 'supabase' | 'local';
@@ -9,6 +9,7 @@ export interface CentralDataPayload {
   items: InventoryItem[];
   transactions: Transaction[];
   warehouses: Warehouse[];
+  users?: User[];
   lastUpdatedBy?: string;
   source?: string;
 }
