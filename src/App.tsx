@@ -14,6 +14,7 @@ import { TransactionPrintModal } from './components/TransactionPrintModal';
 import { ExcelImportModal } from './components/ExcelImportModal';
 import { ImportItemsExcelModal } from './components/ImportItemsExcelModal';
 import { EditTransactionModal } from './components/EditTransactionModal';
+import { SyncStatusModal } from './components/SyncStatusModal';
 import { LoginView } from './components/LoginView';
 import { InventoryItem, Transaction, TransactionType } from './types/inventory';
 import { ActiveTabType } from './components/Header';
@@ -225,6 +226,9 @@ function InventoryApp() {
           onSuccess={() => setIsItemsExcelImportOpen(false)}
         />
       )}
+
+      {/* Real-time Central Cloud Sync Modal */}
+      <SyncStatusModal />
     </div>
   );
 }

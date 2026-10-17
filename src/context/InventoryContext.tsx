@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import {
   INITIAL_ITEMS,
   INITIAL_TRANSACTIONS,
@@ -15,6 +15,8 @@ import {
   Warehouse,
 } from '../types/inventory';
 import { getStockStatus } from '../utils/formatters';
+import { SyncStatus, CloudProvider, centralSyncService } from '../services/centralSyncService';
+import { supabaseRealtimeService, RealtimeConnectionState } from '../services/supabaseRealtimeService';
 
 interface InventoryContextType {
   warehouses: Warehouse[];
@@ -83,6 +85,24 @@ interface InventoryContextType {
 
   getItemLedger: (itemId: string) => StockLedgerEntry[];
   resetToDefaultData: () => void;
+
+  // Central Cloud Synchronization (Vercel KV / Supabase)
+  syncStatus: SyncStatus;
+  lastSyncedAt: Date | null;
+  autoSyncEnabled: boolean;
+  setAutoSyncEnabled: (enabled: boolean) => void;
+  syncProvider: CloudProvider;
+  triggerManualSync: () => Promise<void>;
+  isSyncModalOpen: boolean;
+  setIsSyncModalOpen: (open: boolean) => void;
+
+  // Supabase Realtime WebSocket Connection & Google AI Sync
+  realtimeConnectionState: RealtimeConnectionState;
+  lastRealtimeUpdateMessage: string | null;
+  clearRealtimeMessage: () => void;
+  simulateGoogleAIUpdate: () => Promise<{ success: boolean; message: string }>;
+  saveSupabaseCredentials: (url: string, key: string) => boolean;
+  supabaseCredentials: { url: string; key: string };
 }
 
 const defaultCriteria: MultiFilterCriteria = {
@@ -160,14 +180,328 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const [filterCriteria, setFilterCriteria] = useState<MultiFilterCriteria>(defaultCriteria);
 
-  // Sync to local storage (Chỉ lưu danh mục vật tư, giao dịch và tài khoản người dùng)
+  // Central Cloud Synchronization state (Vercel KV / Supabase)
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>('synced');
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(new Date());
+  const [autoSyncEnabled, setAutoSyncEnabled] = useState<boolean>(true);
+  const [syncProvider, setSyncProvider] = useState<CloudProvider>(() => {
+    if (supabaseRealtimeService.isConfigured()) return 'supabase';
+    return centralSyncService.getProvider();
+  });
+  const [isSyncModalOpen, setIsSyncModalOpen] = useState<boolean>(false);
+  const [lastServerTimestamp, setLastServerTimestamp] = useState<string>(() => new Date().toISOString());
+  const isRemoteUpdatingRef = useRef<boolean>(false);
+  const pushTimerRef = useRef<any>(null);
+
+  // Supabase Realtime state
+  const [realtimeConnectionState, setRealtimeConnectionState] = useState<RealtimeConnectionState>(() =>
+    supabaseRealtimeService.getConnectionState()
+  );
+  const [lastRealtimeUpdateMessage, setLastRealtimeUpdateMessage] = useState<string | null>(null);
+  const [supabaseCredentials, setSupabaseCredentials] = useState<{ url: string; key: string }>(() =>
+    supabaseRealtimeService.getCredentials()
+  );
+
+  const clearRealtimeMessage = useCallback(() => setLastRealtimeUpdateMessage(null), []);
+
+  const saveSupabaseCredentials = useCallback((url: string, key: string) => {
+    const configured = supabaseRealtimeService.setCredentials(url, key);
+    setSupabaseCredentials({ url, key });
+    if (configured) {
+      setSyncProvider('supabase');
+      // Immediately attempt fetch from Supabase
+      supabaseRealtimeService.fetchLatest().then((remoteData) => {
+        if (remoteData) {
+          if (Array.isArray(remoteData.items) && remoteData.items.length > 0) setItems(remoteData.items);
+          if (Array.isArray(remoteData.transactions) && remoteData.transactions.length > 0)
+            setTransactions(remoteData.transactions);
+          if (Array.isArray(remoteData.warehouses) && remoteData.warehouses.length > 0)
+            setWarehouses(remoteData.warehouses);
+          setLastServerTimestamp(remoteData.lastUpdated);
+          setLastSyncedAt(new Date());
+          setSyncStatus('synced');
+        }
+      });
+    }
+    return configured;
+  }, []);
+
+  // Listen to Supabase Realtime WebSocket events
+  useEffect(() => {
+    supabaseRealtimeService.subscribe((payload) => {
+      if (!payload) return;
+      console.log('[InventoryContext] Instant Supabase Realtime update received:', payload);
+
+      isRemoteUpdatingRef.current = true;
+      if (Array.isArray(payload.items) && payload.items.length > 0) {
+        setItems(payload.items);
+      }
+      if (Array.isArray(payload.transactions) && payload.transactions.length > 0) {
+        setTransactions(payload.transactions);
+      }
+      if (Array.isArray(payload.warehouses) && payload.warehouses.length > 0) {
+        setWarehouses(payload.warehouses);
+      }
+
+      setLastServerTimestamp(payload.lastUpdated);
+      setLastSyncedAt(new Date());
+      setSyncStatus('synced');
+      setSyncProvider('supabase');
+
+      const isAI = payload.source === 'google-ai';
+      const msg = isAI
+        ? `⚡ Số liệu mới từ Google AI vừa được cập nhật tức thì (Supabase Realtime)!`
+        : `⚡ Dữ liệu vừa được đồng bộ tức thì qua Supabase Realtime WebSocket!`;
+      setLastRealtimeUpdateMessage(msg);
+
+      // Auto clear message after 6 seconds
+      setTimeout(() => {
+        setLastRealtimeUpdateMessage(prev => (prev === msg ? null : prev));
+      }, 6000);
+
+      setTimeout(() => {
+        isRemoteUpdatingRef.current = false;
+      }, 350);
+    });
+
+    const unsubscribeStatus = supabaseRealtimeService.onConnectionStateChange((state) => {
+      setRealtimeConnectionState(state);
+      if (state === 'CONNECTED') {
+        setSyncProvider('supabase');
+      }
+    });
+
+    return () => {
+      unsubscribeStatus();
+    };
+  }, []);
+
+  // Trigger manual or background fetch from central server
+  const triggerManualSync = useCallback(async () => {
+    setSyncStatus('syncing');
+    try {
+      // If Supabase client is connected, try direct fetch first
+      if (supabaseRealtimeService.isConfigured()) {
+        const directPayload = await supabaseRealtimeService.fetchLatest();
+        if (directPayload) {
+          isRemoteUpdatingRef.current = true;
+          if (Array.isArray(directPayload.items) && directPayload.items.length > 0) {
+            setItems(directPayload.items);
+          }
+          if (Array.isArray(directPayload.transactions) && directPayload.transactions.length > 0) {
+            setTransactions(directPayload.transactions);
+          }
+          if (Array.isArray(directPayload.warehouses) && directPayload.warehouses.length > 0) {
+            setWarehouses(directPayload.warehouses);
+          }
+          setLastServerTimestamp(directPayload.lastUpdated);
+          setLastSyncedAt(new Date());
+          setSyncStatus('synced');
+          setSyncProvider('supabase');
+          setTimeout(() => {
+            isRemoteUpdatingRef.current = false;
+          }, 350);
+          return;
+        }
+      }
+
+      const result = await centralSyncService.fetchLatestData(lastServerTimestamp);
+      if (result.success) {
+        setSyncProvider(result.provider);
+        if (result.isNewer && result.payload) {
+          isRemoteUpdatingRef.current = true;
+          if (Array.isArray(result.payload.items) && result.payload.items.length > 0) {
+            setItems(result.payload.items);
+          }
+          if (Array.isArray(result.payload.transactions) && result.payload.transactions.length > 0) {
+            setTransactions(result.payload.transactions);
+          }
+          if (Array.isArray(result.payload.warehouses) && result.payload.warehouses.length > 0) {
+            setWarehouses(result.payload.warehouses);
+          }
+          setLastServerTimestamp(result.payload.lastUpdated);
+          setTimeout(() => {
+            isRemoteUpdatingRef.current = false;
+          }, 350);
+        }
+        setSyncStatus('synced');
+        setLastSyncedAt(new Date());
+      } else {
+        setSyncStatus(result.error ? 'error' : 'offline');
+      }
+    } catch {
+      setSyncStatus('offline');
+    }
+  }, [lastServerTimestamp]);
+
+  // Real-time automatic polling every 5 seconds (5000ms) as heartbeat fallback
+  useEffect(() => {
+    if (!autoSyncEnabled) return;
+
+    // Run initial fetch on mount
+    triggerManualSync();
+
+    const intervalId = setInterval(() => {
+      // Pause polling if user is on another browser tab to save serverless bandwidth
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return;
+      }
+      triggerManualSync();
+    }, 5000);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        triggerManualSync();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [autoSyncEnabled, triggerManualSync]);
+
+  // Push local changes to cloud datastore (Supabase Realtime / Vercel KV)
+  const pushLocalChanges = useCallback(
+    (newItems: InventoryItem[], newTransactions: Transaction[], newWarehouses: Warehouse[]) => {
+      if (isRemoteUpdatingRef.current) return;
+      if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
+      pushTimerRef.current = setTimeout(() => {
+        const fullPayload = {
+          version: Date.now(),
+          lastUpdated: new Date().toISOString(),
+          items: newItems,
+          transactions: newTransactions,
+          warehouses: newWarehouses,
+          source: 'web-client',
+        };
+
+        // 1. Direct push to Supabase (broadcasts immediately to all WebSocket subscribers)
+        if (supabaseRealtimeService.isConfigured()) {
+          supabaseRealtimeService.pushState(fullPayload).then((ok) => {
+            if (ok) {
+              setLastServerTimestamp(fullPayload.lastUpdated);
+              setLastSyncedAt(new Date());
+              setSyncStatus('synced');
+            }
+          });
+        }
+
+        // 2. Central API fallback / sync
+        centralSyncService
+          .pushUpdate({
+            items: newItems,
+            transactions: newTransactions,
+            warehouses: newWarehouses,
+          })
+          .then((res) => {
+            if (res.success && res.payload) {
+              setLastServerTimestamp(res.payload.lastUpdated);
+              setLastSyncedAt(new Date());
+              setSyncStatus('synced');
+            }
+          })
+          .catch(() => {});
+      }, 500);
+    },
+    []
+  );
+
+  // Simulate Google AI generating new inventory numbers & broadcast instantly
+  const simulateGoogleAIUpdate = useCallback(async (): Promise<{ success: boolean; message: string }> => {
+    if (items.length === 0) {
+      return { success: false, message: 'Chưa có danh mục vật tư để tạo số liệu AI' };
+    }
+
+    const targetIdx = Math.floor(Math.random() * items.length);
+    const targetItem = items[targetIdx];
+    const targetWarehouse = warehouses[0] || INITIAL_WAREHOUSES[0];
+
+    const adjustmentQty = Math.floor(Math.random() * 25) + 5;
+    const newStock = targetItem.currentStock + adjustmentQty;
+
+    const newItems = items.map((it, idx) => (idx === targetIdx ? { ...it, currentStock: newStock } : it));
+
+    const aiCode = `AI-NHAP-${Date.now().toString().slice(-4)}`;
+    const lineAmount = adjustmentQty * (targetItem.unitPrice || 150000);
+    const newTx: Transaction = {
+      id: `tx-ai-${Date.now()}`,
+      code: aiCode,
+      type: 'NHAP_KHO',
+      subtype: 'NHAP_DIEU_CHINH',
+      date: new Date().toISOString().split('T')[0],
+      warehouseId: targetItem.warehouseId || targetWarehouse.id,
+      partnerName: 'Google AI Optimization Engine',
+      departmentOrProject: 'Bộ Phận Dự Đoán Tự Động',
+      creatorName: 'Google AI Gemini',
+      notes: `[Google AI Auto-Analysis] Bổ sung +${adjustmentQty} ${targetItem.unit} cho vật tư "${targetItem.name}"`,
+      status: 'HOAN_THANH',
+      items: [
+        {
+          itemId: targetItem.id,
+          itemCode: targetItem.code,
+          itemName: targetItem.name,
+          unit: targetItem.unit,
+          quantity: adjustmentQty,
+          unitPrice: targetItem.unitPrice || 150000,
+          amount: lineAmount,
+          note: 'Google AI tự động tính toán và bổ sung lượng tồn kho tối ưu',
+        },
+      ],
+      totalAmount: lineAmount,
+    };
+
+    const newTransactions = [newTx, ...transactions];
+
+    // Update local state
+    setItems(newItems);
+    setTransactions(newTransactions);
+
+    const payload = {
+      version: Date.now(),
+      lastUpdated: new Date().toISOString(),
+      items: newItems,
+      transactions: newTransactions,
+      warehouses: warehouses,
+      source: 'google-ai',
+      lastUpdatedBy: 'Google AI Gemini',
+    };
+
+    let sentToRealtime = false;
+    if (supabaseRealtimeService.isConfigured()) {
+      sentToRealtime = await supabaseRealtimeService.pushState(payload);
+    }
+
+    // Also push to central API
+    centralSyncService.pushUpdate({
+      items: newItems,
+      transactions: newTransactions,
+      warehouses: warehouses,
+      source: 'google-ai',
+      lastUpdatedBy: 'Google AI Gemini',
+    }).catch(() => {});
+
+    setLastServerTimestamp(payload.lastUpdated);
+    setLastSyncedAt(new Date());
+
+    const resultMessage = sentToRealtime
+      ? `⚡ Google AI vừa cập nhật +${adjustmentQty} ${targetItem.unit} cho "${targetItem.name}". Supabase Realtime đã phát sóng WebSocket đến toàn bộ người dùng ngay lập tức!`
+      : `Google AI vừa cập nhật +${adjustmentQty} ${targetItem.unit} cho "${targetItem.name}". Đã lưu lên máy chủ đồng bộ!`;
+
+    setLastRealtimeUpdateMessage(resultMessage);
+    return { success: true, message: resultMessage };
+  }, [items, transactions, warehouses]);
+
+  // Sync to local storage & push to Cloud
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(items));
     } catch {
       // ignore
     }
-  }, [items]);
+    pushLocalChanges(items, transactions, warehouses);
+  }, [items, pushLocalChanges, transactions, warehouses]);
 
   useEffect(() => {
     try {
@@ -175,7 +509,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch {
       // ignore
     }
-  }, [transactions]);
+    pushLocalChanges(items, transactions, warehouses);
+  }, [transactions, pushLocalChanges, items, warehouses]);
 
   useEffect(() => {
     try {
@@ -191,7 +526,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch {
       // ignore
     }
-  }, [warehouses]);
+    pushLocalChanges(items, transactions, warehouses);
+  }, [warehouses, pushLocalChanges, items, transactions]);
 
   // Auth Operations
   const login = (username: string, password: string): { success: boolean; error?: string } => {
@@ -1000,6 +1336,20 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         importTransactionsBatch,
         getItemLedger,
         resetToDefaultData,
+        syncStatus,
+        lastSyncedAt,
+        autoSyncEnabled,
+        setAutoSyncEnabled,
+        syncProvider,
+        triggerManualSync,
+        isSyncModalOpen,
+        setIsSyncModalOpen,
+        realtimeConnectionState,
+        lastRealtimeUpdateMessage,
+        clearRealtimeMessage,
+        simulateGoogleAIUpdate,
+        saveSupabaseCredentials,
+        supabaseCredentials,
       }}
     >
       {children}
