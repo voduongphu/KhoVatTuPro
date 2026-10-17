@@ -70,15 +70,16 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           </div>
 
-          {/* Navigation Links - Centered, Single-Row with horizontal scroll if needed on very small screens */}
-          <nav className="flex items-center gap-1 overflow-x-auto py-1 scrollbar-none text-xs font-medium">
+          {/* Navigation Links - Centered, Compact, Single-Row, No text overlap */}
+          <nav className="flex-1 min-w-0 flex items-center justify-center gap-0.5 sm:gap-1 overflow-x-auto py-1 scrollbar-none text-xs font-medium px-1">
             <button
               onClick={() => setActiveTab('dashboard')}
-              className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center gap-1 px-2 sm:px-2.5 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                 activeTab === 'dashboard'
                   ? 'bg-slate-900 text-white font-semibold shadow-xs'
                   : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
               }`}
+              title="Bảng điều khiển tổng quan"
             >
               <LayoutDashboard className="w-3.5 h-3.5" />
               <span>Tổng quan</span>
@@ -86,23 +87,25 @@ export const Header: React.FC<HeaderProps> = ({
 
             <button
               onClick={() => setActiveTab('inventory')}
-              className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center gap-1 px-2 sm:px-2.5 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                 activeTab === 'inventory'
                   ? 'bg-slate-900 text-white font-semibold shadow-xs'
                   : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
               }`}
+              title="Danh mục vật tư và thiết bị"
             >
               <Boxes className="w-3.5 h-3.5" />
-              <span>Vật tư &amp; Thiết bị</span>
+              <span>Vật tư</span>
             </button>
 
             <button
               onClick={() => setActiveTab('warehouses')}
-              className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center gap-1 px-2 sm:px-2.5 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                 activeTab === 'warehouses'
                   ? 'bg-slate-900 text-white font-semibold shadow-xs'
                   : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
               }`}
+              title="Danh mục hệ thống kho hàng"
             >
               <Building2 className="w-3.5 h-3.5" />
               <span>Kho hàng</span>
@@ -110,11 +113,12 @@ export const Header: React.FC<HeaderProps> = ({
 
             <button
               onClick={() => setActiveTab('receipts')}
-              className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center gap-1 px-2 sm:px-2.5 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                 activeTab === 'receipts'
                   ? 'bg-slate-900 text-white font-semibold shadow-xs'
                   : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
               }`}
+              title="Quản lý phiếu nhập kho"
             >
               <PackagePlus className="w-3.5 h-3.5" />
               <span>Phiếu Nhập</span>
@@ -122,11 +126,12 @@ export const Header: React.FC<HeaderProps> = ({
 
             <button
               onClick={() => setActiveTab('issues')}
-              className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center gap-1 px-2 sm:px-2.5 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                 activeTab === 'issues'
                   ? 'bg-slate-900 text-white font-semibold shadow-xs'
                   : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
               }`}
+              title="Quản lý phiếu xuất kho"
             >
               <PackageMinus className="w-3.5 h-3.5" />
               <span>Phiếu Xuất</span>
@@ -134,11 +139,12 @@ export const Header: React.FC<HeaderProps> = ({
 
             <button
               onClick={() => setActiveTab('alerts')}
-              className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center gap-1 px-2 sm:px-2.5 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                 activeTab === 'alerts'
                   ? 'bg-slate-900 text-white font-semibold shadow-xs'
                   : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
               }`}
+              title="Cảnh báo tồn kho & hạn kiểm định"
             >
               <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
               <span>Cảnh báo</span>
@@ -157,11 +163,12 @@ export const Header: React.FC<HeaderProps> = ({
 
             <button
               onClick={() => setActiveTab('users')}
-              className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center gap-1 px-2 sm:px-2.5 py-1.5 rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                 activeTab === 'users'
                   ? 'bg-slate-900 text-white font-semibold shadow-xs'
                   : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
               }`}
+              title="Quản lý người dùng & phân quyền"
             >
               <Users className="w-3.5 h-3.5" />
               <span>Người dùng</span>
@@ -180,7 +187,7 @@ export const Header: React.FC<HeaderProps> = ({
           </nav>
 
           {/* Action & User Cluster - Right side */}
-          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+          <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
             {canManage && (
               <>
                 {/* Excel Import button */}

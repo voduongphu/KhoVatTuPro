@@ -66,6 +66,15 @@ export interface TransactionLineItem {
   amount: number;
   serialNumber?: string;
   note?: string;
+  // Metadata for auto-registering new item when creating Goods Receipt
+  isNewItem?: boolean;
+  type?: ItemType;
+  category?: string;
+  location?: string;
+  minStock?: number;
+  maxStock?: number;
+  condition?: EquipmentCondition;
+  spec?: string;
 }
 
 export interface Transaction {

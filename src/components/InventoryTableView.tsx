@@ -12,6 +12,7 @@ import {
   CheckSquare,
   Square,
   X,
+  FileSpreadsheet,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
 import { InventoryItem } from '../types/inventory';
@@ -33,6 +34,7 @@ interface InventoryTableViewProps {
   onEditItem: (item: InventoryItem) => void;
   onOpenCreateItem: () => void;
   onQuickGoodsIn: (item: InventoryItem) => void;
+  onOpenImportItems?: () => void;
 }
 
 export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
@@ -40,6 +42,7 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
   onEditItem,
   onOpenCreateItem,
   onQuickGoodsIn,
+  onOpenImportItems,
 }) => {
   const {
     filteredItems,
@@ -177,13 +180,25 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
           </button>
 
           {canManage && (
-            <button
-              onClick={onOpenCreateItem}
-              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors shadow-sm whitespace-nowrap"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Thêm vật tư / TB</span>
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={onOpenImportItems}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-colors whitespace-nowrap shadow-2xs"
+                title="Import danh mục vật tư từ file Excel (.xlsx / .csv)"
+              >
+                <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
+                <span>Import Excel</span>
+              </button>
+
+              <button
+                onClick={onOpenCreateItem}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors shadow-sm whitespace-nowrap"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Thêm vật tư / TB</span>
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -252,7 +267,8 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
                     />
                   </th>
                   <th className="py-3 px-3">Mã SKU</th>
-                  <th className="py-3 px-4 min-w-[220px]">Tên vật tư / thiết bị</th>
+                  <th className="py-3 px-4 min-w-[200px]">Tên vật tư / thiết bị</th>
+                  <th className="py-3 px-3 min-w-[130px]">Số Serial / Lô</th>
                   <th className="py-3 px-3">Phân loại</th>
                   <th className="py-3 px-3">Kho &amp; Vị trí</th>
                   <th className="py-3 px-3 text-right">Tồn kho hiện tại</th>
@@ -314,15 +330,27 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
                         </div>
                         <div className="text-[11px] text-slate-500 mt-0.5 flex items-center gap-1.5 flex-wrap">
                           <span>{item.category}</span>
-                          {item.serialOrLot && (
+                          {item.spec && (
                             <>
                               <span aria-hidden="true">&bull;</span>
-                              <span className="font-mono text-slate-600 bg-slate-100 px-1 py-0.2 rounded">
-                                {item.serialOrLot}
-                              </span>
+                              <span className="text-slate-400 truncate max-w-[150px]">{item.spec}</span>
                             </>
                           )}
                         </div>
+                      </td>
+
+                      {/* Serial / Lot Number Column */}
+                      <td className="py-3.5 px-3 font-mono text-slate-700 whitespace-nowrap">
+                        {item.serialOrLot ? (
+                          <span
+                            className="inline-block bg-slate-100 text-slate-800 px-2 py-0.5 rounded font-mono text-[11px] font-semibold border border-slate-200"
+                            title={`Số serial / số lô: ${item.serialOrLot}`}
+                          >
+                            {item.serialOrLot}
+                          </span>
+                        ) : (
+                          <span className="text-slate-300 italic text-[11px]">—</span>
+                        )}
                       </td>
 
                       {/* Type */}

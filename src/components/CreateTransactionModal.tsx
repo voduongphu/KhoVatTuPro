@@ -100,6 +100,33 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
   };
 
   const handleSelectItem = (index: number, selectedItemId: string) => {
+    if (selectedItemId === '__NEW_ITEM__') {
+      setLineItems(prev => {
+        const updated = [...prev];
+        const qty = updated[index].quantity > 0 ? updated[index].quantity : 1;
+        updated[index] = {
+          ...updated[index],
+          itemId: `TEMP-NEW-${Date.now()}-${index}`,
+          itemCode: '',
+          itemName: '',
+          unit: 'Cái',
+          quantity: qty,
+          unitPrice: updated[index].unitPrice || 0,
+          amount: qty * (updated[index].unitPrice || 0),
+          serialNumber: '',
+          isNewItem: true,
+          type: 'VAT_TU',
+          category: 'Cơ điện & Vật tư công trình',
+          location: 'Kệ A1-01',
+          minStock: 5,
+          maxStock: 200,
+        };
+        return updated;
+      });
+      setErrorMessage('');
+      return;
+    }
+
     const item = items.find(i => i.id === selectedItemId);
     if (!item) return;
 
@@ -116,6 +143,7 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
         unitPrice: item.unitPrice,
         amount: qty * item.unitPrice,
         serialNumber: item.serialOrLot || '',
+        isNewItem: false,
       };
       return updated;
     });
@@ -159,19 +187,25 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
     });
   };
 
-  const addLine = () => {
+  const addLine = (isNew: boolean = false) => {
     setLineItems(prev => [
       ...prev,
       {
-        itemId: '',
+        itemId: isNew ? `TEMP-NEW-${Date.now()}` : '',
         itemCode: '',
         itemName: '',
-        unit: '',
+        unit: 'Cái',
         quantity: 1,
         unitPrice: 0,
         amount: 0,
         serialNumber: '',
         note: '',
+        isNewItem: isNew,
+        type: 'VAT_TU',
+        category: 'Cơ điện & Vật tư công trình',
+        location: 'Khu vực tiếp nhận',
+        minStock: 5,
+        maxStock: 200,
       },
     ]);
   };
@@ -201,10 +235,37 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
       return;
     }
 
+    // Validate line items
+    for (let i = 0; i < lineItems.length; i++) {
+      const line = lineItems[i];
+      if (line.isNewItem) {
+        if (!line.itemCode?.trim()) {
+          setErrorMessage(`Dòng ${i + 1}: Vui lòng nhập Mã SKU cho vật tư mới.`);
+          return;
+        }
+        if (!line.itemName?.trim()) {
+          setErrorMessage(`Dòng ${i + 1}: Vui lòng nhập Tên vật tư mới.`);
+          return;
+        }
+        if (!line.unit?.trim()) {
+          setErrorMessage(`Dòng ${i + 1}: Vui lòng nhập Đơn vị tính (ĐVT) cho vật tư mới.`);
+          return;
+        }
+      } else if (!line.itemId && line.quantity > 0) {
+        setErrorMessage(`Dòng ${i + 1}: Vui lòng chọn mặt hàng hoặc nhập vật tư mới.`);
+        return;
+      }
+
+      if (line.quantity <= 0) {
+        setErrorMessage(`Dòng ${i + 1}: Số lượng phải lớn hơn 0.`);
+        return;
+      }
+    }
+
     // Filter valid lines
-    const validLines = lineItems.filter(l => l.itemId && l.quantity > 0);
+    const validLines = lineItems.filter(l => (l.itemId || l.isNewItem) && l.quantity > 0);
     if (validLines.length === 0) {
-      setErrorMessage('Vui lòng chọn ít nhất 1 mặt hàng với số lượng lớn hơn 0.');
+      setErrorMessage('Vui lòng chọn hoặc nhập ít nhất 1 mặt hàng với số lượng lớn hơn 0.');
       return;
     }
 
@@ -417,22 +478,35 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
               <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700">
                 Danh sách vật tư & thiết bị giao dịch
               </h3>
-              <button
-                type="button"
-                onClick={addLine}
-                className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-600 hover:text-indigo-800"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Thêm dòng</span>
-              </button>
+              <div className="flex items-center gap-2">
+                {type === 'NHAP_KHO' && (
+                  <button
+                    type="button"
+                    onClick={() => addLine(true)}
+                    className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 hover:text-emerald-800 bg-emerald-50 hover:bg-emerald-100 px-2.5 py-1 rounded-lg border border-emerald-200 transition-colors"
+                    title="Nhập vật tư mới chưa có trong hệ thống và tự động lưu vào danh mục"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>+ Nhập vật tư mới (Lưu danh mục)</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => addLine(false)}
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-600 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 px-2.5 py-1 rounded-lg border border-indigo-200 transition-colors"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>+ Thêm dòng</span>
+                </button>
+              </div>
             </div>
 
-            <div className="border border-slate-200 rounded-xl overflow-hidden">
+            <div className="border border-slate-200 rounded-xl overflow-hidden shadow-2xs">
               <table className="w-full text-left border-collapse text-xs">
                 <thead>
                   <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase text-[10px]">
-                    <th className="py-2.5 px-3 min-w-[200px]">Chọn Vật tư / Thiết bị</th>
-                    <th className="py-2.5 px-2 w-16">ĐVT</th>
+                    <th className="py-2.5 px-3 min-w-[260px]">Chọn hoặc Nhập Vật tư / Thiết bị</th>
+                    <th className="py-2.5 px-2 w-20">ĐVT</th>
                     <th className="py-2.5 px-2 w-28 text-right">
                       {type === 'XUAT_KHO' ? 'Tồn khả dụng' : 'Tồn hiện tại'}
                     </th>
@@ -450,30 +524,145 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                       type === 'XUAT_KHO' && currentItem && line.quantity > currentItem.currentStock;
 
                     return (
-                      <tr key={idx} className={isExceedingStock ? 'bg-rose-50/50' : 'hover:bg-slate-50/50'}>
-                        {/* Item selection */}
+                      <tr
+                        key={idx}
+                        className={
+                          line.isNewItem
+                            ? 'bg-emerald-50/40 hover:bg-emerald-50/60'
+                            : isExceedingStock
+                            ? 'bg-rose-50/50'
+                            : 'hover:bg-slate-50/50'
+                        }
+                      >
+                        {/* Item selection or New item inputs */}
                         <td className="py-2 px-3">
-                          <select
-                            value={line.itemId}
-                            onChange={e => handleSelectItem(idx, e.target.value)}
-                            className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded focus:border-indigo-500 outline-none bg-white font-medium"
-                            required
-                          >
-                            <option value="">-- Chọn mặt hàng --</option>
-                            {items.map(it => (
-                              <option key={it.id} value={it.id}>
-                                [{it.code}] {it.name} (Tồn: {it.currentStock} {it.unit})
-                              </option>
-                            ))}
-                          </select>
+                          {line.isNewItem ? (
+                            <div className="space-y-1.5 py-1">
+                              <div className="flex items-center justify-between">
+                                <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-md">
+                                  ✨ Vật tư mới - Tự động cập nhật danh mục
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setLineItems(prev => {
+                                      const updated = [...prev];
+                                      updated[idx] = {
+                                        ...updated[idx],
+                                        isNewItem: false,
+                                        itemId: '',
+                                        itemCode: '',
+                                        itemName: '',
+                                      };
+                                      return updated;
+                                    });
+                                  }}
+                                  className="text-[10px] text-slate-500 hover:text-indigo-600 underline"
+                                >
+                                  Chọn hàng có sẵn
+                                </button>
+                              </div>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                                <input
+                                  type="text"
+                                  placeholder="Mã SKU (*) VD: VT-CD-901"
+                                  value={line.itemCode}
+                                  onChange={e =>
+                                    handleFieldChange(idx, 'itemCode', e.target.value.toUpperCase())
+                                  }
+                                  className="w-full px-2 py-1 text-xs font-mono font-bold border border-emerald-300 rounded focus:border-emerald-600 outline-none bg-white"
+                                  required
+                                />
+                                <input
+                                  type="text"
+                                  placeholder="Tên vật tư / thiết bị (*)"
+                                  value={line.itemName}
+                                  onChange={e =>
+                                    handleFieldChange(idx, 'itemName', e.target.value)
+                                  }
+                                  className="w-full px-2 py-1 text-xs border border-emerald-300 rounded focus:border-emerald-600 outline-none bg-white"
+                                  required
+                                />
+                              </div>
+                              <div className="grid grid-cols-2 gap-1.5">
+                                <input
+                                  type="text"
+                                  placeholder="Nhóm ngành (Cáp điện, Cơ khí...)"
+                                  value={line.category || ''}
+                                  onChange={e =>
+                                    handleFieldChange(idx, 'category', e.target.value)
+                                  }
+                                  className="w-full px-2 py-1 text-[11px] border border-slate-200 rounded outline-none bg-white"
+                                />
+                                <input
+                                  type="text"
+                                  placeholder="Vị trí kệ (Kệ A1-02)"
+                                  value={line.location || ''}
+                                  onChange={e =>
+                                    handleFieldChange(idx, 'location', e.target.value)
+                                  }
+                                  className="w-full px-2 py-1 text-[11px] border border-slate-200 rounded outline-none bg-white"
+                                />
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="space-y-1">
+                              <select
+                                value={line.itemId}
+                                onChange={e => handleSelectItem(idx, e.target.value)}
+                                className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded focus:border-indigo-500 outline-none bg-white font-medium"
+                                required
+                              >
+                                <option value="">-- Chọn mặt hàng có sẵn --</option>
+                                {type === 'NHAP_KHO' && (
+                                  <option value="__NEW_ITEM__">
+                                    ✨ + Nhập vật tư mới (Tự động cập nhật danh mục)
+                                  </option>
+                                )}
+                                {items.map(it => (
+                                  <option key={it.id} value={it.id}>
+                                    [{it.code}] {it.name} (Tồn: {it.currentStock} {it.unit})
+                                  </option>
+                                ))}
+                              </select>
+                              {type === 'NHAP_KHO' && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleSelectItem(idx, '__NEW_ITEM__')}
+                                  className="text-[10px] text-emerald-700 hover:text-emerald-900 inline-flex items-center gap-1 font-medium"
+                                >
+                                  <span>+ Không có trong kho? Nhập vật tư mới tại đây</span>
+                                </button>
+                              )}
+                            </div>
+                          )}
                         </td>
 
                         {/* Unit */}
-                        <td className="py-2 px-2 text-slate-600">{line.unit || '-'}</td>
+                        <td className="py-2 px-2 text-slate-600">
+                          {line.isNewItem ? (
+                            <input
+                              type="text"
+                              value={line.unit}
+                              onChange={e => handleFieldChange(idx, 'unit', e.target.value)}
+                              placeholder="ĐVT"
+                              className="w-full px-1.5 py-1 text-xs border border-emerald-300 rounded text-center outline-none bg-white font-medium"
+                              required
+                            />
+                          ) : (
+                            line.unit || '-'
+                          )}
+                        </td>
 
                         {/* Available Stock */}
                         <td className="py-2 px-2 text-right tabular-nums text-slate-500">
-                          {currentItem ? `${formatNumber(currentItem.currentStock)} ${currentItem.unit}` : '-'}
+                          {line.isNewItem ? (
+                            <span className="text-[10px] text-emerald-600 font-semibold">Mới (0)</span>
+                          ) : currentItem ? (
+                            `${formatNumber(currentItem.currentStock)} ${currentItem.unit}`
+                          ) : (
+                            '-'
+                          )}
                         </td>
 
                         {/* Quantity */}

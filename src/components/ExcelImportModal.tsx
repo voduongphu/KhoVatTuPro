@@ -74,6 +74,8 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
         'Đối Tác / Nhà Cung Cấp / Người Nhận': 'Công ty Cổ phần Cadivi Việt Nam',
         'Dự Án / Phòng Ban': 'Dự án Cơ điện Hạ tầng Long Biên',
         'Mã SKU Vật Tư': 'VT-CD-101',
+        'Tên Vật Tư': 'Dây cáp điện Cadivi CV 2.5mm2 (Cuộn 100m)',
+        'Đơn Vị Tính': 'Cuộn',
         'Số Lượng': 200,
         'Đơn Giá (VNĐ)': 185000,
         'Số Serial / Lô': 'LOT-CAD-2026-X1',
@@ -87,6 +89,8 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
         'Đối Tác / Nhà Cung Cấp / Người Nhận': 'Công ty Cổ phần Cadivi Việt Nam',
         'Dự Án / Phòng Ban': 'Dự án Cơ điện Hạ tầng Long Biên',
         'Mã SKU Vật Tư': 'VT-CD-102',
+        'Tên Vật Tư': 'Aptomat Schneider MCB 3P 63A',
+        'Đơn Vị Tính': 'Cái',
         'Số Lượng': 10,
         'Đơn Giá (VNĐ)': 2850000,
         'Số Serial / Lô': 'LOT-SCH-2026-X2',
@@ -100,6 +104,8 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
         'Đối Tác / Nhà Cung Cấp / Người Nhận': 'Đội Thi công Thép (KS. Hùng)',
         'Dự Án / Phòng Ban': 'Dự án Nhà xưởng Hải Phòng',
         'Mã SKU Vật Tư': 'VT-KL-401',
+        'Tên Vật Tư': 'Thép hình chữ H Posco 200x200x8x12',
+        'Đơn Vị Tính': 'Cây',
         'Số Lượng': 20,
         'Đơn Giá (VNĐ)': 7200000,
         'Số Serial / Lô': 'LOT-HP-H200-2026',
@@ -110,17 +116,19 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
     const worksheet = XLSX.utils.json_to_sheet(templateData);
     // Set column widths
     worksheet['!cols'] = [
-      { wch: 18 },
+      { wch: 20 },
       { wch: 16 },
       { wch: 18 },
       { wch: 12 },
       { wch: 32 },
       { wch: 30 },
       { wch: 16 },
+      { wch: 38 },
+      { wch: 14 },
       { wch: 12 },
       { wch: 16 },
       { wch: 18 },
-      { wch: 30 },
+      { wch: 32 },
     ];
 
     const workbook = XLSX.utils.book_new();
@@ -265,11 +273,30 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
             i => i.code.toLowerCase() === itemCode.toLowerCase()
           );
 
+          // Extract additional optional item info if introducing new item in Goods Receipt
+          const rawItemName = getCleanVal(
+            row,
+            'Tên Vật Tư / Thiết Bị',
+            'Tên Vật Tư',
+            'Tên Hàng',
+            'Tên',
+            'Item Name',
+            'Name',
+            'ten_vt'
+          );
+          const rawUnit = getCleanVal(row, 'Đơn Vị Tính', 'ĐVT', 'Unit', 'don_vi_tinh') || 'Cái';
+          const rawCat = getCleanVal(row, 'Danh Mục', 'Nhóm Ngành', 'Category', 'danh_muc') || 'Cơ điện & Vật tư công trình';
+          const rawLoc = getCleanVal(row, 'Vị Trí Kệ', 'Vị Trí', 'Location', 'vi_tri') || 'Khu vực tiếp nhận';
+
+          const isNewItem = !matchedItem && type === 'NHAP_KHO';
+
           const errors: string[] = [];
           if (!itemCode) {
             errors.push(`Dòng ${idx + 2}: Thiếu mã SKU vật tư`);
           } else if (!matchedItem) {
-            errors.push(`Dòng ${idx + 2}: Không tìm thấy mã SKU "${itemCode}" trong kho`);
+            if (type !== 'NHAP_KHO') {
+              errors.push(`Dòng ${idx + 2}: Không tìm thấy mã SKU "${itemCode}" trong kho để xuất`);
+            }
           }
 
           if (qty <= 0) {
@@ -292,13 +319,16 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
           const lineItem: TransactionLineItem = {
             itemId: matchedItem?.id || '',
             itemCode: itemCode || 'CHƯA_RÕ',
-            itemName: matchedItem?.name || 'Vật tư chưa xác định',
-            unit: matchedItem?.unit || 'Cái',
+            itemName: rawItemName ? String(rawItemName).trim() : (matchedItem?.name || itemCode),
+            unit: rawUnit ? String(rawUnit).trim() : (matchedItem?.unit || 'Cái'),
             quantity: qty,
             unitPrice,
             amount: qty * unitPrice,
             serialNumber: serial,
             note,
+            isNewItem,
+            category: String(rawCat),
+            location: String(rawLoc),
           };
 
           if (groupedMap.has(groupKey)) {

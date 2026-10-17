@@ -12,6 +12,7 @@ import { CreateTransactionModal } from './components/CreateTransactionModal';
 import { CreateItemModal } from './components/CreateItemModal';
 import { TransactionPrintModal } from './components/TransactionPrintModal';
 import { ExcelImportModal } from './components/ExcelImportModal';
+import { ImportItemsExcelModal } from './components/ImportItemsExcelModal';
 import { EditTransactionModal } from './components/EditTransactionModal';
 import { LoginView } from './components/LoginView';
 import { InventoryItem, Transaction, TransactionType } from './types/inventory';
@@ -28,6 +29,7 @@ function InventoryApp() {
   const [printTransaction, setPrintTransaction] = useState<Transaction | null>(null);
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
   const [isExcelImportOpen, setIsExcelImportOpen] = useState(false);
+  const [isItemsExcelImportOpen, setIsItemsExcelImportOpen] = useState(false);
 
   const [createTransactionState, setCreateTransactionState] = useState<{
     isOpen: boolean;
@@ -104,6 +106,7 @@ function InventoryApp() {
             onEditItem={item => handleOpenCreateItem(item)}
             onOpenCreateItem={() => handleOpenCreateItem()}
             onQuickGoodsIn={item => handleOpenCreateTransaction('NHAP_KHO', item)}
+            onOpenImportItems={() => setIsItemsExcelImportOpen(true)}
           />
         )}
 
@@ -213,6 +216,13 @@ function InventoryApp() {
         <ExcelImportModal
           onClose={() => setIsExcelImportOpen(false)}
           onSuccess={() => setIsExcelImportOpen(false)}
+        />
+      )}
+
+      {isItemsExcelImportOpen && (
+        <ImportItemsExcelModal
+          onClose={() => setIsItemsExcelImportOpen(false)}
+          onSuccess={() => setIsItemsExcelImportOpen(false)}
         />
       )}
     </div>
