@@ -142,6 +142,10 @@ export interface User {
   status: 'ACTIVE' | 'LOCKED';
   createdAt: string;
   lastLogin?: string;
+  // Multi-device Single Session Tracking
+  activeDeviceId?: string | null;
+  activeDeviceName?: string | null;
+  lastActiveAt?: string | null;
 }
 
 export interface ImportTransactionRow {

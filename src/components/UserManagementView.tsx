@@ -11,9 +11,10 @@ import {
   AlertCircle,
   Warehouse as WarehouseIcon,
   Phone,
-  Mail,
   CheckCircle2,
   X,
+  Smartphone,
+  LogOut,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
 import { User, UserRole } from '../types/inventory';
@@ -21,10 +22,20 @@ import { formatDate, getUserRoleLabel } from '../utils/formatters';
 import { ConfirmDeleteModal } from './ConfirmDeleteModal';
 
 export const UserManagementView: React.FC = () => {
-  const { users, currentUser, warehouses, addUser, updateUser, deleteUser } = useInventory();
+  const { users, currentUser, warehouses, addUser, updateUser, deleteUser, revokeUserSession } = useInventory();
 
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingUser, setEditingUser] = useState<User | null>(null);
+
+  const handleRevokeSession = (user: User) => {
+    if (
+      window.confirm(
+        `Đăng xuất tài khoản "${user.fullName}" khỏi thiết bị "${user.activeDeviceName || 'đang online'}" ngay lập tức?`
+      )
+    ) {
+      revokeUserSession(user.id);
+    }
+  };
 
   // Form states
   const [username, setUsername] = useState('');
@@ -173,12 +184,21 @@ export const UserManagementView: React.FC = () => {
       {/* Top Banner */}
       <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
-            <Users className="w-5 h-5 text-indigo-600" />
-            <span>Quản Lý Người Sử Dụng &amp; Phân Quyền</span>
-          </h2>
+          <div className="flex items-center gap-2 flex-wrap">
+            <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+              <Users className="w-5 h-5 text-indigo-600" />
+              <span>Quản Lý Người Sử Dụng &amp; Phân Quyền</span>
+            </h2>
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-50 border border-emerald-200 text-emerald-700 shadow-2xs">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+              </span>
+              Đồng bộ Realtime đa thiết bị
+            </span>
+          </div>
           <p className="text-xs text-slate-500 mt-1">
-            Phân quyền nghiệp vụ: Quản trị viên (Admin), Thủ kho và Nhân viên kỹ thuật
+            Phân quyền nghiệp vụ: Quản trị viên (Admin), Thủ kho và Nhân viên kỹ thuật. Mọi thay đổi tài khoản tự động đồng bộ ngay lập tức tới các thiết bị khác.
           </p>
         </div>
 
@@ -268,6 +288,7 @@ export const UserManagementView: React.FC = () => {
                 <th className="py-3 px-3">Kho phụ trách</th>
                 <th className="py-3 px-3">Liên hệ</th>
                 <th className="py-3 px-3 text-center">Trạng thái</th>
+                <th className="py-3 px-3">Thiết bị &amp; Phiên online</th>
                 <th className="py-3 px-3">Ngày tạo</th>
                 <th className="py-3 px-4 text-center">Thao tác</th>
               </tr>
@@ -350,6 +371,29 @@ export const UserManagementView: React.FC = () => {
                       </span>
                     </td>
 
+                    {/* Device & Session Status */}
+                    <td className="py-3.5 px-3 whitespace-nowrap">
+                      {u.activeDeviceId ? (
+                        <div className="flex flex-col gap-0.5">
+                          <div className="flex items-center gap-1.5">
+                            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                            <span className="font-semibold text-emerald-700 text-[11px] flex items-center gap-1">
+                              <Smartphone className="w-3.5 h-3.5 text-emerald-600 inline shrink-0" />
+                              <span>{u.activeDeviceName || '1 thiết bị'}</span>
+                            </span>
+                          </div>
+                          <span className="text-[10px] text-slate-400">
+                            Hoạt động: {formatDate(u.lastActiveAt || u.lastLogin)}
+                          </span>
+                        </div>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-slate-400 text-[11px]">
+                          <span className="w-1.5 h-1.5 rounded-full bg-slate-300" />
+                          Ngoại tuyến
+                        </span>
+                      )}
+                    </td>
+
                     {/* Created */}
                     <td className="py-3.5 px-3 text-slate-400 text-[11px] whitespace-nowrap">
                       {formatDate(u.createdAt)}
@@ -359,6 +403,17 @@ export const UserManagementView: React.FC = () => {
                     <td className="py-3.5 px-4 text-center whitespace-nowrap">
                       {isAdmin ? (
                         <div className="flex items-center justify-center gap-1">
+                          {/* Force Logout from Device */}
+                          {u.activeDeviceId && !isCurrent && (
+                            <button
+                              onClick={() => handleRevokeSession(u)}
+                              className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors"
+                              title={`Đăng xuất từ xa khỏi ${u.activeDeviceName || 'thiết bị'}`}
+                            >
+                              <LogOut className="w-4 h-4 text-rose-500" />
+                            </button>
+                          )}
+
                           <button
                             onClick={() => handleOpenEdit(u)}
                             className="p-1.5 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors"

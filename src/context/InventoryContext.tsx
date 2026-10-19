@@ -17,6 +17,8 @@ import {
 import { getStockStatus } from '../utils/formatters';
 import { SyncStatus, CloudProvider, CentralDataPayload, centralSyncService } from '../services/centralSyncService';
 import { supabaseRealtimeService, RealtimeConnectionState } from '../services/supabaseRealtimeService';
+import { DeviceInfo, getDeviceId, getDeviceInfo, getDeviceName } from '../utils/deviceHelper';
+import { sessionBus, SessionBusMessage } from '../services/sessionBus';
 
 interface InventoryContextType {
   warehouses: Warehouse[];
@@ -25,11 +27,32 @@ interface InventoryContextType {
   categories: string[];
   suppliers: string[];
 
-  // Auth & User Management
+  // Auth & User Management (Single active session across devices)
   users: User[];
   currentUser: User | null;
-  login: (username: string, password: string) => { success: boolean; error?: string };
+  login: (
+    username: string,
+    password: string
+  ) => Promise<{
+    success: boolean;
+    error?: string;
+    code?: 'INVALID_CREDENTIALS' | 'ACCOUNT_LOCKED' | 'SESSION_ACTIVE_ON_ANOTHER_DEVICE';
+    otherDevice?: {
+      id?: string | null;
+      name?: string | null;
+      lastActiveAt?: string | null;
+    };
+  }>;
+  forceLogoutOtherDeviceAndLogin: (
+    username: string,
+    password: string
+  ) => Promise<{ success: boolean; error?: string }>;
   logout: () => void;
+  revokeUserSession: (userId: string) => { success: boolean; error?: string };
+  sessionTerminatedReason: string | null;
+  clearSessionTerminatedReason: () => void;
+  currentDeviceInfo: DeviceInfo;
+  regenerateDeviceIdForTesting: () => string;
   addUser: (userData: Omit<User, 'id' | 'createdAt'>) => { success: boolean; error?: string };
   updateUser: (id: string, updates: Partial<User>) => { success: boolean; error?: string };
   deleteUser: (id: string) => { success: boolean; error?: string };
@@ -178,6 +201,28 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return null;
   });
 
+  // Multi-device Single Session Tracking state
+  const [sessionTerminatedReason, setSessionTerminatedReason] = useState<string | null>(null);
+  const [currentDeviceInfo, setCurrentDeviceInfo] = useState<DeviceInfo>(() => getDeviceInfo());
+
+  const clearSessionTerminatedReason = useCallback(() => {
+    setSessionTerminatedReason(null);
+  }, []);
+
+  const regenerateDeviceIdForTesting = useCallback(() => {
+    const randomHex = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const timeHex = Date.now().toString(36).toUpperCase();
+    const newId = `DEV-${timeHex}-${randomHex}`;
+    try {
+      localStorage.setItem('nxt_inventory_device_id_v1', newId);
+    } catch {
+      // ignore
+    }
+    const fresh = getDeviceInfo();
+    setCurrentDeviceInfo(fresh);
+    return newId;
+  }, []);
+
   const [filterCriteria, setFilterCriteria] = useState<MultiFilterCriteria>(defaultCriteria);
 
   // Central Cloud Synchronization state (Vercel KV / Supabase)
@@ -280,6 +325,101 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       unsubscribeStatus();
     };
   }, []);
+
+  // Direct push helper for instant cloud broadcast without debounce delay
+  const pushCloudSyncImmediately = useCallback(
+    async (
+      newItems: InventoryItem[],
+      newTransactions: Transaction[],
+      newWarehouses: Warehouse[],
+      newUsers: User[],
+      source = 'web-client'
+    ) => {
+      const fullPayload: CentralDataPayload = {
+        version: Date.now(),
+        lastUpdated: new Date().toISOString(),
+        items: newItems,
+        transactions: newTransactions,
+        warehouses: newWarehouses,
+        users: newUsers,
+        source,
+      };
+
+      try {
+        if (supabaseRealtimeService.isConfigured()) {
+          await supabaseRealtimeService.pushState(fullPayload);
+        }
+      } catch (err) {
+        console.warn('Immediate supabase push failed:', err);
+      }
+
+      try {
+        await centralSyncService.pushUpdate({
+          items: newItems,
+          transactions: newTransactions,
+          warehouses: newWarehouses,
+          users: newUsers,
+          source,
+        });
+      } catch (err) {
+        console.warn('Immediate centralSync push failed:', err);
+      }
+    },
+    []
+  );
+
+  // Active session monitor: Terminate session if another device logs in with this user account
+  useEffect(() => {
+    if (!currentUser) return;
+    const currentDeviceId = getDeviceId();
+    const freshUser = users.find(u => u.id === currentUser.id);
+    if (!freshUser) return;
+
+    if (freshUser.status === 'LOCKED') {
+      setCurrentUser(null);
+      setSessionTerminatedReason('Tài khoản của bạn đã bị khóa bởi Quản trị viên.');
+      return;
+    }
+
+    // Another device claimed the session
+    if (freshUser.activeDeviceId && freshUser.activeDeviceId !== currentDeviceId) {
+      console.warn('[Multi-Device] Account active on another device:', freshUser.activeDeviceName);
+      setCurrentUser(null);
+      setSessionTerminatedReason(
+        `Tài khoản "${freshUser.fullName}" đã được đăng nhập trên một thiết bị khác (${freshUser.activeDeviceName || 'Thiết bị khác'}). Phiên làm việc trên thiết bị này đã được tự động kết thúc để bảo đảm an toàn dữ liệu.`
+      );
+    } else if (freshUser.activeDeviceId === null) {
+      // Session was logged out remotely or by admin
+      console.warn('[Multi-Device] Account session terminated remotely');
+      setCurrentUser(null);
+      setSessionTerminatedReason(
+        `Tài khoản "${freshUser.fullName}" đã được đăng xuất từ xa hoặc bởi Quản trị viên.`
+      );
+    }
+  }, [users, currentUser]);
+
+  // Cross-tab / Cross-window broadcast listener
+  useEffect(() => {
+    const unsubscribe = sessionBus.subscribe((msg) => {
+      if (!currentUser) return;
+      if (msg.userId === currentUser.id) {
+        const myDeviceId = getDeviceId();
+        if (msg.type === 'TAKEOVER' && msg.deviceId && msg.deviceId !== myDeviceId) {
+          setCurrentUser(null);
+          setSessionTerminatedReason(
+            `Tài khoản "${currentUser.fullName}" vừa được đăng nhập trên một thiết bị khác (${msg.deviceName || 'Thiết bị mới'}). Phiên làm việc trên thiết bị này đã được tự động kết thúc.`
+          );
+        } else if (msg.type === 'LOGOUT' && msg.deviceId !== myDeviceId) {
+          setCurrentUser(null);
+          setSessionTerminatedReason(
+            msg.reason || `Tài khoản "${currentUser.fullName}" đã được đăng xuất từ xa.`
+          );
+        }
+      }
+    });
+
+    return () => unsubscribe();
+  }, [currentUser]);
 
   // Trigger manual or background fetch from central server
   const triggerManualSync = useCallback(async () => {
@@ -551,36 +691,274 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     pushLocalChanges(items, transactions, warehouses, users);
   }, [warehouses, pushLocalChanges, items, transactions, users]);
 
-  // Auth Operations
-  const login = (username: string, password: string): { success: boolean; error?: string } => {
+  // Auth Operations (Multi-Device Single Session Enforcement)
+  const login = async (
+    username: string,
+    password: string
+  ): Promise<{
+    success: boolean;
+    error?: string;
+    code?: 'INVALID_CREDENTIALS' | 'ACCOUNT_LOCKED' | 'SESSION_ACTIVE_ON_ANOTHER_DEVICE';
+    otherDevice?: {
+      id?: string | null;
+      name?: string | null;
+      lastActiveAt?: string | null;
+    };
+  }> => {
     const trimmedUsername = username.trim().toLowerCase();
-    const user = users.find(u => u.username.toLowerCase() === trimmedUsername);
+    let currentUsersList = users;
+
+    // 1. Always refresh users from cloud immediately before login to get real-time device sessions
+    try {
+      let remotePayload: CentralDataPayload | null = null;
+      if (supabaseRealtimeService.isConfigured()) {
+        remotePayload = await supabaseRealtimeService.fetchLatest();
+      }
+      if (!remotePayload) {
+        const syncRes = await centralSyncService.fetchLatestData();
+        if (syncRes.success && syncRes.payload) {
+          remotePayload = syncRes.payload;
+        }
+      }
+
+      if (remotePayload && Array.isArray(remotePayload.users) && remotePayload.users.length > 0) {
+        setUsers(remotePayload.users);
+        try {
+          localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(remotePayload.users));
+        } catch {
+          // ignore
+        }
+        currentUsersList = remotePayload.users;
+      }
+    } catch (err) {
+      console.warn('Could not refresh remote users during login:', err);
+    }
+
+    const user = currentUsersList.find(u => u.username.toLowerCase() === trimmedUsername);
 
     if (!user) {
-      return { success: false, error: 'Tên đăng nhập không tồn tại trong hệ thống.' };
+      return {
+        success: false,
+        code: 'INVALID_CREDENTIALS',
+        error: 'Tên đăng nhập không tồn tại trong hệ thống.',
+      };
     }
 
     if (user.status === 'LOCKED') {
-      return { success: false, error: 'Tài khoản này đang bị khóa. Vui lòng liên hệ Quản trị viên.' };
+      return {
+        success: false,
+        code: 'ACCOUNT_LOCKED',
+        error: 'Tài khoản này đang bị khóa. Vui lòng liên hệ Quản trị viên.',
+      };
     }
 
     if (user.password !== password) {
-      return { success: false, error: 'Mật khẩu không chính xác. Vui lòng thử lại.' };
+      return {
+        success: false,
+        code: 'INVALID_CREDENTIALS',
+        error: 'Mật khẩu không chính xác. Vui lòng thử lại.',
+      };
     }
 
-    const updatedUser = {
+    const currentDeviceId = getDeviceId();
+    const currentDeviceName = getDeviceName();
+
+    // 2. Multi-device check: block if currently active on a different device!
+    if (user.activeDeviceId && user.activeDeviceId !== currentDeviceId) {
+      return {
+        success: false,
+        code: 'SESSION_ACTIVE_ON_ANOTHER_DEVICE',
+        error: `Tài khoản "${user.fullName}" hiện đang đăng nhập trên thiết bị: "${user.activeDeviceName || 'Thiết bị khác'}".`,
+        otherDevice: {
+          id: user.activeDeviceId,
+          name: user.activeDeviceName || 'Thiết bị khác',
+          lastActiveAt: user.lastActiveAt || user.lastLogin,
+        },
+      };
+    }
+
+    // 3. Login allowed on this device
+    const nowIso = new Date().toISOString();
+    const updatedUser: User = {
       ...user,
-      lastLogin: new Date().toISOString().replace('T', ' ').substring(0, 16),
+      lastLogin: nowIso.replace('T', ' ').substring(0, 16),
+      activeDeviceId: currentDeviceId,
+      activeDeviceName: currentDeviceName,
+      lastActiveAt: nowIso,
     };
 
-    setUsers(prev => prev.map(u => (u.id === user.id ? updatedUser : u)));
+    const updatedUsers = currentUsersList.map(u => (u.id === user.id ? updatedUser : u));
+    setUsers(updatedUsers);
+    try {
+      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
+      localStorage.setItem(STORAGE_KEYS.AUTH, JSON.stringify(updatedUser));
+    } catch {
+      // ignore
+    }
+
     setCurrentUser(updatedUser);
+    setSessionTerminatedReason(null);
+
+    // Instant cloud broadcast & local tab notification
+    pushCloudSyncImmediately(items, transactions, warehouses, updatedUsers);
+    sessionBus.broadcast({
+      type: 'LOGIN',
+      userId: user.id,
+      deviceId: currentDeviceId,
+      deviceName: currentDeviceName,
+    });
+
     return { success: true };
   };
 
-  const logout = () => {
-    setCurrentUser(null);
+  const forceLogoutOtherDeviceAndLogin = async (
+    username: string,
+    password: string
+  ): Promise<{ success: boolean; error?: string }> => {
+    const trimmedUsername = username.trim().toLowerCase();
+    let currentUsersList = users;
+
+    try {
+      let remotePayload: CentralDataPayload | null = null;
+      if (supabaseRealtimeService.isConfigured()) {
+        remotePayload = await supabaseRealtimeService.fetchLatest();
+      }
+      if (!remotePayload) {
+        const syncRes = await centralSyncService.fetchLatestData();
+        if (syncRes.success && syncRes.payload) {
+          remotePayload = syncRes.payload;
+        }
+      }
+      if (remotePayload && Array.isArray(remotePayload.users) && remotePayload.users.length > 0) {
+        setUsers(remotePayload.users);
+        currentUsersList = remotePayload.users;
+      }
+    } catch (err) {
+      console.warn('Could not refresh remote users before takeover:', err);
+    }
+
+    const user = currentUsersList.find(u => u.username.toLowerCase() === trimmedUsername);
+    if (!user) {
+      return { success: false, error: 'Tên đăng nhập không tồn tại.' };
+    }
+    if (user.status === 'LOCKED') {
+      return { success: false, error: 'Tài khoản này đang bị khóa.' };
+    }
+    if (user.password !== password) {
+      return { success: false, error: 'Mật khẩu không chính xác.' };
+    }
+
+    const currentDeviceId = getDeviceId();
+    const currentDeviceName = getDeviceName();
+    const nowIso = new Date().toISOString();
+
+    const updatedUser: User = {
+      ...user,
+      lastLogin: nowIso.replace('T', ' ').substring(0, 16),
+      activeDeviceId: currentDeviceId,
+      activeDeviceName: currentDeviceName,
+      lastActiveAt: nowIso,
+    };
+
+    const updatedUsers = currentUsersList.map(u => (u.id === user.id ? updatedUser : u));
+    setUsers(updatedUsers);
+    try {
+      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
+      localStorage.setItem(STORAGE_KEYS.AUTH, JSON.stringify(updatedUser));
+    } catch {
+      // ignore
+    }
+
+    setCurrentUser(updatedUser);
+    setSessionTerminatedReason(null);
+
+    // Push takeover immediately to invalidate other devices
+    pushCloudSyncImmediately(items, transactions, warehouses, updatedUsers);
+    sessionBus.broadcast({
+      type: 'TAKEOVER',
+      userId: user.id,
+      deviceId: currentDeviceId,
+      deviceName: currentDeviceName,
+    });
+
+    return { success: true };
   };
+
+  const logout = useCallback(() => {
+    if (currentUser) {
+      const currentDeviceId = getDeviceId();
+      const updatedUsers = users.map(u => {
+        if (u.id === currentUser.id) {
+          return {
+            ...u,
+            activeDeviceId: null,
+            activeDeviceName: null,
+            lastActiveAt: null,
+          };
+        }
+        return u;
+      });
+
+      setUsers(updatedUsers);
+      try {
+        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
+        localStorage.removeItem(STORAGE_KEYS.AUTH);
+      } catch {
+        // ignore
+      }
+
+      pushCloudSyncImmediately(items, transactions, warehouses, updatedUsers);
+      sessionBus.broadcast({
+        type: 'LOGOUT',
+        userId: currentUser.id,
+        deviceId: currentDeviceId,
+      });
+    }
+    setCurrentUser(null);
+  }, [currentUser, users, items, transactions, warehouses, pushCloudSyncImmediately]);
+
+  const revokeUserSession = useCallback(
+    (userId: string): { success: boolean; error?: string } => {
+      if (!currentUser || currentUser.role !== 'ADMIN') {
+        return { success: false, error: 'Chỉ Quản trị viên (Admin) mới có quyền đăng xuất phiên người dùng.' };
+      }
+
+      const targetUser = users.find(u => u.id === userId);
+      if (!targetUser) {
+        return { success: false, error: 'Không tìm thấy người dùng.' };
+      }
+
+      const updatedUsers = users.map(u => {
+        if (u.id === userId) {
+          return {
+            ...u,
+            activeDeviceId: null,
+            activeDeviceName: null,
+            lastActiveAt: null,
+          };
+        }
+        return u;
+      });
+
+      setUsers(updatedUsers);
+      try {
+        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
+      } catch {
+        // ignore
+      }
+
+      pushCloudSyncImmediately(items, transactions, warehouses, updatedUsers);
+      sessionBus.broadcast({
+        type: 'LOGOUT',
+        userId: userId,
+        deviceId: 'admin-action',
+        reason: 'Quản trị viên đã đăng xuất tài khoản này từ xa.',
+      });
+
+      return { success: true };
+    },
+    [currentUser, users, items, transactions, warehouses, pushCloudSyncImmediately]
+  );
 
   // User Management
   const addUser = (userData: Omit<User, 'id' | 'createdAt'>): { success: boolean; error?: string } => {
@@ -602,6 +980,12 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     const updatedUsers = [...users, newUser];
     setUsers(updatedUsers);
+    try {
+      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
+    } catch {
+      // ignore
+    }
+    pushCloudSyncImmediately(items, transactions, warehouses, updatedUsers);
     pushLocalChanges(items, transactions, warehouses, updatedUsers);
     return { success: true };
   };
@@ -631,6 +1015,12 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     });
 
     setUsers(updatedUsers);
+    try {
+      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
+    } catch {
+      // ignore
+    }
+    pushCloudSyncImmediately(items, transactions, warehouses, updatedUsers);
     pushLocalChanges(items, transactions, warehouses, updatedUsers);
     return { success: true };
   };
@@ -646,6 +1036,12 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     const updatedUsers = users.filter(u => u.id !== id);
     setUsers(updatedUsers);
+    try {
+      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
+    } catch {
+      // ignore
+    }
+    pushCloudSyncImmediately(items, transactions, warehouses, updatedUsers);
     pushLocalChanges(items, transactions, warehouses, updatedUsers);
     return { success: true };
   };
@@ -1336,7 +1732,13 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         users,
         currentUser,
         login,
+        forceLogoutOtherDeviceAndLogin,
         logout,
+        revokeUserSession,
+        sessionTerminatedReason,
+        clearSessionTerminatedReason,
+        currentDeviceInfo,
+        regenerateDeviceIdForTesting,
         addUser,
         updateUser,
         deleteUser,

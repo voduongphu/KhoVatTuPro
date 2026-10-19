@@ -51,6 +51,7 @@ export const Header: React.FC<HeaderProps> = ({
     realtimeConnectionState,
     lastRealtimeUpdateMessage,
     clearRealtimeMessage,
+    currentDeviceInfo,
   } = useInventory();
 
   const [isCreateMenuOpen, setIsCreateMenuOpen] = useState(false);
@@ -321,7 +322,7 @@ export const Header: React.FC<HeaderProps> = ({
               <div className="flex items-center gap-1 sm:gap-1.5 pl-1.5 sm:pl-2 border-l border-slate-200">
                 <div
                   className="flex items-center gap-1 sm:gap-1.5 px-1.5 sm:px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs"
-                  title={`Tài khoản: ${currentUser.fullName} (@${currentUser.username})`}
+                  title={`Tài khoản: ${currentUser.fullName} (@${currentUser.username}) • Thiết bị này: ${currentDeviceInfo.name}`}
                 >
                   <div
                     className={`w-5 h-5 rounded-full flex items-center justify-center font-bold text-[10px] text-white shrink-0 ${
