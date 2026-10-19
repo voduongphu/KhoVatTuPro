@@ -99,7 +99,7 @@ interface InventoryContextType {
   };
   updateTransaction: (
     id: string,
-    updates: Partial<Omit<Transaction, 'id' | 'code' | 'type'>>
+    updates: Partial<Transaction>
   ) => { success: boolean; error?: string };
   deleteTransaction: (id: string) => { success: boolean; error?: string };
   importTransactionsBatch: (
@@ -1506,10 +1506,10 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return { success: true, transaction: newTransaction };
   };
 
-  // Update Transaction
+  // Update Transaction (Admin has full rights to edit details, items, quantities and recalculate stock)
   const updateTransaction = (
     id: string,
-    updates: Partial<Omit<Transaction, 'id' | 'code' | 'type'>>
+    updates: Partial<Transaction>
   ): { success: boolean; error?: string } => {
     if (!currentUser || (currentUser.role !== 'ADMIN' && currentUser.role !== 'THU_KHO')) {
       return { success: false, error: 'Bạn không có quyền chỉnh sửa phiếu này.' };
@@ -1520,10 +1520,117 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Không tìm thấy phiếu giao dịch.' };
     }
 
-    setTransactions(prev =>
-      prev.map(t => (t.id === id ? { ...t, ...updates } : t))
-    );
+    if (updates.items && currentUser.role !== 'ADMIN') {
+      return {
+        success: false,
+        error: 'Chỉ Quản trị viên (Admin) mới có quyền chỉnh sửa chi tiết danh mục và số lượng vật tư trong phiếu.',
+      };
+    }
 
+    let updatedItemsList = [...items];
+
+    // If items or warehouse were updated, adjust inventory balances
+    if (updates.items) {
+      // 1. Revert existing transaction's stock effects:
+      for (const oldLine of existing.items) {
+        const idx = updatedItemsList.findIndex(
+          i =>
+            i.id === oldLine.itemId ||
+            (oldLine.itemCode &&
+              i.code.trim().toUpperCase() === oldLine.itemCode.trim().toUpperCase() &&
+              i.warehouseId === existing.warehouseId)
+        );
+        if (idx !== -1) {
+          const item = updatedItemsList[idx];
+          const revertDelta = existing.type === 'NHAP_KHO' ? -oldLine.quantity : oldLine.quantity;
+          updatedItemsList[idx] = {
+            ...item,
+            currentStock: Math.max(0, item.currentStock + revertDelta),
+          };
+        }
+      }
+
+      // 2. Apply new items' stock effects:
+      const targetWarehouseId = updates.warehouseId || existing.warehouseId;
+      const targetType = updates.type || existing.type;
+
+      for (const newLine of updates.items) {
+        const idx = updatedItemsList.findIndex(
+          i =>
+            i.id === newLine.itemId ||
+            (newLine.itemCode &&
+              i.code.trim().toUpperCase() === newLine.itemCode.trim().toUpperCase() &&
+              i.warehouseId === targetWarehouseId)
+        );
+        if (idx !== -1) {
+          const item = updatedItemsList[idx];
+          const applyDelta = targetType === 'NHAP_KHO' ? newLine.quantity : -newLine.quantity;
+          const newUnitPrice =
+            targetType === 'NHAP_KHO' && newLine.unitPrice > 0 ? newLine.unitPrice : item.unitPrice;
+          updatedItemsList[idx] = {
+            ...item,
+            currentStock: Math.max(0, item.currentStock + applyDelta),
+            unitPrice: newUnitPrice,
+            updatedAt: new Date().toISOString().replace('T', ' ').substring(0, 16),
+          };
+        } else if (targetType === 'NHAP_KHO') {
+          // If new item row was added into a Goods Receipt
+          const newItemId = newLine.itemId || `ITEM-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+          const cleanCode = (newLine.itemCode || `VT-${Date.now().toString().slice(-4)}`).trim().toUpperCase();
+          const newItem: InventoryItem = {
+            id: newItemId,
+            code: cleanCode,
+            name: (newLine.itemName || 'Vật tư nhập mới').trim(),
+            type: newLine.type || 'VAT_TU',
+            category: (newLine.category || 'Vật tư dự án').trim(),
+            unit: (newLine.unit || 'Cái').trim(),
+            warehouseId: targetWarehouseId,
+            location: (newLine.location || 'Khu vực tiếp nhận').trim(),
+            minStock: newLine.minStock ?? 5,
+            maxStock: newLine.maxStock ?? 200,
+            currentStock: Math.max(0, newLine.quantity),
+            unitPrice: Math.max(0, newLine.unitPrice || 0),
+            serialOrLot: (newLine.serialNumber || '').trim(),
+            condition: newLine.condition || 'SAN_SANG',
+            supplierDefault: (updates.partnerName || existing.partnerName).trim(),
+            spec: (newLine.spec || '').trim(),
+            updatedAt: new Date().toISOString().replace('T', ' ').substring(0, 16),
+          };
+          updatedItemsList.unshift(newItem);
+        }
+      }
+
+      setItems(updatedItemsList);
+      try {
+        localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(updatedItemsList));
+      } catch {
+        // ignore
+      }
+    }
+
+    const finalItems = updates.items || existing.items;
+    const computedTotalAmount =
+      updates.totalAmount !== undefined
+        ? updates.totalAmount
+        : finalItems.reduce((acc, it) => acc + (it.amount || it.quantity * it.unitPrice), 0);
+
+    const updatedTrx: Transaction = {
+      ...existing,
+      ...updates,
+      items: finalItems,
+      totalAmount: computedTotalAmount,
+    };
+
+    const newTransactionsList = transactions.map(t => (t.id === id ? updatedTrx : t));
+    setTransactions(newTransactionsList);
+    try {
+      localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(newTransactionsList));
+    } catch {
+      // ignore
+    }
+
+    pushCloudSyncImmediately(updatedItemsList, newTransactionsList, warehouses, users);
+    pushLocalChanges(updatedItemsList, newTransactionsList, warehouses, users);
     return { success: true };
   };
 
@@ -1674,18 +1781,26 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     };
   };
 
-  // Generate Chronological Stock Ledger for an Item
+  // Generate Chronological Stock Ledger for an Item (Scoped strictly to item's storage warehouse)
   const getItemLedger = (itemId: string): StockLedgerEntry[] => {
-    const sorted = [...transactions].sort(
-      (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
-    );
+    const targetItem = items.find(i => i.id === itemId);
+    const sorted = [...transactions]
+      .filter(t => t.status !== 'DA_HUY' && (!targetItem || t.warehouseId === targetItem.warehouseId))
+      .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
     let runningBalance = 0;
     const entries: StockLedgerEntry[] = [];
 
     for (const trx of sorted) {
-      const line = trx.items.find(i => i.itemId === itemId);
-      if (line) {
+      const matchingLines = trx.items.filter(
+        i =>
+          i.itemId === itemId ||
+          (targetItem &&
+            i.itemCode &&
+            i.itemCode.trim().toUpperCase() === targetItem.code.trim().toUpperCase())
+      );
+
+      for (const line of matchingLines) {
         const inQty = trx.type === 'NHAP_KHO' ? line.quantity : 0;
         const outQty = trx.type === 'XUAT_KHO' ? line.quantity : 0;
         runningBalance = runningBalance + inQty - outQty;

@@ -13,6 +13,7 @@ import {
   ArrowDownLeft,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
+import * as XLSX from 'xlsx';
 import {
   exportToCSV,
   formatCurrency,
@@ -89,80 +90,114 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     });
   }, [warehouses, items, totalInventoryValue]);
 
-  // Comprehensive In-Out-Stock (NXT) Report Data
+  // Comprehensive In-Out-Stock (NXT) Report Data - Strictly Scoped by Kho Lưu (Storage Warehouse)
   const nxtReportRows = useMemo(() => {
-    return items
-      .filter(item => (selectedReportWarehouse === 'ALL' ? true : item.warehouseId === selectedReportWarehouse))
-      .map(item => {
-        // Compute in and out from transactions
-        let totalIn = 0;
-        let totalOut = 0;
+    // Filter items by selectedReportWarehouse
+    const relevantItems = items.filter(item =>
+      selectedReportWarehouse === 'ALL' ? true : item.warehouseId === selectedReportWarehouse
+    );
 
-        transactions.forEach(trx => {
-          const line = trx.items.find(l => l.itemId === item.id);
-          if (line) {
-            if (trx.type === 'NHAP_KHO') totalIn += line.quantity;
-            if (trx.type === 'XUAT_KHO') totalOut += line.quantity;
-          }
+    return relevantItems.map(item => {
+      let totalIn = 0;
+      let totalOut = 0;
+
+      // CRITICAL FIX: Only count transactions that occurred at THIS item's specific storage warehouse!
+      transactions.forEach(trx => {
+        if (trx.status === 'DA_HUY') return;
+        if (trx.warehouseId !== item.warehouseId) return;
+
+        const matchingLines = trx.items.filter(
+          l =>
+            l.itemId === item.id ||
+            (l.itemCode &&
+              l.itemCode.trim().toUpperCase() === item.code.trim().toUpperCase())
+        );
+
+        matchingLines.forEach(line => {
+          if (trx.type === 'NHAP_KHO') totalIn += line.quantity;
+          if (trx.type === 'XUAT_KHO') totalOut += line.quantity;
         });
-
-        // Opening balance approximation
-        const closingStock = item.currentStock;
-        const openingStock = Math.max(0, closingStock - totalIn + totalOut);
-        const closingValue = closingStock * item.unitPrice;
-        const wh = warehouses.find(w => w.id === item.warehouseId);
-
-        return {
-          id: item.id,
-          code: item.code,
-          name: item.name,
-          type: item.type,
-          unit: item.unit,
-          warehouseName: wh?.name || item.warehouseId,
-          openingStock,
-          totalIn,
-          totalOut,
-          closingStock,
-          unitPrice: item.unitPrice,
-          closingValue,
-          status: getStockStatus(item),
-        };
       });
+
+      // Opening balance: Tồn đầu kỳ = Tồn cuối kỳ - Nhập trong kỳ + Xuất trong kỳ
+      const closingStock = item.currentStock;
+      const openingStock = Math.max(0, closingStock - totalIn + totalOut);
+      const closingValue = closingStock * item.unitPrice;
+      const wh = warehouses.find(w => w.id === item.warehouseId);
+
+      return {
+        id: item.id,
+        code: item.code,
+        name: item.name,
+        type: item.type,
+        unit: item.unit,
+        warehouseId: item.warehouseId,
+        warehouseName: wh?.name || item.warehouseId,
+        openingStock,
+        totalIn,
+        totalOut,
+        closingStock,
+        unitPrice: item.unitPrice,
+        closingValue,
+        status: getStockStatus(item),
+      };
+    });
   }, [items, transactions, selectedReportWarehouse, warehouses]);
 
-  // Export report to CSV
+  // Export report to genuine Excel (.xlsx) file
   const handleExportNXT = () => {
-    const headers = [
-      'Mã Vật Tư/Thiết Bị',
-      'Tên Vật Tư Thiết Bị',
-      'Phân Loại',
-      'ĐVT',
-      'Kho Lưu Trữ',
-      'Tồn Đầu Kỳ',
-      'Nhập Trong Kỳ',
-      'Xuất Trong Kỳ',
-      'Tồn Cuối Kỳ',
-      'Đơn Giá Vốn (VNĐ)',
-      'Thành Tiền Tồn (VNĐ)',
-      'Tình Trạng Tồn Kho',
-    ];
+    const selectedWhName =
+      selectedReportWarehouse === 'ALL'
+        ? 'Tat_Ca_Cac_Kho'
+        : warehouses.find(w => w.id === selectedReportWarehouse)?.name?.replace(/\s+/g, '_') ||
+          selectedReportWarehouse;
 
-    const rows = nxtReportRows.map(row => [
-      row.code,
-      row.name,
-      getItemTypeLabel(row.type),
-      row.unit,
-      row.warehouseName,
-      row.openingStock,
-      row.totalIn,
-      row.totalOut,
-      row.closingStock,
-      row.unitPrice,
-      row.closingValue,
-      getStockStatusLabel(row.status),
-    ]);
+    const excelData = nxtReportRows.map((row, idx) => ({
+      STT: idx + 1,
+      'Mã SKU': row.code,
+      'Tên Vật Tư Thiết Bị': row.name,
+      'Phân Loại': getItemTypeLabel(row.type),
+      'ĐVT': row.unit,
+      'Kho Lưu Trữ': row.warehouseName,
+      'Tồn Đầu Kỳ': row.openingStock,
+      'Nhập Trong Kỳ': row.totalIn,
+      'Xuất Trong Kỳ': row.totalOut,
+      'Tồn Cuối Kỳ': row.closingStock,
+      'Đơn Giá Vốn (VNĐ)': row.unitPrice,
+      'Thành Tiền Tồn (VNĐ)': row.closingValue,
+      'Tình Trạng Tồn Kho': getStockStatusLabel(row.status),
+    }));
 
-    exportToCSV(`Bao_Cao_Nhap_Xuat_Ton_${new Date().toISOString().substring(0, 10)}`, headers, rows);
+    // Add summary row
+    const totalOpening = nxtReportRows.reduce((a, b) => a + b.openingStock, 0);
+    const totalIn = nxtReportRows.reduce((a, b) => a + b.totalIn, 0);
+    const totalOut = nxtReportRows.reduce((a, b) => a + b.totalOut, 0);
+    const totalClosing = nxtReportRows.reduce((a, b) => a + b.closingStock, 0);
+    const totalValue = nxtReportRows.reduce((a, b) => a + b.closingValue, 0);
+
+    excelData.push({
+      STT: 'TỔNG CỘNG' as any,
+      'Mã SKU': '',
+      'Tên Vật Tư Thiết Bị': `Tổng ${nxtReportRows.length} mặt hàng`,
+      'Phân Loại': '',
+      'ĐVT': '',
+      'Kho Lưu Trữ': '',
+      'Tồn Đầu Kỳ': totalOpening,
+      'Nhập Trong Kỳ': totalIn,
+      'Xuất Trong Kỳ': totalOut,
+      'Tồn Cuối Kỳ': totalClosing,
+      'Đơn Giá Vốn (VNĐ)': '' as any,
+      'Thành Tiền Tồn (VNĐ)': totalValue,
+      'Tình Trạng Tồn Kho': '',
+    });
+
+    const worksheet = XLSX.utils.json_to_sheet(excelData);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Bao_Cao_NXT');
+    XLSX.writeFile(
+      workbook,
+      `Bao_Cao_Nhap_Xuat_Ton_${selectedWhName}_${new Date().toISOString().substring(0, 10)}.xlsx`
+    );
   };
 
   return (
