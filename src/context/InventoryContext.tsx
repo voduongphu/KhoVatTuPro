@@ -1231,8 +1231,15 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
 
       // 2. Warehouses
-      if (filterCriteria.warehouses.length > 0 && !filterCriteria.warehouses.includes(item.warehouseId)) {
-        return false;
+      if (filterCriteria.warehouses.length > 0) {
+        const itemWh = item.warehouseId || '';
+        const inPrimary = Boolean(itemWh && filterCriteria.warehouses.includes(itemWh));
+        const inStocks = item.warehouseStocks
+          ? filterCriteria.warehouses.some(wId => (item.warehouseStocks?.[wId] || 0) > 0)
+          : false;
+        if (!inPrimary && !inStocks) {
+          return false;
+        }
       }
 
       // 3. Item Types
