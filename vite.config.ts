@@ -4,8 +4,14 @@ import fs from 'fs';
 import path from 'path';
 import { defineConfig } from 'vite';
 
+const CURRENT_RESET_EPOCH = '2026-10-20T10:00:00.000Z';
+
 function mergeServerStateAdditive(existing: any, incoming: any) {
-  if (!existing) return incoming;
+  // If incoming has an outdated resetEpoch, reject it to prevent stale data resurrection
+  if (incoming && incoming.resetEpoch !== CURRENT_RESET_EPOCH) {
+    return existing;
+  }
+  if (!existing || existing.resetEpoch !== CURRENT_RESET_EPOCH) return incoming;
   if (!incoming) return existing;
 
   // 1. Users additive merge
@@ -90,6 +96,7 @@ function mergeServerStateAdditive(existing: any, incoming: any) {
     ),
     warehouses: Array.from(whMap.values()),
     items: Array.from(itemMap.values()),
+    resetEpoch: CURRENT_RESET_EPOCH,
     source: incoming.source || 'server-additive-merge',
   };
 }
@@ -124,6 +131,13 @@ function syncApiPlugin() {
           }
 
           if (req.method === 'GET') {
+            try {
+              if (fs.existsSync(STATE_FILE)) {
+                memoryState = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
+              }
+            } catch {
+              // keep existing memoryState
+            }
             res.setHeader('Content-Type', 'application/json');
             res.statusCode = 200;
             res.end(
@@ -145,8 +159,15 @@ function syncApiPlugin() {
               try {
                 const body = JSON.parse(bodyStr);
                 if (body && body.payload) {
-                  // Additive merge instead of overwriting existing state
-                  memoryState = mergeServerStateAdditive(memoryState, body.payload);
+                  if (body.cleanReset || body.payload.cleanReset) {
+                    memoryState = {
+                      ...body.payload,
+                      resetEpoch: CURRENT_RESET_EPOCH,
+                    };
+                  } else {
+                    // Additive merge instead of overwriting existing state
+                    memoryState = mergeServerStateAdditive(memoryState, body.payload);
+                  }
                   try {
                     fs.writeFileSync(STATE_FILE, JSON.stringify(memoryState, null, 2), 'utf-8');
                   } catch (e) {

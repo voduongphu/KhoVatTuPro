@@ -151,12 +151,51 @@ const defaultCriteria: MultiFilterCriteria = {
 };
 
 const STORAGE_KEYS = {
-  ITEMS: 'nxt_inventory_items_v1',
-  TRANSACTIONS: 'nxt_inventory_transactions_v1',
-  WAREHOUSES: 'nxt_inventory_warehouses_v1',
-  USERS: 'nxt_inventory_users_v1',
-  AUTH: 'nxt_inventory_current_user_v1',
+  ITEMS: 'nxt_inventory_items_v3',
+  TRANSACTIONS: 'nxt_inventory_transactions_v3',
+  WAREHOUSES: 'nxt_inventory_warehouses_v3',
+  USERS: 'nxt_inventory_users_v3',
+  AUTH: 'nxt_inventory_current_user_v3',
 };
+
+const RESET_EPOCH = '2026-10-20T10:00:00.000Z';
+
+// Automatic cleanup of legacy data so admin starts fresh with admin/admin123
+if (typeof window !== 'undefined') {
+  try {
+    const CLEAN_KEY = 'nxt_clean_admin_v4_clean_users';
+    if (!localStorage.getItem(CLEAN_KEY)) {
+      Object.keys(localStorage).forEach(k => {
+        if (k.startsWith('nxt_')) {
+          localStorage.removeItem(k);
+        }
+      });
+      localStorage.setItem(CLEAN_KEY, 'true');
+
+      // Sync clean state to central endpoint immediately
+      fetch('/api/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cleanReset: true,
+          payload: {
+            cleanReset: true,
+            resetEpoch: RESET_EPOCH,
+            version: 1,
+            lastUpdated: new Date().toISOString(),
+            users: INITIAL_USERS,
+            warehouses: INITIAL_WAREHOUSES,
+            items: INITIAL_ITEMS,
+            transactions: INITIAL_TRANSACTIONS,
+            source: 'admin-clean-reset',
+          },
+        }),
+      }).catch(() => {});
+    }
+  } catch {
+    // ignore
+  }
+}
 
 const InventoryContext = createContext<InventoryContextType | null>(null);
 
@@ -261,6 +300,41 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       if (!payload) return;
 
       isRemoteUpdatingRef.current = true;
+
+      // If this is a clean reset command from admin or payload is from before the reset epoch, wipe cleanly
+      if (
+        (payload as any).cleanReset ||
+        (payload.resetEpoch && payload.resetEpoch !== RESET_EPOCH) ||
+        (!payload.resetEpoch && (payload as any).version > 1)
+      ) {
+        setWarehouses(payload.warehouses && payload.warehouses.length > 0 ? payload.warehouses : INITIAL_WAREHOUSES);
+        setUsers(payload.users && payload.users.length > 0 ? payload.users : INITIAL_USERS);
+        setTransactions(payload.transactions || []);
+        setItems(payload.items || []);
+        try {
+          localStorage.setItem(
+            STORAGE_KEYS.WAREHOUSES,
+            JSON.stringify(payload.warehouses && payload.warehouses.length > 0 ? payload.warehouses : INITIAL_WAREHOUSES)
+          );
+          localStorage.setItem(
+            STORAGE_KEYS.USERS,
+            JSON.stringify(payload.users && payload.users.length > 0 ? payload.users : INITIAL_USERS)
+          );
+          localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(payload.transactions || []));
+          localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(payload.items || []));
+        } catch {
+          // ignore
+        }
+        if (payload.lastUpdated) {
+          setLastServerTimestamp(payload.lastUpdated);
+        }
+        setLastSyncedAt(new Date());
+        setSyncStatus('synced');
+        setTimeout(() => {
+          isRemoteUpdatingRef.current = false;
+        }, 350);
+        return;
+      }
 
       // 1. Merge warehouses additively
       let currentWh = warehouses;
@@ -395,6 +469,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         transactions: newTransactions,
         warehouses: newWarehouses,
         users: newUsers,
+        resetEpoch: RESET_EPOCH,
         source,
       };
 
@@ -412,6 +487,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           transactions: newTransactions,
           warehouses: newWarehouses,
           users: newUsers,
+          resetEpoch: RESET_EPOCH,
           source,
         });
       } catch (err) {
@@ -551,6 +627,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           transactions: newTransactions,
           warehouses: newWarehouses,
           users: usersToPush,
+          resetEpoch: RESET_EPOCH,
           source: 'web-client',
         };
 
@@ -572,6 +649,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             transactions: newTransactions,
             warehouses: newWarehouses,
             users: usersToPush,
+            resetEpoch: RESET_EPOCH,
           })
           .then((res) => {
             if (res.success && res.payload) {
@@ -1861,6 +1939,27 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     localStorage.removeItem(STORAGE_KEYS.ITEMS);
     localStorage.removeItem(STORAGE_KEYS.TRANSACTIONS);
     localStorage.removeItem(STORAGE_KEYS.USERS);
+    localStorage.removeItem(STORAGE_KEYS.AUTH);
+
+    // Sync clean state to /api/sync
+    fetch('/api/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        cleanReset: true,
+        payload: {
+          cleanReset: true,
+          resetEpoch: RESET_EPOCH,
+          version: 1,
+          lastUpdated: new Date().toISOString(),
+          users: INITIAL_USERS,
+          warehouses: INITIAL_WAREHOUSES,
+          items: INITIAL_ITEMS,
+          transactions: INITIAL_TRANSACTIONS,
+          source: 'admin-clean-reset',
+        },
+      }),
+    }).catch(() => {});
   };
 
   return (

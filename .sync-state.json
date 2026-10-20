@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "lastUpdated": "2026-10-20T10:00:00.000Z",
+  "resetEpoch": "2026-10-20T10:00:00.000Z",
+  "cleanReset": true,
+  "users": [
+    {
+      "id": "USR-ADMIN",
+      "username": "admin",
+      "password": "admin123",
+      "fullName": "Quản Trị Viên",
+      "role": "ADMIN",
+      "email": "admin@khovattu.pro",
+      "phone": "0901.156.220",
+      "assignedWarehouseId": "ALL",
+      "status": "ACTIVE",
+      "createdAt": "2026-01-01 08:00"
+    }
+  ],
+  "warehouses": [
+    {
+      "id": "WH-01",
+      "code": "KHO-01",
+      "name": "Kho Tổng Trung Tâm",
+      "address": "Trụ sở chính PTSC",
+      "manager": "Quản trị viên",
+      "status": "ACTIVE"
+    }
+  ],
+  "items": [],
+  "transactions": [],
+  "source": "admin-clean-reset"
+}

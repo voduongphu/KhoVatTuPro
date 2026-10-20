@@ -386,7 +386,10 @@ function mergeStateAdditive(existing: any, incoming: any) {
     }
 
     // 2. Merge additively: never overwrite or erase existing items, transactions, or users
-    const mergedPayload = mergeStateAdditive(existingState, payload);
+    const mergedPayload =
+      body.cleanReset || payload.cleanReset
+        ? payload
+        : mergeStateAdditive(existingState, payload);
     localMemoryState = mergedPayload;
 
     let saved = false;
