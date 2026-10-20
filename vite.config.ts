@@ -4,6 +4,96 @@ import fs from 'fs';
 import path from 'path';
 import { defineConfig } from 'vite';
 
+function mergeServerStateAdditive(existing: any, incoming: any) {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+
+  // 1. Users additive merge
+  const userMap = new Map<string, any>();
+  (existing.users || []).forEach((u: any) => {
+    const key = (u.username || u.id || '').trim().toLowerCase();
+    if (key) userMap.set(key, u);
+  });
+  (incoming.users || []).forEach((u: any) => {
+    const key = (u.username || u.id || '').trim().toLowerCase();
+    if (!key) return;
+    const prev = userMap.get(key);
+    if (!prev) {
+      userMap.set(key, u);
+    } else {
+      userMap.set(key, { ...prev, ...u });
+    }
+  });
+
+  // 2. Transactions additive merge
+  const trxMap = new Map<string, any>();
+  (existing.transactions || []).forEach((t: any) => {
+    const key = (t.id || t.code || '').trim();
+    if (key) trxMap.set(key, t);
+  });
+  (incoming.transactions || []).forEach((t: any) => {
+    const key = (t.id || t.code || '').trim();
+    if (!key) return;
+    const prev = trxMap.get(key);
+    if (!prev) {
+      trxMap.set(key, t);
+    } else {
+      trxMap.set(key, { ...prev, ...t });
+    }
+  });
+
+  // 3. Warehouses additive merge
+  const whMap = new Map<string, any>();
+  (existing.warehouses || []).forEach((w: any) => {
+    const key = (w.id || w.code || '').trim();
+    if (key) whMap.set(key, w);
+  });
+  (incoming.warehouses || []).forEach((w: any) => {
+    const key = (w.id || w.code || '').trim();
+    if (!key) return;
+    const prev = whMap.get(key);
+    if (!prev) {
+      whMap.set(key, w);
+    } else {
+      whMap.set(key, { ...prev, ...w });
+    }
+  });
+
+  // 4. Items additive merge
+  const itemMap = new Map<string, any>();
+  (existing.items || []).forEach((i: any) => {
+    const key = (i.code || i.id || '').trim().toUpperCase();
+    if (key) itemMap.set(key, i);
+  });
+  (incoming.items || []).forEach((i: any) => {
+    const key = (i.code || i.id || '').trim().toUpperCase();
+    if (!key) return;
+    const prev = itemMap.get(key);
+    if (!prev) {
+      itemMap.set(key, i);
+    } else {
+      itemMap.set(key, {
+        ...prev,
+        ...i,
+        warehouseStocks: { ...(prev.warehouseStocks || {}), ...(i.warehouseStocks || {}) },
+        currentStock: i.currentStock !== undefined ? i.currentStock : prev.currentStock,
+      });
+    }
+  });
+
+  return {
+    version: Math.max(Number(existing.version) || 0, Number(incoming.version) || 0) + 1,
+    lastUpdated: new Date().toISOString(),
+    users: Array.from(userMap.values()),
+    transactions: Array.from(trxMap.values()).sort(
+      (a: any, b: any) => new Date(b.date).getTime() - new Date(a.date).getTime()
+    ),
+    warehouses: Array.from(whMap.values()),
+    items: Array.from(itemMap.values()),
+    source: incoming.source || 'server-additive-merge',
+  };
+}
+
 function syncApiPlugin() {
   const STATE_FILE = path.resolve(__dirname, '.sync-state.json');
   let memoryState: any = null;
@@ -55,7 +145,8 @@ function syncApiPlugin() {
               try {
                 const body = JSON.parse(bodyStr);
                 if (body && body.payload) {
-                  memoryState = body.payload;
+                  // Additive merge instead of overwriting existing state
+                  memoryState = mergeServerStateAdditive(memoryState, body.payload);
                   try {
                     fs.writeFileSync(STATE_FILE, JSON.stringify(memoryState, null, 2), 'utf-8');
                   } catch (e) {
@@ -70,6 +161,7 @@ function syncApiPlugin() {
                       savedToCloud: true,
                       version: memoryState.version,
                       lastUpdated: memoryState.lastUpdated,
+                      payload: memoryState,
                     })
                   );
                   return;

@@ -19,6 +19,12 @@ import { SyncStatus, CloudProvider, CentralDataPayload, centralSyncService } fro
 import { supabaseRealtimeService, RealtimeConnectionState } from '../services/supabaseRealtimeService';
 import { DeviceInfo, getDeviceId, getDeviceInfo, getDeviceName } from '../utils/deviceHelper';
 import { sessionBus, SessionBusMessage } from '../services/sessionBus';
+import {
+  mergeItemsAdditive,
+  mergeTransactionsAdditive,
+  mergeUsersAdditive,
+  mergeWarehousesAdditive,
+} from '../utils/mergeSyncData';
 
 interface InventoryContextType {
   warehouses: Warehouse[];
@@ -249,6 +255,83 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const clearRealtimeMessage = useCallback(() => setLastRealtimeUpdateMessage(null), []);
 
+  // Central additive merge helper: ensures remote data is added/merged rather than replacing local items/users/transactions
+  const applyRemotePayloadAdditive = useCallback(
+    (payload: CentralDataPayload) => {
+      if (!payload) return;
+
+      isRemoteUpdatingRef.current = true;
+
+      // 1. Merge warehouses additively
+      let currentWh = warehouses;
+      if (Array.isArray(payload.warehouses) && payload.warehouses.length > 0) {
+        setWarehouses(prevWh => {
+          const mergedWh = mergeWarehousesAdditive(prevWh, payload.warehouses);
+          currentWh = mergedWh;
+          try {
+            localStorage.setItem(STORAGE_KEYS.WAREHOUSES, JSON.stringify(mergedWh));
+          } catch {
+            // ignore
+          }
+          return mergedWh;
+        });
+      }
+
+      // 2. Merge users additively (never lose any user created on any device)
+      if (Array.isArray(payload.users) && payload.users.length > 0) {
+        const remoteUsers = payload.users;
+        setUsers(prevUsers => {
+          const mergedUsers = mergeUsersAdditive(prevUsers, remoteUsers);
+          try {
+            localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(mergedUsers));
+          } catch {
+            // ignore
+          }
+          return mergedUsers;
+        });
+      }
+
+      // 3. Merge transactions additively & recalculate stock per warehouse
+      setTransactions(prevTrx => {
+        const mergedTrx =
+          Array.isArray(payload.transactions) && payload.transactions.length > 0
+            ? mergeTransactionsAdditive(prevTrx, payload.transactions)
+            : prevTrx;
+        try {
+          localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(mergedTrx));
+        } catch {
+          // ignore
+        }
+
+        // 4. Merge items additively
+        if (Array.isArray(payload.items) && payload.items.length > 0) {
+          setItems(prevItems => {
+            const mergedItems = mergeItemsAdditive(prevItems, payload.items, currentWh, mergedTrx);
+            try {
+              localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(mergedItems));
+            } catch {
+              // ignore
+            }
+            return mergedItems;
+          });
+        }
+
+        return mergedTrx;
+      });
+
+      if (payload.lastUpdated) {
+        setLastServerTimestamp(payload.lastUpdated);
+      }
+      setLastSyncedAt(new Date());
+      setSyncStatus('synced');
+
+      setTimeout(() => {
+        isRemoteUpdatingRef.current = false;
+      }, 350);
+    },
+    [warehouses]
+  );
+
   const saveSupabaseCredentials = useCallback((url: string, key: string) => {
     const configured = supabaseRealtimeService.setCredentials(url, key);
     setSupabaseCredentials({ url, key });
@@ -257,21 +340,12 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       // Immediately attempt fetch from Supabase
       supabaseRealtimeService.fetchLatest().then((remoteData) => {
         if (remoteData) {
-          if (Array.isArray(remoteData.items) && remoteData.items.length > 0) setItems(remoteData.items);
-          if (Array.isArray(remoteData.transactions) && remoteData.transactions.length > 0)
-            setTransactions(remoteData.transactions);
-          if (Array.isArray(remoteData.warehouses) && remoteData.warehouses.length > 0)
-            setWarehouses(remoteData.warehouses);
-          if (Array.isArray(remoteData.users) && remoteData.users.length > 0)
-            setUsers(remoteData.users);
-          setLastServerTimestamp(remoteData.lastUpdated);
-          setLastSyncedAt(new Date());
-          setSyncStatus('synced');
+          applyRemotePayloadAdditive(remoteData);
         }
       });
     }
     return configured;
-  }, []);
+  }, [applyRemotePayloadAdditive]);
 
   // Listen to Supabase Realtime WebSocket events
   useEffect(() => {
@@ -279,39 +353,18 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       if (!payload) return;
       console.log('[InventoryContext] Instant Supabase Realtime update received:', payload);
 
-      isRemoteUpdatingRef.current = true;
-      if (Array.isArray(payload.items) && payload.items.length > 0) {
-        setItems(payload.items);
-      }
-      if (Array.isArray(payload.transactions) && payload.transactions.length > 0) {
-        setTransactions(payload.transactions);
-      }
-      if (Array.isArray(payload.warehouses) && payload.warehouses.length > 0) {
-        setWarehouses(payload.warehouses);
-      }
-      if (Array.isArray(payload.users) && payload.users.length > 0) {
-        setUsers(payload.users);
-      }
-
-      setLastServerTimestamp(payload.lastUpdated);
-      setLastSyncedAt(new Date());
-      setSyncStatus('synced');
-      setSyncProvider('supabase');
+      applyRemotePayloadAdditive(payload);
 
       const isAI = payload.source === 'google-ai';
       const msg = isAI
         ? `⚡ Số liệu mới từ Google AI vừa được cập nhật tức thì (Supabase Realtime)!`
-        : `⚡ Dữ liệu vừa được đồng bộ tức thì qua Supabase Realtime WebSocket!`;
+        : `⚡ Dữ liệu vừa được hợp nhất tự động qua Supabase Realtime WebSocket!`;
       setLastRealtimeUpdateMessage(msg);
 
       // Auto clear message after 6 seconds
       setTimeout(() => {
         setLastRealtimeUpdateMessage(prev => (prev === msg ? null : prev));
       }, 6000);
-
-      setTimeout(() => {
-        isRemoteUpdatingRef.current = false;
-      }, 350);
     });
 
     const unsubscribeStatus = supabaseRealtimeService.onConnectionStateChange((state) => {
@@ -324,7 +377,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return () => {
       unsubscribeStatus();
     };
-  }, []);
+  }, [applyRemotePayloadAdditive]);
 
   // Direct push helper for instant cloud broadcast without debounce delay
   const pushCloudSyncImmediately = useCallback(
@@ -429,26 +482,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       if (supabaseRealtimeService.isConfigured()) {
         const directPayload = await supabaseRealtimeService.fetchLatest();
         if (directPayload) {
-          isRemoteUpdatingRef.current = true;
-          if (Array.isArray(directPayload.items) && directPayload.items.length > 0) {
-            setItems(directPayload.items);
-          }
-          if (Array.isArray(directPayload.transactions) && directPayload.transactions.length > 0) {
-            setTransactions(directPayload.transactions);
-          }
-          if (Array.isArray(directPayload.warehouses) && directPayload.warehouses.length > 0) {
-            setWarehouses(directPayload.warehouses);
-          }
-          if (Array.isArray(directPayload.users) && directPayload.users.length > 0) {
-            setUsers(directPayload.users);
-          }
-          setLastServerTimestamp(directPayload.lastUpdated);
-          setLastSyncedAt(new Date());
-          setSyncStatus('synced');
+          applyRemotePayloadAdditive(directPayload);
           setSyncProvider('supabase');
-          setTimeout(() => {
-            isRemoteUpdatingRef.current = false;
-          }, 350);
           return;
         }
       }
@@ -456,24 +491,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       const result = await centralSyncService.fetchLatestData(lastServerTimestamp);
       if (result.success) {
         setSyncProvider(result.provider);
-        if (result.isNewer && result.payload) {
-          isRemoteUpdatingRef.current = true;
-          if (Array.isArray(result.payload.items) && result.payload.items.length > 0) {
-            setItems(result.payload.items);
-          }
-          if (Array.isArray(result.payload.transactions) && result.payload.transactions.length > 0) {
-            setTransactions(result.payload.transactions);
-          }
-          if (Array.isArray(result.payload.warehouses) && result.payload.warehouses.length > 0) {
-            setWarehouses(result.payload.warehouses);
-          }
-          if (Array.isArray(result.payload.users) && result.payload.users.length > 0) {
-            setUsers(result.payload.users);
-          }
-          setLastServerTimestamp(result.payload.lastUpdated);
-          setTimeout(() => {
-            isRemoteUpdatingRef.current = false;
-          }, 350);
+        if (result.payload) {
+          applyRemotePayloadAdditive(result.payload);
         }
         setSyncStatus('synced');
         setLastSyncedAt(new Date());
@@ -483,9 +502,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch {
       setSyncStatus('offline');
     }
-  }, [lastServerTimestamp]);
+  }, [lastServerTimestamp, applyRemotePayloadAdditive]);
 
-  // Real-time automatic polling every 5 seconds (5000ms) as heartbeat fallback
+  // Real-time automatic polling every 3 seconds (3000ms) as heartbeat fallback
   useEffect(() => {
     if (!autoSyncEnabled) return;
 
@@ -498,7 +517,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         return;
       }
       triggerManualSync();
-    }, 5000);
+    }, 3000);
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
@@ -722,13 +741,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
 
       if (remotePayload && Array.isArray(remotePayload.users) && remotePayload.users.length > 0) {
-        setUsers(remotePayload.users);
+        const mergedUsers = mergeUsersAdditive(users, remotePayload.users);
+        setUsers(mergedUsers);
         try {
-          localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(remotePayload.users));
+          localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(mergedUsers));
         } catch {
           // ignore
         }
-        currentUsersList = remotePayload.users;
+        currentUsersList = mergedUsers;
       }
     } catch (err) {
       console.warn('Could not refresh remote users during login:', err);
