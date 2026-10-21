@@ -10,6 +10,10 @@ export interface CentralDataPayload {
   transactions: Transaction[];
   warehouses: Warehouse[];
   users?: User[];
+  deletedUserIds?: string[];
+  deletedTransactionIds?: string[];
+  deletedItemIds?: string[];
+  deletedWarehouseIds?: string[];
   lastUpdatedBy?: string;
   source?: string;
   resetEpoch?: string;

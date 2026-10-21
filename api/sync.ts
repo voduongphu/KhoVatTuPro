@@ -281,71 +281,153 @@ function mergeStateAdditive(existing: any, incoming: any) {
   if (!existing) return incoming;
   if (!incoming) return existing;
 
+  // Merge deleted IDs (Tombstones) so deletions by Admin or users are respected across devices
+  const deletedUserIds = Array.from(
+    new Set([
+      ...(existing.deletedUserIds || []).map((s: string) => String(s).toLowerCase()),
+      ...(incoming.deletedUserIds || []).map((s: string) => String(s).toLowerCase()),
+    ])
+  );
+  const deletedTrxIds = Array.from(
+    new Set([
+      ...(existing.deletedTransactionIds || []).map((s: string) => String(s).toUpperCase()),
+      ...(incoming.deletedTransactionIds || []).map((s: string) => String(s).toUpperCase()),
+    ])
+  );
+  const deletedItemIds = Array.from(
+    new Set([
+      ...(existing.deletedItemIds || []).map((s: string) => String(s).toUpperCase()),
+      ...(incoming.deletedItemIds || []).map((s: string) => String(s).toUpperCase()),
+    ])
+  );
+  const deletedWarehouseIds = Array.from(
+    new Set([
+      ...(existing.deletedWarehouseIds || []).map((s: string) => String(s).toUpperCase()),
+      ...(incoming.deletedWarehouseIds || []).map((s: string) => String(s).toUpperCase()),
+    ])
+  );
+
+  const delUserSet = new Set(deletedUserIds);
+  const delTrxSet = new Set(deletedTrxIds);
+  const delItemSet = new Set(deletedItemIds);
+  const delWhSet = new Set(deletedWarehouseIds);
+
+  // 1. Users merge (respecting deletions & admin edits)
   const userMap = new Map<string, any>();
   (existing.users || []).forEach((u: any) => {
     const key = (u.username || u.id || '').trim().toLowerCase();
-    if (key) userMap.set(key, u);
+    const idKey = (u.id || '').trim().toLowerCase();
+    if (key && !delUserSet.has(key) && !delUserSet.has(idKey)) {
+      userMap.set(key, u);
+    }
   });
   (incoming.users || []).forEach((u: any) => {
     const key = (u.username || u.id || '').trim().toLowerCase();
-    if (!key) return;
+    const idKey = (u.id || '').trim().toLowerCase();
+    if (!key || delUserSet.has(key) || delUserSet.has(idKey)) return;
+
     const prev = userMap.get(key);
     if (!prev) {
       userMap.set(key, u);
     } else {
-      userMap.set(key, { ...prev, ...u });
+      const prevTime = prev.updatedAt
+        ? new Date(prev.updatedAt).getTime()
+        : prev.lastActiveAt
+        ? new Date(prev.lastActiveAt).getTime()
+        : 0;
+      const incTime = u.updatedAt
+        ? new Date(u.updatedAt).getTime()
+        : u.lastActiveAt
+        ? new Date(u.lastActiveAt).getTime()
+        : 0;
+      const useInc = incTime >= prevTime;
+      userMap.set(key, { ...(useInc ? prev : u), ...(useInc ? u : prev) });
     }
   });
 
+  // 2. Transactions merge (respecting deletions & admin edits)
   const trxMap = new Map<string, any>();
   (existing.transactions || []).forEach((t: any) => {
-    const key = (t.id || t.code || '').trim();
-    if (key) trxMap.set(key, t);
+    const key = (t.id || t.code || '').trim().toUpperCase();
+    const codeKey = (t.code || '').trim().toUpperCase();
+    if (key && !delTrxSet.has(key) && !delTrxSet.has(codeKey)) {
+      trxMap.set(key, t);
+    }
   });
   (incoming.transactions || []).forEach((t: any) => {
-    const key = (t.id || t.code || '').trim();
-    if (!key) return;
+    const key = (t.id || t.code || '').trim().toUpperCase();
+    const codeKey = (t.code || '').trim().toUpperCase();
+    if (!key || delTrxSet.has(key) || delTrxSet.has(codeKey)) return;
+
     const prev = trxMap.get(key);
     if (!prev) {
       trxMap.set(key, t);
     } else {
-      trxMap.set(key, { ...prev, ...t });
+      const prevTime = prev.updatedAt
+        ? new Date(prev.updatedAt).getTime()
+        : new Date(prev.date).getTime() || 0;
+      const incTime = t.updatedAt
+        ? new Date(t.updatedAt).getTime()
+        : new Date(t.date).getTime() || 0;
+      const useInc = incTime >= prevTime;
+      trxMap.set(key, {
+        ...(useInc ? prev : t),
+        ...(useInc ? t : prev),
+        items: useInc && t.items ? t.items : prev.items || t.items,
+        totalAmount: useInc && t.totalAmount !== undefined ? t.totalAmount : prev.totalAmount ?? t.totalAmount,
+      });
     }
   });
 
+  // 3. Warehouses merge
   const whMap = new Map<string, any>();
   (existing.warehouses || []).forEach((w: any) => {
-    const key = (w.id || w.code || '').trim();
-    if (key) whMap.set(key, w);
+    const key = (w.id || w.code || '').trim().toUpperCase();
+    if (key && !delWhSet.has(key)) whMap.set(key, w);
   });
   (incoming.warehouses || []).forEach((w: any) => {
-    const key = (w.id || w.code || '').trim();
-    if (!key) return;
+    const key = (w.id || w.code || '').trim().toUpperCase();
+    if (!key || delWhSet.has(key)) return;
     const prev = whMap.get(key);
     if (!prev) {
       whMap.set(key, w);
     } else {
-      whMap.set(key, { ...prev, ...w });
+      const prevTime = prev.updatedAt ? new Date(prev.updatedAt).getTime() : 0;
+      const incTime = w.updatedAt ? new Date(w.updatedAt).getTime() : 0;
+      const useInc = incTime >= prevTime;
+      whMap.set(key, { ...(useInc ? prev : w), ...(useInc ? w : prev) });
     }
   });
 
+  // 4. Items merge
   const itemMap = new Map<string, any>();
   (existing.items || []).forEach((i: any) => {
     const key = (i.code || i.id || '').trim().toUpperCase();
-    if (key) itemMap.set(key, i);
+    const idKey = (i.id || '').trim().toUpperCase();
+    if (key && !delItemSet.has(key) && !delItemSet.has(idKey)) {
+      itemMap.set(key, i);
+    }
   });
   (incoming.items || []).forEach((i: any) => {
     const key = (i.code || i.id || '').trim().toUpperCase();
-    if (!key) return;
+    const idKey = (i.id || '').trim().toUpperCase();
+    if (!key || delItemSet.has(key) || delItemSet.has(idKey)) return;
+
     const prev = itemMap.get(key);
     if (!prev) {
       itemMap.set(key, i);
     } else {
+      const prevTime = prev.updatedAt ? new Date(prev.updatedAt).getTime() : 0;
+      const incTime = i.updatedAt ? new Date(i.updatedAt).getTime() : 0;
+      const useInc = incTime >= prevTime;
+      const base = useInc ? prev : i;
+      const newer = useInc ? i : prev;
+
       itemMap.set(key, {
-        ...prev,
-        ...i,
-        warehouseStocks: { ...(prev.warehouseStocks || {}), ...(i.warehouseStocks || {}) },
-        currentStock: i.currentStock !== undefined ? i.currentStock : prev.currentStock,
+        ...base,
+        ...newer,
+        warehouseStocks: { ...(base.warehouseStocks || {}), ...(newer.warehouseStocks || {}) },
+        currentStock: newer.currentStock !== undefined ? newer.currentStock : base.currentStock,
       });
     }
   });
@@ -359,6 +441,10 @@ function mergeStateAdditive(existing: any, incoming: any) {
     ),
     warehouses: Array.from(whMap.values()),
     items: Array.from(itemMap.values()),
+    deletedUserIds,
+    deletedTransactionIds: deletedTrxIds,
+    deletedItemIds,
+    deletedWarehouseIds,
     source: incoming.source || 'server-additive-merge',
   };
 }

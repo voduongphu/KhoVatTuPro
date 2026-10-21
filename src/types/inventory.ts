@@ -14,6 +14,7 @@ export interface Warehouse {
   description?: string;
   status?: 'ACTIVE' | 'INACTIVE';
   createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface InventoryItem {
@@ -93,6 +94,7 @@ export interface Transaction {
   items: TransactionLineItem[];
   totalAmount: number;
   status: 'HOAN_THANH' | 'CHO_DUYET' | 'DA_HUY';
+  updatedAt?: string;
 }
 
 export interface MultiFilterCriteria {
@@ -147,6 +149,7 @@ export interface User {
   activeDeviceId?: string | null;
   activeDeviceName?: string | null;
   lastActiveAt?: string | null;
+  updatedAt?: string;
 }
 
 export interface ImportTransactionRow {

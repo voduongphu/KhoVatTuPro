@@ -48,13 +48,26 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
   const [typeFilter, setTypeFilter] = useState<'ALL' | TransactionType>(initialType || 'ALL');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedWarehouse, setSelectedWarehouse] = useState<string>('ALL');
+  const [selectedCreator, setSelectedCreator] = useState<string>('ALL');
 
   const isAdmin = currentUser?.role === 'ADMIN';
   const canManage = currentUser?.role === 'ADMIN' || currentUser?.role === 'THU_KHO';
 
+  // Extract unique creators for filtering
+  const creatorsList = React.useMemo(() => {
+    const set = new Set<string>();
+    transactions.forEach(t => {
+      if (t.creatorName && t.creatorName.trim()) {
+        set.add(t.creatorName.trim());
+      }
+    });
+    return Array.from(set).sort();
+  }, [transactions]);
+
   const filteredTransactions = transactions.filter(trx => {
     if (typeFilter !== 'ALL' && trx.type !== typeFilter) return false;
     if (selectedWarehouse !== 'ALL' && trx.warehouseId !== selectedWarehouse) return false;
+    if (selectedCreator !== 'ALL' && trx.creatorName !== selectedCreator) return false;
 
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase().trim();
@@ -397,6 +410,25 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
               </option>
             ))}
           </select>
+
+          {creatorsList.length > 0 && (
+            <select
+              value={selectedCreator}
+              onChange={e => setSelectedCreator(e.target.value)}
+              className="text-xs border border-slate-200 rounded-lg px-2.5 py-1.5 bg-slate-50 text-slate-700 font-medium outline-none"
+              title="Lọc chứng từ theo người lập phiếu"
+            >
+              <option value="ALL">Tất cả người lập</option>
+              {creatorsList.map(c => {
+                const count = transactions.filter(t => t.creatorName === c).length;
+                return (
+                  <option key={c} value={c}>
+                    {c} ({count} phiếu)
+                  </option>
+                );
+              })}
+            </select>
+          )}
         </div>
 
         {/* Search */}

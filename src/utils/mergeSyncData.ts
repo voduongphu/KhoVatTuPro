@@ -3,47 +3,60 @@ import { calculateItemWarehouseStocks } from './formatters';
 
 /**
  * Hợp nhất danh sách người dùng theo cơ chế thêm vào (Additive Merge).
- * Giữ nguyên tất cả người dùng được tạo trên các thiết bị, không xóa hoặc ghi đè mất người dùng.
+ * Tôn trọng lệnh xóa từ Admin thông qua deletedIds, và ưu tiên phiên bản mới nhất khi Admin chỉnh sửa.
  */
-export function mergeUsersAdditive(localUsers: User[], remoteUsers: User[]): User[] {
+export function mergeUsersAdditive(
+  localUsers: User[],
+  remoteUsers: User[],
+  deletedIds: string[] = []
+): User[] {
   const userMap = new Map<string, User>();
+  const delSet = new Set(deletedIds.map(d => d.trim().toLowerCase()));
 
-  // Normalize key: username hoặc id
   const getKey = (u: User) => (u.username || u.id).trim().toLowerCase();
 
-  // 1. Thêm toàn bộ người dùng local
+  // 1. Thêm toàn bộ người dùng local (bỏ qua những người dùng đã bị xóa)
   localUsers.forEach(u => {
-    userMap.set(getKey(u), u);
+    const key = getKey(u);
+    if (!delSet.has(key) && !delSet.has((u.id || '').toLowerCase())) {
+      userMap.set(key, u);
+    }
   });
 
   // 2. Hợp nhất người dùng remote
   remoteUsers.forEach(remoteU => {
     const key = getKey(remoteU);
+    if (delSet.has(key) || delSet.has((remoteU.id || '').toLowerCase())) {
+      userMap.delete(key);
+      return;
+    }
+
     const existing = userMap.get(key);
 
     if (!existing) {
       // Người dùng mới được tạo từ thiết bị khác -> THÊM VÀO
       userMap.set(key, remoteU);
     } else {
-      // Đã có trong danh sách -> Cập nhật thông tin mới nhất (phiên làm việc, trạng thái, mật khẩu...)
-      const remoteTime = remoteU.lastActiveAt ? new Date(remoteU.lastActiveAt).getTime() : 0;
-      const localTime = existing.lastActiveAt ? new Date(existing.lastActiveAt).getTime() : 0;
+      // Đã có trong danh sách -> So sánh thời gian cập nhật (Admin sửa thông tin có quyền ưu tiên)
+      const remoteTime = remoteU.updatedAt
+        ? new Date(remoteU.updatedAt).getTime()
+        : remoteU.lastActiveAt
+        ? new Date(remoteU.lastActiveAt).getTime()
+        : 0;
+      const localTime = existing.updatedAt
+        ? new Date(existing.updatedAt).getTime()
+        : existing.lastActiveAt
+        ? new Date(existing.lastActiveAt).getTime()
+        : 0;
 
-      const useRemoteSession =
-        remoteTime >= localTime ||
-        (remoteU.activeDeviceId && !existing.activeDeviceId) ||
-        remoteU.status === 'LOCKED';
+      const useRemote = remoteTime >= localTime;
+      const base = useRemote ? existing : remoteU;
+      const overrides = useRemote ? remoteU : existing;
 
       userMap.set(key, {
-        ...existing,
-        ...remoteU,
+        ...base,
+        ...overrides,
         id: remoteU.id || existing.id,
-        role: remoteU.role || existing.role,
-        password: remoteU.password || existing.password,
-        status: remoteU.status || existing.status,
-        activeDeviceId: useRemoteSession ? remoteU.activeDeviceId : existing.activeDeviceId,
-        activeDeviceName: useRemoteSession ? remoteU.activeDeviceName : existing.activeDeviceName,
-        lastActiveAt: useRemoteSession ? remoteU.lastActiveAt : existing.lastActiveAt,
       });
     }
   });
@@ -52,36 +65,60 @@ export function mergeUsersAdditive(localUsers: User[], remoteUsers: User[]): Use
 }
 
 /**
- * Hợp nhất danh sách giao dịch (Phiếu nhập kho / xuất kho) theo cơ chế thêm vào.
- * Tuyệt đối không xóa hay thay thế phiếu của người khác đã tạo.
+ * Hợp nhất danh sách giao dịch (Phiếu nhập kho / xuất kho).
+ * Tôn trọng lệnh xóa phiếu từ Admin (deletedIds) và đồng bộ nội dung chỉnh sửa từ Admin.
  */
 export function mergeTransactionsAdditive(
   localTrx: Transaction[],
-  remoteTrx: Transaction[]
+  remoteTrx: Transaction[],
+  deletedIds: string[] = []
 ): Transaction[] {
   const trxMap = new Map<string, Transaction>();
+  const delSet = new Set(deletedIds.map(d => d.trim().toUpperCase()));
 
-  // 1. Thêm tất cả phiếu local
+  const getKey = (t: Transaction) => (t.id || t.code).trim().toUpperCase();
+
+  // 1. Thêm tất cả phiếu local chưa bị xóa
   localTrx.forEach(t => {
-    const key = (t.id || t.code).trim();
-    trxMap.set(key, t);
+    const key = getKey(t);
+    const codeKey = (t.code || '').trim().toUpperCase();
+    if (!delSet.has(key) && !delSet.has(codeKey)) {
+      trxMap.set(key, t);
+    }
   });
 
   // 2. Hợp nhất phiếu remote
-  remoteTrx.forEach(t => {
-    const key = (t.id || t.code).trim();
+  remoteTrx.forEach(remoteT => {
+    const key = getKey(remoteT);
+    const codeKey = (remoteT.code || '').trim().toUpperCase();
+    if (delSet.has(key) || delSet.has(codeKey)) {
+      trxMap.delete(key);
+      return;
+    }
+
     const existing = trxMap.get(key);
 
     if (!existing) {
       // Phiếu mới tạo từ thiết bị khác -> THÊM VÀO
-      trxMap.set(key, t);
+      trxMap.set(key, remoteT);
     } else {
-      // Đã tồn tại (ví dụ Admin chỉnh sửa nội dung phiếu) -> cập nhật phiên bản mới nhất
+      // Đã tồn tại (Admin chỉnh sửa nội dung phiếu hoặc cập nhật trạng thái)
+      const remoteTime = remoteT.updatedAt
+        ? new Date(remoteT.updatedAt).getTime()
+        : new Date(remoteT.date).getTime() || 0;
+      const localTime = existing.updatedAt
+        ? new Date(existing.updatedAt).getTime()
+        : new Date(existing.date).getTime() || 0;
+
+      const useRemote = remoteTime >= localTime;
+      const base = useRemote ? existing : remoteT;
+      const newer = useRemote ? remoteT : existing;
+
       trxMap.set(key, {
-        ...existing,
-        ...t,
-        items: t.items && t.items.length > 0 ? t.items : existing.items,
-        totalAmount: t.totalAmount !== undefined ? t.totalAmount : existing.totalAmount,
+        ...base,
+        ...newer,
+        items: newer.items && newer.items.length > 0 ? newer.items : base.items,
+        totalAmount: newer.totalAmount !== undefined ? newer.totalAmount : base.totalAmount,
       });
     }
   });
@@ -95,28 +132,44 @@ export function mergeTransactionsAdditive(
 }
 
 /**
- * Hợp nhất danh mục kho lưu trữ theo cơ chế thêm vào.
+ * Hợp nhất danh mục kho lưu trữ.
  */
 export function mergeWarehousesAdditive(
   localWh: Warehouse[],
-  remoteWh: Warehouse[]
+  remoteWh: Warehouse[],
+  deletedIds: string[] = []
 ): Warehouse[] {
   const whMap = new Map<string, Warehouse>();
+  const delSet = new Set(deletedIds.map(d => d.trim().toUpperCase()));
+
+  const getKey = (w: Warehouse) => (w.id || w.code).trim().toUpperCase();
 
   localWh.forEach(w => {
-    const key = (w.id || w.code).trim();
-    whMap.set(key, w);
+    const key = getKey(w);
+    const codeKey = (w.code || '').trim().toUpperCase();
+    if (!delSet.has(key) && !delSet.has(codeKey)) {
+      whMap.set(key, w);
+    }
   });
 
-  remoteWh.forEach(w => {
-    const key = (w.id || w.code).trim();
+  remoteWh.forEach(remoteW => {
+    const key = getKey(remoteW);
+    const codeKey = (remoteW.code || '').trim().toUpperCase();
+    if (delSet.has(key) || delSet.has(codeKey)) {
+      whMap.delete(key);
+      return;
+    }
+
     const existing = whMap.get(key);
     if (!existing) {
-      whMap.set(key, w);
+      whMap.set(key, remoteW);
     } else {
+      const remoteTime = remoteW.updatedAt ? new Date(remoteW.updatedAt).getTime() : 0;
+      const localTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
+      const useRemote = remoteTime >= localTime;
       whMap.set(key, {
-        ...existing,
-        ...w,
+        ...(useRemote ? existing : remoteW),
+        ...(useRemote ? remoteW : existing),
       });
     }
   });
@@ -125,39 +178,51 @@ export function mergeWarehousesAdditive(
 }
 
 /**
- * Hợp nhất danh mục vật tư / thiết bị theo cơ chế thêm vào.
- * Không làm mất mặt hàng nào của bất kỳ thiết bị nào khai báo.
+ * Hợp nhất danh mục vật tư / thiết bị.
+ * Tôn trọng lệnh xóa vật tư từ Admin và cập nhật phiên bản sửa đổi mới nhất.
  */
 export function mergeItemsAdditive(
   localItems: InventoryItem[],
   remoteItems: InventoryItem[],
   warehouses: Warehouse[],
-  mergedTransactions: Transaction[]
+  mergedTransactions: Transaction[],
+  deletedIds: string[] = []
 ): InventoryItem[] {
   const itemMap = new Map<string, InventoryItem>();
+  const delSet = new Set(deletedIds.map(d => d.trim().toUpperCase()));
 
   const getItemKey = (item: InventoryItem) => {
     if (item.code && item.code.trim()) {
       return item.code.trim().toUpperCase();
     }
-    return item.id.trim();
+    return item.id.trim().toUpperCase();
   };
 
-  // 1. Thêm tất cả mặt hàng local
+  // 1. Thêm tất cả mặt hàng local chưa bị xóa
   localItems.forEach(i => {
-    itemMap.set(getItemKey(i), i);
+    const key = getItemKey(i);
+    const idKey = (i.id || '').trim().toUpperCase();
+    if (!delSet.has(key) && !delSet.has(idKey)) {
+      itemMap.set(key, i);
+    }
   });
 
   // 2. Hợp nhất mặt hàng remote
   remoteItems.forEach(remoteItem => {
     const key = getItemKey(remoteItem);
+    const idKey = (remoteItem.id || '').trim().toUpperCase();
+    if (delSet.has(key) || delSet.has(idKey)) {
+      itemMap.delete(key);
+      return;
+    }
+
     const existing = itemMap.get(key);
 
     if (!existing) {
       // Mặt hàng mới khai báo từ thiết bị khác -> THÊM VÀO
       itemMap.set(key, remoteItem);
     } else {
-      // Đã có -> Hợp nhất thông tin thuộc tính
+      // Đã có -> Hợp nhất thông tin thuộc tính theo phiên bản mới nhất
       const remoteTime = remoteItem.updatedAt ? new Date(remoteItem.updatedAt).getTime() : 0;
       const localTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
 

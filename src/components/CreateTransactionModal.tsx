@@ -36,7 +36,7 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
   onClose,
   onSuccess,
 }) => {
-  const { warehouses, items, createTransaction } = useInventory();
+  const { warehouses, items, createTransaction, currentUser } = useInventory();
 
   const [type, setType] = useState<TransactionType>(initialType);
   const [subtype, setSubtype] = useState<string>(
@@ -52,7 +52,9 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
     initialItem?.supplierDefault || ''
   );
   const [departmentOrProject, setDepartmentOrProject] = useState<string>('');
-  const [creatorName, setCreatorName] = useState<string>('Thủ kho');
+  const [creatorName, setCreatorName] = useState<string>(
+    () => currentUser?.fullName || currentUser?.username || 'Thủ kho'
+  );
   const [approverName, setApproverName] = useState<string>('Chỉ huy trưởng / GĐ');
   const [notes, setNotes] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string>('');
