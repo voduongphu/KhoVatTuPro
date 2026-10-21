@@ -158,10 +158,23 @@ function mergeServerStateAdditive(existing: any, incoming: any) {
     }
   });
 
+  const seenUserIds = new Set<string>();
+  const sanitizedUsers = Array.from(userMap.values()).map((u: any) => {
+    let uniqueId = u.id || `USR-${String(u.username).toUpperCase()}`;
+    if (uniqueId === 'USR-ADMIN' && String(u.username).toLowerCase() !== 'admin') {
+      uniqueId = `USR-${String(u.username).toUpperCase()}`;
+    }
+    if (seenUserIds.has(uniqueId)) {
+      uniqueId = `USR-${String(u.username).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+    }
+    seenUserIds.add(uniqueId);
+    return { ...u, id: uniqueId };
+  });
+
   return {
     version: Math.max(Number(existing.version) || 0, Number(incoming.version) || 0) + 1,
     lastUpdated: new Date().toISOString(),
-    users: Array.from(userMap.values()),
+    users: sanitizedUsers,
     transactions: Array.from(trxMap.values()).sort(
       (a: any, b: any) => new Date(b.date).getTime() - new Date(a.date).getTime()
     ),

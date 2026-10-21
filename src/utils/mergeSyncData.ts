@@ -61,7 +61,20 @@ export function mergeUsersAdditive(
     }
   });
 
-  return Array.from(userMap.values());
+  // Đảm bảo ID người dùng luôn là duy nhất (tránh duplicate key USR-ADMIN)
+  const seenIds = new Set<string>();
+  return Array.from(userMap.values()).map(u => {
+    let uniqueId = u.id || `USR-${u.username.toUpperCase()}`;
+    // Nếu không phải tài khoản 'admin' nhưng bị gán id 'USR-ADMIN' thì chuẩn hóa lại
+    if (uniqueId === 'USR-ADMIN' && u.username.toLowerCase() !== 'admin') {
+      uniqueId = `USR-${u.username.toUpperCase()}`;
+    }
+    if (seenIds.has(uniqueId)) {
+      uniqueId = `USR-${u.username.toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+    }
+    seenIds.add(uniqueId);
+    return { ...u, id: uniqueId };
+  });
 }
 
 /**

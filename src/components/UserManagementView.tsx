@@ -320,7 +320,7 @@ export const UserManagementView: React.FC = () => {
                 const isCurrent = u.id === currentUser?.id;
 
                 return (
-                  <tr key={u.id} className="hover:bg-slate-50/80 transition-colors">
+                  <tr key={`${u.id}-${u.username}`} className="hover:bg-slate-50/80 transition-colors">
                     {/* User info */}
                     <td className="py-3.5 px-4">
                       <div className="flex items-center gap-3">

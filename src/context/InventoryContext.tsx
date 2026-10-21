@@ -197,7 +197,19 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [users, setUsers] = useState<User[]>(() => {
     try {
       const stored = localStorage.getItem(STORAGE_KEYS.USERS);
-      return stored ? JSON.parse(stored) : INITIAL_USERS;
+      const parsed = stored ? JSON.parse(stored) : INITIAL_USERS;
+      const seen = new Set<string>();
+      return (Array.isArray(parsed) ? parsed : INITIAL_USERS).map((u: User) => {
+        let uniqueId = u.id || `USR-${u.username.toUpperCase()}`;
+        if (uniqueId === 'USR-ADMIN' && u.username.toLowerCase() !== 'admin') {
+          uniqueId = `USR-${u.username.toUpperCase()}`;
+        }
+        if (seen.has(uniqueId)) {
+          uniqueId = `USR-${u.username.toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+        }
+        seen.add(uniqueId);
+        return { ...u, id: uniqueId };
+      });
     } catch {
       return INITIAL_USERS;
     }
