@@ -182,17 +182,7 @@ export const calculateItemWarehouseStocks = (
     result[w.id] = 0;
   });
 
-  // 1. Nếu mặt hàng đã có cấu hình explicit warehouseStocks
-  if (item.warehouseStocks && Object.keys(item.warehouseStocks).length > 0) {
-    warehouses.forEach(w => {
-      if (item.warehouseStocks?.[w.id] !== undefined) {
-        result[w.id] = Math.max(0, item.warehouseStocks[w.id]);
-      }
-    });
-    return result;
-  }
-
-  // 2. Tính toán theo luồng giao dịch thực tế tại từng kho
+  // Calculate actual transaction movements per warehouse
   const activeTrx = transactions.filter(t => t.status !== 'DA_HUY');
   const whMovements: Record<string, { inQty: number; outQty: number }> = {};
   warehouses.forEach(w => {
@@ -206,35 +196,50 @@ export const calculateItemWarehouseStocks = (
     if (!whMovements[whId]) {
       whMovements[whId] = { inQty: 0, outQty: 0 };
     }
-    const matchingLines = trx.items.filter(
+    const matchingLines = (trx.items || []).filter(
       l =>
-        l.itemId === item.id ||
+        (l.itemId && l.itemId === item.id) ||
         (l.itemCode &&
           item.code &&
           l.itemCode.trim().toUpperCase() === item.code.trim().toUpperCase())
     );
     matchingLines.forEach(line => {
+      const q = Number(line.quantity) || 0;
       if (trx.type === 'NHAP_KHO') {
-        whMovements[whId].inQty += line.quantity;
-        totalNetTransactions += line.quantity;
+        whMovements[whId].inQty += q;
+        totalNetTransactions += q;
       } else if (trx.type === 'XUAT_KHO') {
-        whMovements[whId].outQty += line.quantity;
-        totalNetTransactions -= line.quantity;
+        whMovements[whId].outQty += q;
+        totalNetTransactions -= q;
       }
     });
   });
 
-  const primaryWhId = item.warehouseId || warehouses[0]?.id || 'WH-HN';
-  const baselineOpening = Math.max(0, item.currentStock - totalNetTransactions);
+  const primaryWhId = item.warehouseId || warehouses[0]?.id || 'WH-01';
 
-  warehouses.forEach(w => {
-    const net = (whMovements[w.id]?.inQty || 0) - (whMovements[w.id]?.outQty || 0);
-    if (w.id === primaryWhId) {
-      result[w.id] = Math.max(0, baselineOpening + net);
-    } else {
-      result[w.id] = Math.max(0, net);
-    }
-  });
+  if (item.warehouseStocks && Object.keys(item.warehouseStocks).length > 0) {
+    warehouses.forEach(w => {
+      const recorded = item.warehouseStocks?.[w.id] ?? 0;
+      result[w.id] = Math.max(0, recorded);
+    });
+    // Ensure warehouses with transactions reflect movements
+    warehouses.forEach(w => {
+      const net = (whMovements[w.id]?.inQty || 0) - (whMovements[w.id]?.outQty || 0);
+      if (result[w.id] === 0 && net > 0) {
+        result[w.id] = Math.max(0, net);
+      }
+    });
+  } else {
+    const baselineOpening = Math.max(0, (item.currentStock || 0) - totalNetTransactions);
+    warehouses.forEach(w => {
+      const net = (whMovements[w.id]?.inQty || 0) - (whMovements[w.id]?.outQty || 0);
+      if (w.id === primaryWhId) {
+        result[w.id] = Math.max(0, baselineOpening + net);
+      } else {
+        result[w.id] = Math.max(0, net);
+      }
+    });
+  }
 
   const sumAll = Object.values(result).reduce((a, b) => a + b, 0);
   if (sumAll === 0 && item.currentStock > 0) {

@@ -7,7 +7,7 @@
       "username": "admin",
       "password": "admin123",
       "fullName": "Quản Trị Viên Hệ Thống",
-      "role": "THU_KHO",
+      "role": "ADMIN",
       "email": "admin@khovattu.pro",
       "phone": "0901.888.999",
       "assignedWarehouseId": "ALL",

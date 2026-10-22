@@ -11,6 +11,7 @@ import {
   StockLedgerEntry,
   StockStatus,
   Transaction,
+  TransactionLineItem,
   User,
   Warehouse,
 } from '../types/inventory';
@@ -109,7 +110,7 @@ interface InventoryContextType {
   ) => { success: boolean; error?: string };
   deleteTransaction: (id: string) => { success: boolean; error?: string };
   importTransactionsBatch: (
-    importedList: (Omit<Transaction, 'id' | 'code'> & { id?: string; code?: string })[]
+    importedList: Omit<Transaction, 'id' | 'code'>[]
   ) => { success: boolean; importedCount: number; errors: string[] };
 
   getItemLedger: (itemId: string) => StockLedgerEntry[];
@@ -1768,10 +1769,10 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         const currentItem = items.find(
           i =>
             (line.itemId && i.id === line.itemId) ||
-            (line.itemCode && i.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
+            (line.itemCode && i.code && i.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
         );
         if (!currentItem) {
-          return { success: false, error: `Không tìm thấy vật tư mã "${line.itemCode}".` };
+          return { success: false, error: `Không tìm thấy vật tư mã "${line.itemCode || line.itemName}".` };
         }
         if (currentItem.currentStock < line.quantity) {
           return {
@@ -1788,25 +1789,21 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const code = `${prefix}-${year}-${String(1000 + count).padStart(4, '0')}`;
 
     const nowIso = new Date().toISOString();
-    const newTransaction: Transaction = {
-      ...data,
-      id: `TRX-${Date.now()}`,
-      code,
-      updatedAt: nowIso,
-    };
-
     let updatedItems = [...items];
+    const resolvedLines: TransactionLineItem[] = [];
+
     for (const line of data.items) {
+      const lineCopy: TransactionLineItem = { ...line };
       // Find existing item by id or SKU code (case-insensitive)
       let idx = updatedItems.findIndex(
         i =>
-          (line.itemId && i.id === line.itemId) ||
-          (line.itemCode && i.code.trim().toLowerCase() === line.itemCode.trim().toLowerCase())
+          (lineCopy.itemId && i.id === lineCopy.itemId) ||
+          (lineCopy.itemCode && i.code && i.code.trim().toUpperCase() === lineCopy.itemCode.trim().toUpperCase())
       );
 
       if (idx !== -1) {
         const item = updatedItems[idx];
-        const qtyDelta = data.type === 'NHAP_KHO' ? line.quantity : -line.quantity;
+        const qtyDelta = data.type === 'NHAP_KHO' ? lineCopy.quantity : -lineCopy.quantity;
         const newStock = Math.max(0, item.currentStock + qtyDelta);
 
         let condition = item.condition;
@@ -1819,11 +1816,20 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
 
         const unitPrice =
-          data.type === 'NHAP_KHO' && line.unitPrice > 0 ? line.unitPrice : item.unitPrice;
+          data.type === 'NHAP_KHO' && lineCopy.unitPrice > 0 ? lineCopy.unitPrice : item.unitPrice;
+
+        const prevWhStocks = item.warehouseStocks || {};
+        const prevWhQty = prevWhStocks[data.warehouseId] || 0;
+        const newWhQty = Math.max(0, prevWhQty + qtyDelta);
+        const newWhStocks = {
+          ...prevWhStocks,
+          [data.warehouseId]: newWhQty,
+        };
 
         updatedItems[idx] = {
           ...item,
           currentStock: newStock,
+          warehouseStocks: newWhStocks,
           unitPrice,
           condition,
           supplierDefault:
@@ -1831,34 +1837,48 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             (data.type === 'NHAP_KHO' && data.partnerName ? data.partnerName : item.supplierDefault),
           updatedAt: nowIso,
         };
-        line.itemId = item.id;
+        lineCopy.itemId = item.id;
+        lineCopy.itemCode = item.code;
+        lineCopy.itemName = item.name;
+        lineCopy.unit = item.unit;
       } else if (data.type === 'NHAP_KHO') {
         // Tự động thêm vật tư mới vào danh mục vật tư khi lập phiếu nhập kho
         const newItemId = `ITEM-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-        line.itemId = newItemId;
-        const cleanCode = (line.itemCode || `VT-${Date.now().toString().slice(-4)}`).trim().toUpperCase();
+        const cleanCode = (lineCopy.itemCode || `VT-${Date.now().toString().slice(-4)}`).trim().toUpperCase();
         const newItem: InventoryItem = {
           id: newItemId,
           code: cleanCode,
-          name: (line.itemName || 'Vật tư nhập mới').trim(),
-          type: line.type || 'VAT_TU',
-          category: (line.category || 'Vật tư nhập mới').trim(),
-          unit: (line.unit || 'Cái').trim(),
+          name: (lineCopy.itemName || 'Vật tư nhập mới').trim(),
+          type: lineCopy.type || 'VAT_TU',
+          category: (lineCopy.category || 'Vật tư nhập mới').trim(),
+          unit: (lineCopy.unit || 'Cái').trim(),
           warehouseId: data.warehouseId,
-          location: (line.location || 'Khu vực tiếp nhận').trim(),
-          minStock: line.minStock !== undefined && line.minStock >= 0 ? line.minStock : 5,
-          maxStock: line.maxStock !== undefined && line.maxStock > 0 ? line.maxStock : 200,
-          currentStock: Math.max(0, line.quantity),
-          unitPrice: Math.max(0, line.unitPrice || 0),
-          serialOrLot: (line.serialNumber || '').trim(),
-          condition: line.condition || 'SAN_SANG',
+          warehouseStocks: { [data.warehouseId]: Math.max(0, lineCopy.quantity) },
+          location: (lineCopy.location || 'Khu vực tiếp nhận').trim(),
+          minStock: lineCopy.minStock !== undefined && lineCopy.minStock >= 0 ? lineCopy.minStock : 5,
+          maxStock: lineCopy.maxStock !== undefined && lineCopy.maxStock > 0 ? lineCopy.maxStock : 200,
+          currentStock: Math.max(0, lineCopy.quantity),
+          unitPrice: Math.max(0, lineCopy.unitPrice || 0),
+          serialOrLot: (lineCopy.serialNumber || '').trim(),
+          condition: lineCopy.condition || 'SAN_SANG',
           supplierDefault: data.partnerName.trim(),
-          spec: (line.spec || '').trim(),
+          spec: (lineCopy.spec || '').trim(),
           updatedAt: nowIso,
         };
         updatedItems = [newItem, ...updatedItems];
+        lineCopy.itemId = newItemId;
+        lineCopy.itemCode = cleanCode;
       }
+      resolvedLines.push(lineCopy);
     }
+
+    const newTransaction: Transaction = {
+      ...data,
+      id: `TRX-${Date.now()}`,
+      code,
+      items: resolvedLines,
+      updatedAt: nowIso,
+    };
 
     const newTransactionsList = [newTransaction, ...transactions];
     const newDeletedTrx = deletedTransactionIds.filter(
@@ -1896,7 +1916,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return { success: true, transaction: newTransaction };
   };
 
-  // Update Transaction (Admin has full rights to edit details, items, quantities and recalculate stock)
+  // Update Transaction (Admin and Stockkeeper can edit details, items, quantities and recalculate stock)
   const updateTransaction = (
     id: string,
     updates: Partial<Transaction>
@@ -1910,13 +1930,6 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Không tìm thấy phiếu giao dịch.' };
     }
 
-    if (updates.items && currentUser.role !== 'ADMIN') {
-      return {
-        success: false,
-        error: 'Chỉ Quản trị viên (Admin) mới có quyền chỉnh sửa chi tiết danh mục và số lượng vật tư trong phiếu.',
-      };
-    }
-
     let updatedItemsList = [...items];
 
     // If items or warehouse were updated, adjust inventory balances
@@ -1925,17 +1938,24 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       for (const oldLine of existing.items) {
         const idx = updatedItemsList.findIndex(
           i =>
-            i.id === oldLine.itemId ||
+            (oldLine.itemId && i.id === oldLine.itemId) ||
             (oldLine.itemCode &&
-              i.code.trim().toUpperCase() === oldLine.itemCode.trim().toUpperCase() &&
-              i.warehouseId === existing.warehouseId)
+              i.code.trim().toUpperCase() === oldLine.itemCode.trim().toUpperCase())
         );
         if (idx !== -1) {
           const item = updatedItemsList[idx];
           const revertDelta = existing.type === 'NHAP_KHO' ? -oldLine.quantity : oldLine.quantity;
+          const prevWhStocks = item.warehouseStocks || {};
+          const prevWhQty = prevWhStocks[existing.warehouseId] || 0;
+          const newWhQty = Math.max(0, prevWhQty + revertDelta);
+          const newWhStocks = {
+            ...prevWhStocks,
+            [existing.warehouseId]: newWhQty,
+          };
           updatedItemsList[idx] = {
             ...item,
             currentStock: Math.max(0, item.currentStock + revertDelta),
+            warehouseStocks: newWhStocks,
           };
         }
       }
@@ -1947,22 +1967,33 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       for (const newLine of updates.items) {
         const idx = updatedItemsList.findIndex(
           i =>
-            i.id === newLine.itemId ||
+            (newLine.itemId && i.id === newLine.itemId) ||
             (newLine.itemCode &&
-              i.code.trim().toUpperCase() === newLine.itemCode.trim().toUpperCase() &&
-              i.warehouseId === targetWarehouseId)
+              i.code.trim().toUpperCase() === newLine.itemCode.trim().toUpperCase())
         );
         if (idx !== -1) {
           const item = updatedItemsList[idx];
           const applyDelta = targetType === 'NHAP_KHO' ? newLine.quantity : -newLine.quantity;
           const newUnitPrice =
             targetType === 'NHAP_KHO' && newLine.unitPrice > 0 ? newLine.unitPrice : item.unitPrice;
+          const prevWhStocks = item.warehouseStocks || {};
+          const prevWhQty = prevWhStocks[targetWarehouseId] || 0;
+          const newWhQty = Math.max(0, prevWhQty + applyDelta);
+          const newWhStocks = {
+            ...prevWhStocks,
+            [targetWarehouseId]: newWhQty,
+          };
           updatedItemsList[idx] = {
             ...item,
             currentStock: Math.max(0, item.currentStock + applyDelta),
+            warehouseStocks: newWhStocks,
             unitPrice: newUnitPrice,
             updatedAt: new Date().toISOString().replace('T', ' ').substring(0, 16),
           };
+          newLine.itemId = item.id;
+          newLine.itemCode = item.code;
+          newLine.itemName = item.name;
+          newLine.unit = item.unit;
         } else if (targetType === 'NHAP_KHO') {
           // If new item row was added into a Goods Receipt
           const newItemId = newLine.itemId || `ITEM-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
@@ -1975,6 +2006,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             category: (newLine.category || 'Vật tư dự án').trim(),
             unit: (newLine.unit || 'Cái').trim(),
             warehouseId: targetWarehouseId,
+            warehouseStocks: { [targetWarehouseId]: Math.max(0, newLine.quantity) },
             location: (newLine.location || 'Khu vực tiếp nhận').trim(),
             minStock: newLine.minStock ?? 5,
             maxStock: newLine.maxStock ?? 200,
@@ -1987,6 +2019,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             updatedAt: new Date().toISOString().replace('T', ' ').substring(0, 16),
           };
           updatedItemsList.unshift(newItem);
+          newLine.itemId = newItemId;
+          newLine.itemCode = cleanCode;
         }
       }
 
@@ -2117,138 +2151,21 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return { success: true };
   };
 
-  // Batch Import Transactions atomically
+  // Batch Import Transactions
   const importTransactionsBatch = (
-    importedList: (Omit<Transaction, 'id' | 'code'> & { id?: string; code?: string })[]
+    importedList: Omit<Transaction, 'id' | 'code'>[]
   ): { success: boolean; importedCount: number; errors: string[] } => {
     const errors: string[] = [];
     let importedCount = 0;
 
-    let runningItems = [...items];
-    let runningTransactions = [...transactions];
-    const year = new Date().getFullYear();
-    const nowIso = new Date().toISOString();
-
-    let pnCount = runningTransactions.filter(t => t.type === 'NHAP_KHO').length;
-    let pxCount = runningTransactions.filter(t => t.type === 'XUAT_KHO').length;
-
     for (let i = 0; i < importedList.length; i++) {
-      const data = importedList[i];
-      let hasError = false;
-
-      // 1. For XUAT_KHO, check stock availability against runningItems
-      if (data.type === 'XUAT_KHO') {
-        for (const line of data.items) {
-          const currentItem = runningItems.find(
-            it =>
-              (line.itemId && it.id === line.itemId) ||
-              (line.itemCode && it.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
-          );
-          if (!currentItem) {
-            errors.push(`Phiếu xuất "${data.partnerName}": Không tìm thấy vật tư "${line.itemCode}".`);
-            hasError = true;
-            break;
-          }
-          if (currentItem.currentStock < line.quantity) {
-            errors.push(
-              `Phiếu xuất "${data.partnerName}": Mặt hàng "${currentItem.name}" (${currentItem.code}) tồn khả dụng (${currentItem.currentStock} ${currentItem.unit}) không đủ để xuất (${line.quantity} ${currentItem.unit}).`
-            );
-            hasError = true;
-            break;
-          }
-        }
+      const item = importedList[i];
+      const res = createTransaction(item);
+      if (res.success) {
+        importedCount++;
+      } else {
+        errors.push(`Dòng ${i + 1} (${item.partnerName}): ${res.error}`);
       }
-
-      if (hasError) continue;
-
-      // 2. Generate unique code and id
-      let code = data.code?.trim();
-      if (!code || runningTransactions.some(t => t.code.toUpperCase() === code!.toUpperCase())) {
-        if (data.type === 'NHAP_KHO') {
-          pnCount++;
-          code = `PN-${year}-${String(1000 + pnCount).padStart(4, '0')}`;
-        } else {
-          pxCount++;
-          code = `PX-${year}-${String(1000 + pxCount).padStart(4, '0')}`;
-        }
-      }
-
-      const newTrxId = data.id || `TRX-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
-
-      // 3. Apply line items to runningItems
-      const updatedLines = [...data.items];
-      for (const line of updatedLines) {
-        const idx = runningItems.findIndex(
-          it =>
-            (line.itemId && it.id === line.itemId) ||
-            (line.itemCode && it.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
-        );
-
-        if (idx !== -1) {
-          const item = runningItems[idx];
-          const qtyDelta = data.type === 'NHAP_KHO' ? line.quantity : -line.quantity;
-          const newStock = Math.max(0, item.currentStock + qtyDelta);
-          const unitPrice = data.type === 'NHAP_KHO' && line.unitPrice > 0 ? line.unitPrice : item.unitPrice;
-
-          runningItems[idx] = {
-            ...item,
-            currentStock: newStock,
-            unitPrice,
-            updatedAt: nowIso,
-          };
-          line.itemId = item.id;
-        } else if (data.type === 'NHAP_KHO') {
-          // Auto create missing item in Goods Receipt
-          const newItemId = line.itemId || `ITEM-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
-          line.itemId = newItemId;
-          const cleanCode = (line.itemCode || `VT-${Date.now().toString().slice(-4)}`).trim().toUpperCase();
-          const newItem: InventoryItem = {
-            id: newItemId,
-            code: cleanCode,
-            name: (line.itemName || 'Vật tư nhập mới').trim(),
-            type: line.type || 'VAT_TU',
-            category: (line.category || 'Vật tư nhập mới').trim(),
-            unit: (line.unit || 'Cái').trim(),
-            warehouseId: data.warehouseId,
-            location: (line.location || 'Khu vực tiếp nhận').trim(),
-            minStock: line.minStock !== undefined && line.minStock >= 0 ? line.minStock : 5,
-            maxStock: line.maxStock !== undefined && line.maxStock > 0 ? line.maxStock : 200,
-            currentStock: Math.max(0, line.quantity),
-            unitPrice: Math.max(0, line.unitPrice || 0),
-            serialOrLot: (line.serialNumber || '').trim(),
-            condition: line.condition || 'SAN_SANG',
-            supplierDefault: data.partnerName.trim(),
-            spec: (line.spec || '').trim(),
-            updatedAt: nowIso,
-          };
-          runningItems = [newItem, ...runningItems];
-        }
-      }
-
-      const newTrx: Transaction = {
-        ...data,
-        id: newTrxId,
-        code,
-        items: updatedLines,
-        updatedAt: nowIso,
-      };
-
-      runningTransactions = [newTrx, ...runningTransactions];
-      importedCount++;
-    }
-
-    if (importedCount > 0) {
-      setItems(runningItems);
-      setTransactions(runningTransactions);
-      try {
-        localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(runningItems));
-        localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(runningTransactions));
-      } catch {
-        // ignore
-      }
-
-      pushCloudSyncImmediately(runningItems, runningTransactions, warehouses, users);
-      pushLocalChanges(runningItems, runningTransactions, warehouses, users);
     }
 
     return {
