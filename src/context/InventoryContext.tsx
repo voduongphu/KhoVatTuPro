@@ -109,7 +109,7 @@ interface InventoryContextType {
   ) => { success: boolean; error?: string };
   deleteTransaction: (id: string) => { success: boolean; error?: string };
   importTransactionsBatch: (
-    importedList: Omit<Transaction, 'id' | 'code'>[]
+    importedList: (Omit<Transaction, 'id' | 'code'> & { id?: string; code?: string })[]
   ) => { success: boolean; importedCount: number; errors: string[] };
 
   getItemLedger: (itemId: string) => StockLedgerEntry[];
@@ -1765,7 +1765,11 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const createTransaction = (data: Omit<Transaction, 'id' | 'code'>) => {
     if (data.type === 'XUAT_KHO') {
       for (const line of data.items) {
-        const currentItem = items.find(i => i.id === line.itemId);
+        const currentItem = items.find(
+          i =>
+            (line.itemId && i.id === line.itemId) ||
+            (line.itemCode && i.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
+        );
         if (!currentItem) {
           return { success: false, error: `Không tìm thấy vật tư mã "${line.itemCode}".` };
         }
@@ -2113,21 +2117,138 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return { success: true };
   };
 
-  // Batch Import Transactions
+  // Batch Import Transactions atomically
   const importTransactionsBatch = (
-    importedList: Omit<Transaction, 'id' | 'code'>[]
+    importedList: (Omit<Transaction, 'id' | 'code'> & { id?: string; code?: string })[]
   ): { success: boolean; importedCount: number; errors: string[] } => {
     const errors: string[] = [];
     let importedCount = 0;
 
+    let runningItems = [...items];
+    let runningTransactions = [...transactions];
+    const year = new Date().getFullYear();
+    const nowIso = new Date().toISOString();
+
+    let pnCount = runningTransactions.filter(t => t.type === 'NHAP_KHO').length;
+    let pxCount = runningTransactions.filter(t => t.type === 'XUAT_KHO').length;
+
     for (let i = 0; i < importedList.length; i++) {
-      const item = importedList[i];
-      const res = createTransaction(item);
-      if (res.success) {
-        importedCount++;
-      } else {
-        errors.push(`Dòng ${i + 1} (${item.partnerName}): ${res.error}`);
+      const data = importedList[i];
+      let hasError = false;
+
+      // 1. For XUAT_KHO, check stock availability against runningItems
+      if (data.type === 'XUAT_KHO') {
+        for (const line of data.items) {
+          const currentItem = runningItems.find(
+            it =>
+              (line.itemId && it.id === line.itemId) ||
+              (line.itemCode && it.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
+          );
+          if (!currentItem) {
+            errors.push(`Phiếu xuất "${data.partnerName}": Không tìm thấy vật tư "${line.itemCode}".`);
+            hasError = true;
+            break;
+          }
+          if (currentItem.currentStock < line.quantity) {
+            errors.push(
+              `Phiếu xuất "${data.partnerName}": Mặt hàng "${currentItem.name}" (${currentItem.code}) tồn khả dụng (${currentItem.currentStock} ${currentItem.unit}) không đủ để xuất (${line.quantity} ${currentItem.unit}).`
+            );
+            hasError = true;
+            break;
+          }
+        }
       }
+
+      if (hasError) continue;
+
+      // 2. Generate unique code and id
+      let code = data.code?.trim();
+      if (!code || runningTransactions.some(t => t.code.toUpperCase() === code!.toUpperCase())) {
+        if (data.type === 'NHAP_KHO') {
+          pnCount++;
+          code = `PN-${year}-${String(1000 + pnCount).padStart(4, '0')}`;
+        } else {
+          pxCount++;
+          code = `PX-${year}-${String(1000 + pxCount).padStart(4, '0')}`;
+        }
+      }
+
+      const newTrxId = data.id || `TRX-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
+      // 3. Apply line items to runningItems
+      const updatedLines = [...data.items];
+      for (const line of updatedLines) {
+        const idx = runningItems.findIndex(
+          it =>
+            (line.itemId && it.id === line.itemId) ||
+            (line.itemCode && it.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
+        );
+
+        if (idx !== -1) {
+          const item = runningItems[idx];
+          const qtyDelta = data.type === 'NHAP_KHO' ? line.quantity : -line.quantity;
+          const newStock = Math.max(0, item.currentStock + qtyDelta);
+          const unitPrice = data.type === 'NHAP_KHO' && line.unitPrice > 0 ? line.unitPrice : item.unitPrice;
+
+          runningItems[idx] = {
+            ...item,
+            currentStock: newStock,
+            unitPrice,
+            updatedAt: nowIso,
+          };
+          line.itemId = item.id;
+        } else if (data.type === 'NHAP_KHO') {
+          // Auto create missing item in Goods Receipt
+          const newItemId = line.itemId || `ITEM-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+          line.itemId = newItemId;
+          const cleanCode = (line.itemCode || `VT-${Date.now().toString().slice(-4)}`).trim().toUpperCase();
+          const newItem: InventoryItem = {
+            id: newItemId,
+            code: cleanCode,
+            name: (line.itemName || 'Vật tư nhập mới').trim(),
+            type: line.type || 'VAT_TU',
+            category: (line.category || 'Vật tư nhập mới').trim(),
+            unit: (line.unit || 'Cái').trim(),
+            warehouseId: data.warehouseId,
+            location: (line.location || 'Khu vực tiếp nhận').trim(),
+            minStock: line.minStock !== undefined && line.minStock >= 0 ? line.minStock : 5,
+            maxStock: line.maxStock !== undefined && line.maxStock > 0 ? line.maxStock : 200,
+            currentStock: Math.max(0, line.quantity),
+            unitPrice: Math.max(0, line.unitPrice || 0),
+            serialOrLot: (line.serialNumber || '').trim(),
+            condition: line.condition || 'SAN_SANG',
+            supplierDefault: data.partnerName.trim(),
+            spec: (line.spec || '').trim(),
+            updatedAt: nowIso,
+          };
+          runningItems = [newItem, ...runningItems];
+        }
+      }
+
+      const newTrx: Transaction = {
+        ...data,
+        id: newTrxId,
+        code,
+        items: updatedLines,
+        updatedAt: nowIso,
+      };
+
+      runningTransactions = [newTrx, ...runningTransactions];
+      importedCount++;
+    }
+
+    if (importedCount > 0) {
+      setItems(runningItems);
+      setTransactions(runningTransactions);
+      try {
+        localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(runningItems));
+        localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(runningTransactions));
+      } catch {
+        // ignore
+      }
+
+      pushCloudSyncImmediately(runningItems, runningTransactions, warehouses, users);
+      pushLocalChanges(runningItems, runningTransactions, warehouses, users);
     }
 
     return {
