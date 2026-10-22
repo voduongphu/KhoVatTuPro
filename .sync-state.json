@@ -1,24 +1,7 @@
 {
-  "version": 3,
-  "lastUpdated": "2026-10-21T10:40:09.969Z",
+  "version": 102,
+  "lastUpdated": "2026-10-22T10:18:06.329Z",
   "users": [
-    {
-      "id": "USR-ADMIN",
-      "username": "admin",
-      "password": "admin123",
-      "fullName": "Quản Trị Viên Hệ Thống",
-      "role": "ADMIN",
-      "email": "admin@khovattu.pro",
-      "phone": "0901.888.999",
-      "assignedWarehouseId": "ALL",
-      "status": "ACTIVE",
-      "createdAt": "2026-01-01 08:00",
-      "lastLogin": "2026-10-20 10:26",
-      "lastActiveAt": "2026-10-21T01:35:18.699Z",
-      "activeDeviceId": "DEV-MVGH7HI9-OAYCOG",
-      "activeDeviceName": "Google Chrome trên Windows 10/11",
-      "updatedAt": "2026-10-21T10:36:27.005Z"
-    },
     {
       "id": "USR-PHUVO",
       "role": "ADMIN",
@@ -29,8 +12,8 @@
       "password": "abc123",
       "username": "phuvo",
       "createdAt": "2026-01-01 08:00",
-      "lastLogin": "2026-10-21 10:36",
-      "lastActiveAt": "2026-10-21T10:36:48.583Z",
+      "lastLogin": "2026-10-22 10:08",
+      "lastActiveAt": "2026-10-22T10:08:09.405Z",
       "activeDeviceId": "DEV-MVGHC2DA-EGPRQU",
       "activeDeviceName": "Google Chrome trên Windows 10/11",
       "assignedWarehouseId": "ALL"
@@ -46,10 +29,39 @@
       "username": "cuongvo",
       "createdAt": "2026-10-21 10:36",
       "updatedAt": "2026-10-21T10:36:15.506Z",
-      "assignedWarehouseId": "ALL"
+      "assignedWarehouseId": "ALL",
+      "lastLogin": "2026-10-21 10:49",
+      "lastActiveAt": "2026-10-21T10:49:26.644Z",
+      "activeDeviceId": "DEV-MVGHC2DA-EGPRQU",
+      "activeDeviceName": "Google Chrome trên Windows 10/11"
     }
   ],
-  "transactions": [],
+  "transactions": [
+    {
+      "id": "TRX-TEST-001",
+      "code": "PN-2026-0001",
+      "type": "NHAP_KHO",
+      "subtype": "NHAP_MUA_MOI",
+      "date": "2026-10-22 10:18",
+      "warehouseId": "WH-01",
+      "partnerName": "Test Partner",
+      "departmentOrProject": "Dự án Test",
+      "creatorName": "Quản trị viên",
+      "items": [
+        {
+          "itemId": "ITEM-TEST",
+          "itemCode": "VT-TEST-01",
+          "itemName": "Cáp đồng test",
+          "unit": "Mét",
+          "quantity": 50,
+          "unitPrice": 25000,
+          "amount": 1250000
+        }
+      ],
+      "totalAmount": 1250000,
+      "status": "HOAN_THANH"
+    }
+  ],
   "warehouses": [
     {
       "id": "WH-01",
@@ -72,7 +84,40 @@
       "updatedAt": "2026-10-21T10:35:14.827Z"
     }
   ],
-  "items": [],
+  "items": [
+    {
+      "id": "ITEM-1792663713349-393",
+      "code": "DSVVREBER",
+      "name": "dveverbe",
+      "spec": "",
+      "type": "VAT_TU",
+      "unit": "Cái",
+      "category": "Cơ điện & Vật tư công trình",
+      "location": "Kệ A1-01",
+      "maxStock": 200,
+      "minStock": 5,
+      "condition": "SAN_SANG",
+      "unitPrice": 0,
+      "updatedAt": "2026-10-22T10:09:09.253Z",
+      "serialOrLot": "",
+      "warehouseId": "WH-01",
+      "currentStock": 1,
+      "supplierDefault": "srgerghr",
+      "warehouseStocks": {
+        "WH-01": 1,
+        "WH-LT": 0
+      }
+    },
+    {
+      "id": "ITEM-TEST",
+      "code": "VT-TEST-01",
+      "name": "Cáp đồng test",
+      "unit": "Mét",
+      "currentStock": 50,
+      "unitPrice": 25000,
+      "warehouseId": "WH-01"
+    }
+  ],
   "deletedUserIds": [
     "usr-002",
     "thukho_hn",
@@ -147,7 +192,41 @@
     "ITEM-006",
     "ITEM-013",
     "VT-KL-401",
-    "VT-HC-801"
+    "VT-HC-801",
+    "ITEM-1792579599316-15",
+    "ITEM-1792579599316-14",
+    "ITEM-1792579599316-13",
+    "ITEM-1792579599316-12",
+    "ITEM-1792579599316-11",
+    "ITEM-1792579599316-10",
+    "ITEM-1792579599316-9",
+    "ITEM-1792579599316-8",
+    "ITEM-1792579599316-7",
+    "ITEM-1792579599316-6",
+    "ITEM-1792579599316-5",
+    "ITEM-1792579599316-4",
+    "ITEM-1792579599316-3",
+    "ITEM-1792579599316-2",
+    "ITEM-1792579599316-1",
+    "ITEM-1792579599316-0",
+    "11LAB11-BR024-P03",
+    "11LAB11-BR023-P03",
+    "11LAB11-BR021-P03",
+    "11LBA50-BR007-P03",
+    "11LBB10-BR001-P03",
+    "11LBA50-BR006-P03",
+    "11LAB11-BR024-P01",
+    "11LAB11-BR023-P01",
+    "11LAB11-BR022-P02",
+    "11LAB11-BR021-P01",
+    "11LBC11-BR002-P34",
+    "11LAB11-BR024-P02",
+    "11LAB11-BR022-P03",
+    "11LAB11-BR023-P02",
+    "11LAB11-BR022-P01",
+    "11LAB11-BR021-P02",
+    "ITEM-1792645651803-11",
+    "TEST-0001"
   ],
   "deletedWarehouseIds": [
     "WH-HN",
@@ -157,5 +236,5 @@
     "WH-HP",
     "KHO-HP"
   ],
-  "source": "web-client"
+  "source": "server-additive-merge"
 }

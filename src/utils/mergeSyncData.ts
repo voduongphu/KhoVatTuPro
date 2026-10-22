@@ -87,7 +87,16 @@ export function mergeTransactionsAdditive(
   deletedIds: string[] = []
 ): Transaction[] {
   const trxMap = new Map<string, Transaction>();
-  const delSet = new Set(deletedIds.map(d => d.trim().toUpperCase()));
+  
+  // Prune any deletedIds that match an active local transaction (created recently)
+  const localActiveKeys = new Set(
+    localTrx.flatMap(t => [(t.id || '').trim().toUpperCase(), (t.code || '').trim().toUpperCase()]).filter(Boolean)
+  );
+  const delSet = new Set(
+    deletedIds
+      .map(d => d.trim().toUpperCase())
+      .filter(d => !localActiveKeys.has(d))
+  );
 
   const getKey = (t: Transaction) => (t.id || t.code).trim().toUpperCase();
 
@@ -202,7 +211,14 @@ export function mergeItemsAdditive(
   deletedIds: string[] = []
 ): InventoryItem[] {
   const itemMap = new Map<string, InventoryItem>();
-  const delSet = new Set(deletedIds.map(d => d.trim().toUpperCase()));
+  const localActiveItemKeys = new Set(
+    localItems.flatMap(i => [(i.id || '').trim().toUpperCase(), (i.code || '').trim().toUpperCase()]).filter(Boolean)
+  );
+  const delSet = new Set(
+    deletedIds
+      .map(d => d.trim().toUpperCase())
+      .filter(d => !localActiveItemKeys.has(d))
+  );
 
   const getItemKey = (item: InventoryItem) => {
     if (item.code && item.code.trim()) {

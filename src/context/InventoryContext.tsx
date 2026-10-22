@@ -12,6 +12,7 @@ import {
   StockStatus,
   Transaction,
   TransactionLineItem,
+  TransactionType,
   User,
   Warehouse,
 } from '../types/inventory';
@@ -99,7 +100,7 @@ interface InventoryContextType {
   ) => { success: boolean; addedCount: number; updatedCount: number; errors: string[] };
 
   // CRUD Transactions
-  createTransaction: (data: Omit<Transaction, 'id' | 'code'>) => {
+  createTransaction: (data: Omit<Transaction, 'id' | 'code'> & { code?: string }) => {
     success: boolean;
     error?: string;
     transaction?: Transaction;
@@ -110,7 +111,7 @@ interface InventoryContextType {
   ) => { success: boolean; error?: string };
   deleteTransaction: (id: string) => { success: boolean; error?: string };
   importTransactionsBatch: (
-    importedList: Omit<Transaction, 'id' | 'code'>[]
+    importedList: (Omit<Transaction, 'id' | 'code'> & { code?: string })[]
   ) => { success: boolean; importedCount: number; errors: string[] };
 
   getItemLedger: (itemId: string) => StockLedgerEntry[];
@@ -1762,8 +1763,34 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return { success: true, count: ids.length };
   };
 
+  const generateUniqueTransactionCode = (
+    type: TransactionType,
+    currentTrx: Transaction[],
+    delIds: string[] = []
+  ): string => {
+    const prefix = type === 'NHAP_KHO' ? 'PN' : 'PX';
+    const year = new Date().getFullYear();
+    const pattern = new RegExp(`^${prefix}-${year}-(\\d+)$`, 'i');
+
+    const takenNumbers = new Set<number>();
+    currentTrx.forEach(t => {
+      const m = (t.code || '').trim().match(pattern);
+      if (m) takenNumbers.add(parseInt(m[1], 10));
+    });
+    delIds.forEach(d => {
+      const m = d.trim().match(pattern);
+      if (m) takenNumbers.add(parseInt(m[1], 10));
+    });
+
+    let num = 1;
+    while (takenNumbers.has(num)) {
+      num++;
+    }
+    return `${prefix}-${year}-${String(num).padStart(4, '0')}`;
+  };
+
   // Create Transaction (NHAP / XUAT)
-  const createTransaction = (data: Omit<Transaction, 'id' | 'code'>) => {
+  const createTransaction = (data: Omit<Transaction, 'id' | 'code'> & { code?: string }) => {
     if (data.type === 'XUAT_KHO') {
       for (const line of data.items) {
         const currentItem = items.find(
@@ -1783,10 +1810,10 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
     }
 
-    const prefix = data.type === 'NHAP_KHO' ? 'PN' : 'PX';
-    const year = new Date().getFullYear();
-    const count = transactions.filter(t => t.type === data.type).length + 1;
-    const code = `${prefix}-${year}-${String(1000 + count).padStart(4, '0')}`;
+    let code = data.code && data.code.trim() ? data.code.trim().toUpperCase() : '';
+    if (!code) {
+      code = generateUniqueTransactionCode(data.type, transactions, deletedTransactionIds);
+    }
 
     const nowIso = new Date().toISOString();
     let updatedItems = [...items];
@@ -2151,26 +2178,175 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return { success: true };
   };
 
-  // Batch Import Transactions
+  // Batch Import Transactions (Atomic multi-transaction processing)
   const importTransactionsBatch = (
-    importedList: Omit<Transaction, 'id' | 'code'>[]
+    importedList: (Omit<Transaction, 'id' | 'code'> & { code?: string })[]
   ): { success: boolean; importedCount: number; errors: string[] } => {
     const errors: string[] = [];
-    let importedCount = 0;
+    let updatedItemsList = [...items];
+    const newTransactionsToAdd: Transaction[] = [];
+    const activeDelTrxSet = new Set(deletedTransactionIds);
+    const nowIso = new Date().toISOString();
 
     for (let i = 0; i < importedList.length; i++) {
-      const item = importedList[i];
-      const res = createTransaction(item);
-      if (res.success) {
-        importedCount++;
-      } else {
-        errors.push(`Dòng ${i + 1} (${item.partnerName}): ${res.error}`);
+      const data = importedList[i];
+
+      // Validate stock for XUAT_KHO
+      if (data.type === 'XUAT_KHO') {
+        let stockError = '';
+        for (const line of data.items) {
+          const currentItem = updatedItemsList.find(
+            it =>
+              (line.itemId && it.id === line.itemId) ||
+              (line.itemCode && it.code && it.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
+          );
+          if (!currentItem) {
+            stockError = `Phiếu ${i + 1} (${data.partnerName}): Không tìm thấy vật tư mã "${line.itemCode || line.itemName}".`;
+            break;
+          }
+          if (currentItem.currentStock < line.quantity) {
+            stockError = `Phiếu ${i + 1} (${data.partnerName}): Số lượng xuất của "${currentItem.name}" (${line.quantity} ${currentItem.unit}) vượt quá tồn kho khả dụng (${currentItem.currentStock} ${currentItem.unit})!`;
+            break;
+          }
+        }
+        if (stockError) {
+          errors.push(stockError);
+          continue;
+        }
       }
+
+      // Generate or use provided code
+      let finalCode = data.code && data.code.trim() ? data.code.trim().toUpperCase() : '';
+      if (!finalCode) {
+        finalCode = generateUniqueTransactionCode(
+          data.type,
+          [...newTransactionsToAdd, ...transactions],
+          Array.from(activeDelTrxSet)
+        );
+      }
+
+      // Ensure code is not suppressed by deletion tombstones
+      activeDelTrxSet.delete(finalCode);
+
+      // Process line items
+      const resolvedLines: TransactionLineItem[] = [];
+      for (const line of data.items) {
+        const lineCopy: TransactionLineItem = { ...line };
+        let idx = updatedItemsList.findIndex(
+          it =>
+            (lineCopy.itemId && it.id === lineCopy.itemId) ||
+            (lineCopy.itemCode && it.code && it.code.trim().toUpperCase() === lineCopy.itemCode.trim().toUpperCase())
+        );
+
+        if (idx !== -1) {
+          const item = updatedItemsList[idx];
+          const qtyDelta = data.type === 'NHAP_KHO' ? lineCopy.quantity : -lineCopy.quantity;
+          const newStock = Math.max(0, item.currentStock + qtyDelta);
+
+          const unitPrice =
+            data.type === 'NHAP_KHO' && lineCopy.unitPrice > 0 ? lineCopy.unitPrice : item.unitPrice;
+
+          const prevWhStocks = item.warehouseStocks || {};
+          const prevWhQty = prevWhStocks[data.warehouseId] || 0;
+          const newWhQty = Math.max(0, prevWhQty + qtyDelta);
+          const newWhStocks = {
+            ...prevWhStocks,
+            [data.warehouseId]: newWhQty,
+          };
+
+          updatedItemsList[idx] = {
+            ...item,
+            currentStock: newStock,
+            warehouseStocks: newWhStocks,
+            unitPrice,
+            supplierDefault:
+              item.supplierDefault ||
+              (data.type === 'NHAP_KHO' && data.partnerName ? data.partnerName : item.supplierDefault),
+            updatedAt: nowIso,
+          };
+          lineCopy.itemId = item.id;
+          lineCopy.itemCode = item.code;
+          lineCopy.itemName = item.name;
+          lineCopy.unit = item.unit;
+        } else if (data.type === 'NHAP_KHO') {
+          const newItemId = `ITEM-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+          const cleanCode = (lineCopy.itemCode || `VT-${Date.now().toString().slice(-4)}`).trim().toUpperCase();
+          const newItem: InventoryItem = {
+            id: newItemId,
+            code: cleanCode,
+            name: (lineCopy.itemName || 'Vật tư nhập mới').trim(),
+            type: lineCopy.type || 'VAT_TU',
+            category: (lineCopy.category || 'Vật tư nhập mới').trim(),
+            unit: (lineCopy.unit || 'Cái').trim(),
+            warehouseId: data.warehouseId,
+            warehouseStocks: { [data.warehouseId]: Math.max(0, lineCopy.quantity) },
+            location: (lineCopy.location || 'Khu vực tiếp nhận').trim(),
+            minStock: lineCopy.minStock !== undefined && lineCopy.minStock >= 0 ? lineCopy.minStock : 5,
+            maxStock: lineCopy.maxStock !== undefined && lineCopy.maxStock > 0 ? lineCopy.maxStock : 200,
+            currentStock: Math.max(0, lineCopy.quantity),
+            unitPrice: Math.max(0, lineCopy.unitPrice || 0),
+            serialOrLot: (lineCopy.serialNumber || '').trim(),
+            condition: lineCopy.condition || 'SAN_SANG',
+            supplierDefault: data.partnerName.trim(),
+            spec: (lineCopy.spec || '').trim(),
+            updatedAt: nowIso,
+          };
+          updatedItemsList = [newItem, ...updatedItemsList];
+          lineCopy.itemId = newItemId;
+          lineCopy.itemCode = cleanCode;
+        }
+        resolvedLines.push(lineCopy);
+      }
+
+      const newTrx: Transaction = {
+        ...data,
+        id: `TRX-${Date.now()}-${i}`,
+        code: finalCode,
+        items: resolvedLines,
+        updatedAt: nowIso,
+      };
+      activeDelTrxSet.delete(newTrx.id);
+      newTransactionsToAdd.push(newTrx);
     }
 
+    if (newTransactionsToAdd.length === 0) {
+      return { success: false, importedCount: 0, errors };
+    }
+
+    const newTransactionsList = [...newTransactionsToAdd, ...transactions];
+    const newDeletedTrx = Array.from(activeDelTrxSet);
+
+    setItems(updatedItemsList);
+    setTransactions(newTransactionsList);
+    setDeletedTransactionIds(newDeletedTrx);
+    try {
+      localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(updatedItemsList));
+      localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(newTransactionsList));
+      localStorage.setItem(STORAGE_KEYS.DELETED_TRANSACTIONS, JSON.stringify(newDeletedTrx));
+    } catch {
+      // ignore
+    }
+
+    pushCloudSyncImmediately(
+      updatedItemsList,
+      newTransactionsList,
+      warehouses,
+      users,
+      undefined,
+      newDeletedTrx
+    );
+    pushLocalChanges(
+      updatedItemsList,
+      newTransactionsList,
+      warehouses,
+      users,
+      undefined,
+      newDeletedTrx
+    );
+
     return {
-      success: importedCount > 0,
-      importedCount,
+      success: true,
+      importedCount: newTransactionsToAdd.length,
       errors,
     };
   };

@@ -8,25 +8,47 @@ function mergeServerStateAdditive(existing: any, incoming: any) {
   if (!existing) return incoming;
   if (!incoming) return existing;
 
-  // Merge deleted IDs (Tombstones) so deletions by Admin or users are respected across devices
+  // Active incoming items / transactions / users must NEVER be blocked by stale deleted IDs
+  const activeIncomingTrxKeys = new Set(
+    (incoming.transactions || []).flatMap((t: any) => [
+      (t.id || '').trim().toUpperCase(),
+      (t.code || '').trim().toUpperCase(),
+    ]).filter(Boolean)
+  );
+  const activeIncomingItemKeys = new Set(
+    (incoming.items || []).flatMap((i: any) => [
+      (i.id || '').trim().toUpperCase(),
+      (i.code || '').trim().toUpperCase(),
+    ]).filter(Boolean)
+  );
+  const activeIncomingUserKeys = new Set(
+    (incoming.users || []).flatMap((u: any) => [
+      (u.id || '').trim().toLowerCase(),
+      (u.username || '').trim().toLowerCase(),
+    ]).filter(Boolean)
+  );
+
   const deletedUserIds = Array.from(
     new Set([
       ...(existing.deletedUserIds || []).map((s: string) => String(s).toLowerCase()),
       ...(incoming.deletedUserIds || []).map((s: string) => String(s).toLowerCase()),
     ])
-  );
+  ).filter(id => !activeIncomingUserKeys.has(id) && id !== 'admin' && id !== 'usr-admin');
+
   const deletedTrxIds = Array.from(
     new Set([
       ...(existing.deletedTransactionIds || []).map((s: string) => String(s).toUpperCase()),
       ...(incoming.deletedTransactionIds || []).map((s: string) => String(s).toUpperCase()),
     ])
-  );
+  ).filter(id => !activeIncomingTrxKeys.has(id));
+
   const deletedItemIds = Array.from(
     new Set([
       ...(existing.deletedItemIds || []).map((s: string) => String(s).toUpperCase()),
       ...(incoming.deletedItemIds || []).map((s: string) => String(s).toUpperCase()),
     ])
-  );
+  ).filter(id => !activeIncomingItemKeys.has(id));
+
   const deletedWarehouseIds = Array.from(
     new Set([
       ...(existing.deletedWarehouseIds || []).map((s: string) => String(s).toUpperCase()),

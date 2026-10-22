@@ -73,20 +73,28 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
           amount: initialItem.unitPrice,
           serialNumber: initialItem.serialOrLot || '',
           note: '',
+          isNewItem: false,
         },
       ];
     }
+    const shouldStartNew = initialType === 'NHAP_KHO' && items.length === 0;
     return [
       {
-        itemId: '',
+        itemId: shouldStartNew ? `TEMP-NEW-${Date.now()}-0` : '',
         itemCode: '',
         itemName: '',
-        unit: '',
+        unit: 'Cái',
         quantity: 1,
         unitPrice: 0,
         amount: 0,
         serialNumber: '',
         note: '',
+        isNewItem: shouldStartNew,
+        type: 'VAT_TU',
+        category: 'Cơ điện & Vật tư công trình',
+        location: 'Khu vực tiếp nhận',
+        minStock: 5,
+        maxStock: 200,
       },
     ];
   });
@@ -95,8 +103,21 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
     setType(newType);
     if (newType === 'NHAP_KHO') {
       setSubtype('NHAP_MUA_MOI');
+      if (items.length === 0) {
+        setLineItems(prev =>
+          prev.map((l, i) => ({
+            ...l,
+            isNewItem: true,
+            itemId: l.itemId || `TEMP-NEW-${Date.now()}-${i}`,
+            unit: l.unit || 'Cái',
+          }))
+        );
+      }
     } else {
       setSubtype('XUAT_THI_CONG');
+      setLineItems(prev =>
+        prev.map(l => (l.isNewItem ? { ...l, isNewItem: false, itemId: '', itemCode: '', itemName: '' } : l))
+      );
     }
     setErrorMessage('');
   };
@@ -240,6 +261,16 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
     // Validate line items
     for (let i = 0; i < lineItems.length; i++) {
       const line = lineItems[i];
+      if (type === 'NHAP_KHO' && !line.itemId && (line.itemCode?.trim() || line.itemName?.trim())) {
+        line.isNewItem = true;
+        if (!line.itemCode?.trim()) {
+          line.itemCode = `VT-${Date.now().toString().slice(-4)}`;
+        }
+        if (!line.unit?.trim()) {
+          line.unit = 'Cái';
+        }
+      }
+
       if (line.isNewItem) {
         if (!line.itemCode?.trim()) {
           setErrorMessage(`Dòng ${i + 1}: Vui lòng nhập Mã SKU cho vật tư mới.`);
@@ -250,11 +281,10 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
           return;
         }
         if (!line.unit?.trim()) {
-          setErrorMessage(`Dòng ${i + 1}: Vui lòng nhập Đơn vị tính (ĐVT) cho vật tư mới.`);
-          return;
+          line.unit = 'Cái';
         }
       } else if (!line.itemId && line.quantity > 0) {
-        setErrorMessage(`Dòng ${i + 1}: Vui lòng chọn mặt hàng hoặc nhập vật tư mới.`);
+        setErrorMessage(`Dòng ${i + 1}: Vui lòng chọn mặt hàng hoặc bấm nhập vật tư mới.`);
         return;
       }
 
