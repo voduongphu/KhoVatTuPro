@@ -62,6 +62,7 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
 
   const [error, setError] = useState('');
   const [selectedAddItemId, setSelectedAddItemId] = useState('');
+  const [rawInputs, setRawInputs] = useState<Record<string, string>>({});
 
   // Available inventory items for quick addition
   const availableItemsInWarehouse = inventoryItems.filter(
@@ -95,6 +96,29 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
 
       updated[index] = target;
       return updated;
+    });
+  };
+
+  const handleNumericInputChange = (
+    index: number,
+    field: 'quantity' | 'unitPrice',
+    rawValue: string
+  ) => {
+    const key = `${index}-${field}`;
+    setRawInputs(prev => ({ ...prev, [key]: rawValue }));
+    const parsed = rawValue.trim() === '' ? 0 : Number(rawValue);
+    if (!Number.isNaN(parsed)) {
+      handleItemFieldChange(index, field, Math.max(0, parsed));
+    }
+  };
+
+  const handleNumericInputBlur = (index: number, field: 'quantity' | 'unitPrice') => {
+    const key = `${index}-${field}`;
+    setRawInputs(prev => {
+      if (!(key in prev)) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
     });
   };
 
@@ -147,6 +171,7 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
       return;
     }
     setLineItems(prev => prev.filter((_, idx) => idx !== index));
+    setRawInputs({});
     setError('');
   };
 
@@ -203,10 +228,10 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
-      <div className="bg-white rounded-2xl max-w-4xl w-full border border-slate-200 shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
+    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-2 sm:p-4">
+      <div className="bg-white rounded-2xl max-w-[96vw] 2xl:max-w-[1480px] w-full border border-slate-200 shadow-2xl overflow-hidden flex flex-col max-h-[94vh]">
         {/* Header */}
-        <div className="p-4 border-b border-slate-200 flex items-center justify-between bg-slate-50">
+        <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50">
           <div className="flex items-center gap-2.5">
             <div className="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-xs">
               <Edit2 className="w-5 h-5" />
@@ -433,7 +458,7 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
 
           {/* Section 2: Items Table - Detail Editing */}
           <div className="space-y-3">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-200 pb-2">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-200 pb-2.5">
               <div>
                 <h3 className="font-bold text-slate-900 text-sm flex items-center gap-1.5">
                   <Package className="w-4 h-4 text-indigo-600" />
@@ -453,7 +478,7 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
                   <select
                     value={selectedAddItemId}
                     onChange={e => setSelectedAddItemId(e.target.value)}
-                    className="text-xs border border-slate-300 rounded-lg px-2.5 py-1.5 bg-white outline-none max-w-[200px]"
+                    className="text-xs border border-slate-300 rounded-lg px-3 py-2 bg-white outline-none max-w-[280px]"
                   >
                     <option value="">-- Thêm vật tư vào phiếu --</option>
                     {availableItemsInWarehouse.map(it => (
@@ -467,7 +492,7 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
                     type="button"
                     onClick={handleAddCatalogItem}
                     disabled={!selectedAddItemId}
-                    className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
+                    className="inline-flex items-center gap-1 px-3.5 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
                   >
                     <Plus className="w-3.5 h-3.5" />
                     <span>Thêm dòng</span>
@@ -478,157 +503,170 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
 
             {/* Table of Line Items */}
             <div className="border border-slate-200 rounded-xl overflow-x-auto shadow-xs bg-white">
-              <table className="w-full text-left border-collapse text-xs">
+              <table className="w-full min-w-[1260px] text-left border-collapse text-xs">
                 <thead>
-                  <tr className="bg-slate-100/90 text-slate-700 font-bold border-b border-slate-200 text-[11px]">
-                    <th className="py-2.5 px-3 w-10 text-center">STT</th>
-                    <th className="py-2.5 px-3 min-w-[130px]">Mã SKU</th>
-                    <th className="py-2.5 px-3 min-w-[220px]">Tên vật tư / Thiết bị</th>
-                    <th className="py-2.5 px-2 w-20">ĐVT</th>
-                    <th className="py-2.5 px-3 w-28 text-right bg-indigo-50/60 text-indigo-900">
+                  <tr className="bg-slate-100/90 text-slate-700 font-bold border-b border-slate-200 text-xs">
+                    <th className="py-3 px-2.5 w-12 text-center">STT</th>
+                    <th className="py-3 px-3 min-w-[135px] w-36">Mã SKU</th>
+                    <th className="py-3 px-3 min-w-[230px]">Tên vật tư / Thiết bị</th>
+                    <th className="py-3 px-2.5 min-w-[84px] w-22 text-center">ĐVT</th>
+                    <th className="py-3 px-3.5 min-w-[175px] w-44 text-right bg-indigo-50/80 text-indigo-950 border-x border-indigo-100">
                       Số lượng *
                     </th>
-                    <th className="py-2.5 px-3 w-32 text-right">Đơn giá (VNĐ)</th>
-                    <th className="py-2.5 px-3 w-32 text-right">Thành tiền (VNĐ)</th>
-                    <th className="py-2.5 px-2 min-w-[120px]">Số lô / Serial</th>
-                    <th className="py-2.5 px-2 min-w-[120px]">Ghi chú dòng</th>
-                    {isAdmin && <th className="py-2.5 px-2 w-10 text-center">Xóa</th>}
+                    <th className="py-3 px-3.5 min-w-[215px] w-56 text-right bg-amber-50/70 text-amber-950 border-r border-amber-100">
+                      Đơn giá (VNĐ)
+                    </th>
+                    <th className="py-3 px-3.5 min-w-[165px] w-44 text-right">Thành tiền (VNĐ)</th>
+                    <th className="py-3 px-2.5 min-w-[135px] w-36">Số lô / Serial</th>
+                    <th className="py-3 px-2.5 min-w-[145px] w-40">Ghi chú dòng</th>
+                    {isAdmin && <th className="py-3 px-2 w-12 text-center">Xóa</th>}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {lineItems.map((line, idx) => (
-                    <tr key={idx} className="hover:bg-slate-50/60 transition-colors">
+                    <tr key={idx} className="hover:bg-slate-50/60 transition-colors align-top">
                       {/* STT */}
-                      <td className="py-2.5 px-3 text-center text-slate-400 font-semibold font-mono">
+                      <td className="py-3.5 px-2.5 text-center text-slate-400 font-semibold font-mono tabular-nums">
                         {idx + 1}
                       </td>
 
                       {/* Code */}
-                      <td className="py-2 px-3">
+                      <td className="py-2.5 px-3">
                         {isAdmin ? (
                           <input
                             type="text"
                             value={line.itemCode}
                             onChange={e => handleItemFieldChange(idx, 'itemCode', e.target.value.toUpperCase())}
-                            className="w-full px-2 py-1 border border-slate-200 rounded font-mono text-[11px] font-semibold text-slate-800 bg-white focus:border-indigo-500 outline-none"
+                            className="w-full px-2.5 py-2 border border-slate-200 rounded-lg font-mono text-xs font-semibold text-slate-800 bg-white focus:border-indigo-500 outline-none"
                             placeholder="Mã SKU"
                           />
                         ) : (
-                          <span className="font-mono text-[11px] font-semibold text-slate-700">
+                          <span className="inline-block py-1.5 font-mono text-xs font-semibold text-slate-700">
                             {line.itemCode}
                           </span>
                         )}
                       </td>
 
                       {/* Name */}
-                      <td className="py-2 px-3">
+                      <td className="py-2.5 px-3">
                         {isAdmin ? (
                           <input
                             type="text"
                             value={line.itemName}
                             onChange={e => handleItemFieldChange(idx, 'itemName', e.target.value)}
-                            className="w-full px-2 py-1 border border-slate-200 rounded text-slate-800 bg-white focus:border-indigo-500 outline-none"
+                            className="w-full px-2.5 py-2 border border-slate-200 rounded-lg text-xs font-medium text-slate-900 bg-white focus:border-indigo-500 outline-none"
                             placeholder="Tên vật tư"
                             required
                           />
                         ) : (
-                          <span className="font-medium text-slate-900">{line.itemName}</span>
+                          <span className="inline-block py-1.5 font-medium text-slate-900">{line.itemName}</span>
                         )}
                       </td>
 
                       {/* Unit */}
-                      <td className="py-2 px-2">
+                      <td className="py-2.5 px-2.5 text-center">
                         {isAdmin ? (
                           <input
                             type="text"
                             value={line.unit}
                             onChange={e => handleItemFieldChange(idx, 'unit', e.target.value)}
-                            className="w-full px-1.5 py-1 border border-slate-200 rounded text-center text-slate-700 bg-white focus:border-indigo-500 outline-none"
+                            className="w-full px-2 py-2 border border-slate-200 rounded-lg text-center text-xs font-medium text-slate-700 bg-white focus:border-indigo-500 outline-none"
                           />
                         ) : (
-                          <span className="text-slate-600">{line.unit}</span>
+                          <span className="inline-block py-1.5 text-slate-600">{line.unit}</span>
                         )}
                       </td>
 
-                      {/* Quantity (Cột Số Lượng Vật Tư - Crucial) */}
-                      <td className="py-2 px-3 bg-indigo-50/30">
+                      {/* Quantity (Cột Số Lượng Vật Tư - Rộng rãi, dễ nhập liệu) */}
+                      <td className="py-2.5 px-3.5 bg-indigo-50/35 border-x border-indigo-100/70 min-w-[175px] w-44">
                         {isAdmin ? (
                           <input
                             type="number"
                             min="0.001"
                             step="any"
-                            value={line.quantity}
-                            onChange={e => handleItemFieldChange(idx, 'quantity', e.target.value)}
-                            className="w-full px-2 py-1 border-2 border-indigo-300 rounded font-bold text-right text-indigo-900 bg-white focus:border-indigo-600 outline-none tabular-nums"
+                            value={rawInputs[`${idx}-quantity`] ?? line.quantity}
+                            onChange={e => handleNumericInputChange(idx, 'quantity', e.target.value)}
+                            onBlur={() => handleNumericInputBlur(idx, 'quantity')}
+                            placeholder="0"
+                            className="w-full min-w-[145px] px-3 py-2 border-2 border-indigo-300 rounded-lg text-sm font-bold text-right text-indigo-950 bg-white focus:border-indigo-600 focus:ring-2 focus:ring-indigo-500/15 outline-none tabular-nums"
                             required
                           />
                         ) : (
-                          <div className="text-right font-bold text-slate-900 tabular-nums">
+                          <div className="py-1.5 text-right text-sm font-bold text-slate-900 tabular-nums">
                             {formatNumber(line.quantity)}
                           </div>
                         )}
                       </td>
 
-                      {/* Unit Price */}
-                      <td className="py-2 px-3">
+                      {/* Unit Price (Cột Đơn Giá VNĐ - Mở rộng cho dãy số lớn) */}
+                      <td className="py-2.5 px-3.5 bg-amber-50/25 border-r border-amber-100/70 min-w-[215px] w-56">
                         {isAdmin ? (
-                          <input
-                            type="number"
-                            min="0"
-                            step="any"
-                            value={line.unitPrice}
-                            onChange={e => handleItemFieldChange(idx, 'unitPrice', e.target.value)}
-                            className="w-full px-2 py-1 border border-slate-200 rounded text-right text-slate-800 bg-white focus:border-indigo-500 outline-none tabular-nums"
-                          />
+                          <div>
+                            <input
+                              type="number"
+                              min="0"
+                              step="any"
+                              value={rawInputs[`${idx}-unitPrice`] ?? line.unitPrice}
+                              onChange={e => handleNumericInputChange(idx, 'unitPrice', e.target.value)}
+                              onBlur={() => handleNumericInputBlur(idx, 'unitPrice')}
+                              placeholder="0"
+                              className="w-full min-w-[185px] px-3 py-2 border-2 border-amber-300/90 rounded-lg text-sm font-bold text-right text-slate-900 bg-white focus:border-amber-600 focus:ring-2 focus:ring-amber-500/15 outline-none tabular-nums"
+                            />
+                            {line.unitPrice > 0 && (
+                              <div className="mt-1 text-[10px] font-medium text-slate-500 text-right tabular-nums">
+                                {formatCurrency(line.unitPrice)}
+                              </div>
+                            )}
+                          </div>
                         ) : (
-                          <div className="text-right text-slate-700 tabular-nums">
+                          <div className="py-1.5 text-right text-sm font-semibold text-slate-700 tabular-nums">
                             {formatCurrency(line.unitPrice)}
                           </div>
                         )}
                       </td>
 
                       {/* Amount */}
-                      <td className="py-2.5 px-3 text-right font-bold text-slate-900 tabular-nums">
+                      <td className="py-3.5 px-3.5 text-right text-sm font-bold text-slate-900 tabular-nums whitespace-nowrap">
                         {formatCurrency(line.amount || line.quantity * line.unitPrice)}
                       </td>
 
                       {/* Serial / Lot */}
-                      <td className="py-2 px-2">
+                      <td className="py-2.5 px-2.5">
                         {isAdmin ? (
                           <input
                             type="text"
                             value={line.serialNumber || ''}
                             onChange={e => handleItemFieldChange(idx, 'serialNumber', e.target.value)}
                             placeholder="Số lô / Serial"
-                            className="w-full px-2 py-1 border border-slate-200 rounded text-[11px] text-slate-700 bg-white outline-none"
+                            className="w-full px-2.5 py-2 border border-slate-200 rounded-lg text-xs text-slate-700 bg-white focus:border-indigo-500 outline-none"
                           />
                         ) : (
-                          <span className="text-slate-500 text-[11px]">{line.serialNumber || '-'}</span>
+                          <span className="inline-block py-1.5 text-slate-500 text-xs">{line.serialNumber || '-'}</span>
                         )}
                       </td>
 
                       {/* Note */}
-                      <td className="py-2 px-2">
+                      <td className="py-2.5 px-2.5">
                         {isAdmin ? (
                           <input
                             type="text"
                             value={line.note || ''}
                             onChange={e => handleItemFieldChange(idx, 'note', e.target.value)}
                             placeholder="Ghi chú dòng"
-                            className="w-full px-2 py-1 border border-slate-200 rounded text-[11px] text-slate-700 bg-white outline-none"
+                            className="w-full px-2.5 py-2 border border-slate-200 rounded-lg text-xs text-slate-700 bg-white focus:border-indigo-500 outline-none"
                           />
                         ) : (
-                          <span className="text-slate-500 text-[11px]">{line.note || '-'}</span>
+                          <span className="inline-block py-1.5 text-slate-500 text-xs">{line.note || '-'}</span>
                         )}
                       </td>
 
                       {/* Delete Line */}
                       {isAdmin && (
-                        <td className="py-2 px-2 text-center">
+                        <td className="py-3 px-2 text-center">
                           <button
                             type="button"
                             onClick={() => handleRemoveLineItem(idx)}
-                            className="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors"
+                            className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors"
                             title="Xóa dòng vật tư này"
                           >
                             <Trash2 className="w-4 h-4" />
@@ -640,14 +678,14 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
                 </tbody>
                 <tfoot>
                   <tr className="bg-slate-50 font-bold text-slate-900 border-t border-slate-200">
-                    <td colSpan={4} className="py-3 px-3 uppercase text-[11px]">
+                    <td colSpan={4} className="py-3.5 px-3 uppercase text-xs">
                       Tổng cộng chứng từ ({lineItems.length} mặt hàng)
                     </td>
-                    <td className="py-3 px-3 text-right tabular-nums text-indigo-700 text-sm bg-indigo-50/50">
+                    <td className="py-3.5 px-3.5 text-right tabular-nums text-indigo-700 text-sm bg-indigo-50/60 border-x border-indigo-100">
                       {formatNumber(totalQuantity)}
                     </td>
-                    <td className="py-3 px-3 text-right text-slate-400">-</td>
-                    <td className="py-3 px-3 text-right tabular-nums text-indigo-900 text-sm">
+                    <td className="py-3.5 px-3.5 text-right text-slate-400 border-r border-amber-100/60">-</td>
+                    <td className="py-3.5 px-3.5 text-right tabular-nums text-indigo-900 text-sm whitespace-nowrap">
                       {formatCurrency(totalAmount)}
                     </td>
                     <td colSpan={isAdmin ? 3 : 2}></td>
@@ -660,7 +698,7 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
           {/* Footer Controls */}
           <div className="pt-4 border-t border-slate-200 flex items-center justify-between gap-3">
             <div className="text-xs text-slate-500">
-              Tổng số lượng: <strong className="text-slate-900">{formatNumber(totalQuantity)}</strong> &bull; Tổng tiền: <strong className="text-indigo-700">{formatCurrency(totalAmount)}</strong>
+              Tổng số lượng: <strong className="text-slate-900 tabular-nums">{formatNumber(totalQuantity)}</strong> &bull; Tổng tiền: <strong className="text-indigo-700 tabular-nums">{formatCurrency(totalAmount)}</strong>
             </div>
 
             <div className="flex items-center gap-2">

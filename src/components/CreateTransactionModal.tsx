@@ -58,6 +58,7 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
   const [approverName, setApproverName] = useState<string>('Chỉ huy trưởng / GĐ');
   const [notes, setNotes] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string>('');
+  const [rawInputs, setRawInputs] = useState<Record<string, string>>({});
 
   // Initial line item
   const [lineItems, setLineItems] = useState<TransactionLineItem[]>(() => {
@@ -123,6 +124,13 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
   };
 
   const handleSelectItem = (index: number, selectedItemId: string) => {
+    setRawInputs(prev => {
+      const next = { ...prev };
+      delete next[`${index}-quantity`];
+      delete next[`${index}-unitPrice`];
+      return next;
+    });
+
     if (selectedItemId === '__NEW_ITEM__') {
       setLineItems(prev => {
         const updated = [...prev];
@@ -199,6 +207,33 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
     });
   };
 
+  const handleNumericInputChange = (
+    index: number,
+    field: 'quantity' | 'unitPrice',
+    rawValue: string
+  ) => {
+    const key = `${index}-${field}`;
+    setRawInputs(prev => ({ ...prev, [key]: rawValue }));
+    const parsed = rawValue.trim() === '' ? 0 : Number(rawValue);
+    if (!Number.isNaN(parsed)) {
+      if (field === 'quantity') {
+        handleQuantityChange(index, parsed);
+      } else {
+        handlePriceChange(index, parsed);
+      }
+    }
+  };
+
+  const handleNumericInputBlur = (index: number, field: 'quantity' | 'unitPrice') => {
+    const key = `${index}-${field}`;
+    setRawInputs(prev => {
+      if (!(key in prev)) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  };
+
   const handleFieldChange = (index: number, field: keyof TransactionLineItem, value: string) => {
     setLineItems(prev => {
       const updated = [...prev];
@@ -236,8 +271,10 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
   const removeLine = (index: number) => {
     if (lineItems.length <= 1) return;
     setLineItems(prev => prev.filter((_, i) => i !== index));
+    setRawInputs({});
   };
 
+  const totalQuantity = lineItems.reduce((acc, l) => acc + (Number(l.quantity) || 0), 0);
   const totalAmount = lineItems.reduce((acc, l) => acc + (l.amount || 0), 0);
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -325,8 +362,8 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl max-w-4xl w-full border border-slate-200 shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
+    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-2 sm:p-4">
+      <div className="bg-white rounded-2xl max-w-[96vw] 2xl:max-w-[1480px] w-full border border-slate-200 shadow-2xl overflow-hidden flex flex-col max-h-[94vh]">
         {/* Header */}
         <div className="p-5 border-b border-slate-200 flex items-center justify-between bg-slate-50">
           <div className="flex items-center gap-3">
@@ -506,16 +543,16 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
 
           {/* Line Items Table */}
           <div>
-            <div className="flex items-center justify-between mb-2">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2.5">
               <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700">
-                Danh sách vật tư & thiết bị giao dịch
+                Danh sách vật tư & thiết bị giao dịch ({lineItems.length} dòng)
               </h3>
               <div className="flex items-center gap-2">
                 {type === 'NHAP_KHO' && (
                   <button
                     type="button"
                     onClick={() => addLine(true)}
-                    className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 hover:text-emerald-800 bg-emerald-50 hover:bg-emerald-100 px-2.5 py-1 rounded-lg border border-emerald-200 transition-colors"
+                    className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 hover:text-emerald-800 bg-emerald-50 hover:bg-emerald-100 px-3 py-1.5 rounded-lg border border-emerald-200 transition-colors"
                     title="Nhập vật tư mới chưa có trong hệ thống và tự động lưu vào danh mục"
                   >
                     <Plus className="w-3.5 h-3.5" />
@@ -525,7 +562,7 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                 <button
                   type="button"
                   onClick={() => addLine(false)}
-                  className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-600 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 px-2.5 py-1 rounded-lg border border-indigo-200 transition-colors"
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-600 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 rounded-lg border border-indigo-200 transition-colors"
                 >
                   <Plus className="w-3.5 h-3.5" />
                   <span>+ Thêm dòng</span>
@@ -533,20 +570,24 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
               </div>
             </div>
 
-            <div className="border border-slate-200 rounded-xl overflow-hidden shadow-2xs">
-              <table className="w-full text-left border-collapse text-xs">
+            <div className="border border-slate-200 rounded-xl overflow-x-auto shadow-2xs bg-white">
+              <table className="w-full min-w-[1180px] text-left border-collapse text-xs">
                 <thead>
-                  <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase text-[10px]">
-                    <th className="py-2.5 px-3 min-w-[260px]">Chọn hoặc Nhập Vật tư / Thiết bị</th>
-                    <th className="py-2.5 px-2 w-20">ĐVT</th>
-                    <th className="py-2.5 px-2 w-28 text-right">
+                  <tr className="bg-slate-100/90 border-b border-slate-200 text-slate-700 font-bold text-xs">
+                    <th className="py-3 px-3 min-w-[280px]">Chọn hoặc Nhập Vật tư / Thiết bị</th>
+                    <th className="py-3 px-2.5 min-w-[84px] w-22 text-center">ĐVT</th>
+                    <th className="py-3 px-3 min-w-[120px] w-32 text-right">
                       {type === 'XUAT_KHO' ? 'Tồn khả dụng' : 'Tồn hiện tại'}
                     </th>
-                    <th className="py-2.5 px-2 w-24 text-right">Số lượng *</th>
-                    <th className="py-2.5 px-2 w-32 text-right">Đơn giá (VNĐ)</th>
-                    <th className="py-2.5 px-3 w-32 text-right">Thành tiền</th>
-                    <th className="py-2.5 px-2 min-w-[120px]">Serial / Lô / Ghi chú</th>
-                    <th className="py-2.5 px-2 w-10 text-center"></th>
+                    <th className="py-3 px-3.5 min-w-[175px] w-44 text-right bg-indigo-50/80 text-indigo-950 border-x border-indigo-100">
+                      Số lượng *
+                    </th>
+                    <th className="py-3 px-3.5 min-w-[215px] w-56 text-right bg-amber-50/70 text-amber-950 border-r border-amber-100">
+                      Đơn giá (VNĐ)
+                    </th>
+                    <th className="py-3 px-3.5 min-w-[165px] w-44 text-right">Thành tiền (VNĐ)</th>
+                    <th className="py-3 px-3 min-w-[160px] w-44">Serial / Lô / Ghi chú</th>
+                    <th className="py-3 px-2 w-12 text-center">Xóa</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -558,21 +599,21 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                     return (
                       <tr
                         key={idx}
-                        className={
+                        className={`align-top ${
                           line.isNewItem
                             ? 'bg-emerald-50/40 hover:bg-emerald-50/60'
                             : isExceedingStock
                             ? 'bg-rose-50/50'
                             : 'hover:bg-slate-50/50'
-                        }
+                        }`}
                       >
                         {/* Item selection or New item inputs */}
-                        <td className="py-2 px-3">
+                        <td className="py-2.5 px-3">
                           {line.isNewItem ? (
-                            <div className="space-y-1.5 py-1">
+                            <div className="space-y-1.5 py-0.5">
                               <div className="flex items-center justify-between">
                                 <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-md">
-                                  ✨ Vật tư mới - Tự động cập nhật danh mục
+                                  Vật tư mới - Tự động cập nhật danh mục
                                 </span>
                                 <button
                                   type="button"
@@ -602,7 +643,7 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                                   onChange={e =>
                                     handleFieldChange(idx, 'itemCode', e.target.value.toUpperCase())
                                   }
-                                  className="w-full px-2 py-1 text-xs font-mono font-bold border border-emerald-300 rounded focus:border-emerald-600 outline-none bg-white"
+                                  className="w-full px-2.5 py-1.5 text-xs font-mono font-bold border border-emerald-300 rounded-lg focus:border-emerald-600 outline-none bg-white"
                                   required
                                 />
                                 <input
@@ -612,7 +653,7 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                                   onChange={e =>
                                     handleFieldChange(idx, 'itemName', e.target.value)
                                   }
-                                  className="w-full px-2 py-1 text-xs border border-emerald-300 rounded focus:border-emerald-600 outline-none bg-white"
+                                  className="w-full px-2.5 py-1.5 text-xs border border-emerald-300 rounded-lg focus:border-emerald-600 outline-none bg-white"
                                   required
                                 />
                               </div>
@@ -624,7 +665,7 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                                   onChange={e =>
                                     handleFieldChange(idx, 'category', e.target.value)
                                   }
-                                  className="w-full px-2 py-1 text-[11px] border border-slate-200 rounded outline-none bg-white"
+                                  className="w-full px-2.5 py-1.5 text-[11px] border border-slate-200 rounded-lg outline-none bg-white"
                                 />
                                 <input
                                   type="text"
@@ -633,7 +674,7 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                                   onChange={e =>
                                     handleFieldChange(idx, 'location', e.target.value)
                                   }
-                                  className="w-full px-2 py-1 text-[11px] border border-slate-200 rounded outline-none bg-white"
+                                  className="w-full px-2.5 py-1.5 text-[11px] border border-slate-200 rounded-lg outline-none bg-white"
                                 />
                               </div>
                             </div>
@@ -642,13 +683,13 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                               <select
                                 value={line.itemId}
                                 onChange={e => handleSelectItem(idx, e.target.value)}
-                                className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded focus:border-indigo-500 outline-none bg-white font-medium"
+                                className="w-full px-2.5 py-2 text-xs border border-slate-200 rounded-lg focus:border-indigo-500 outline-none bg-white font-medium"
                                 required
                               >
                                 <option value="">-- Chọn mặt hàng có sẵn --</option>
                                 {type === 'NHAP_KHO' && (
                                   <option value="__NEW_ITEM__">
-                                    ✨ + Nhập vật tư mới (Tự động cập nhật danh mục)
+                                    + Nhập vật tư mới (Tự động cập nhật danh mục)
                                   </option>
                                 )}
                                 {items.map(it => (
@@ -671,25 +712,25 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                         </td>
 
                         {/* Unit */}
-                        <td className="py-2 px-2 text-slate-600">
+                        <td className="py-2.5 px-2.5 text-center text-slate-600">
                           {line.isNewItem ? (
                             <input
                               type="text"
                               value={line.unit}
                               onChange={e => handleFieldChange(idx, 'unit', e.target.value)}
                               placeholder="ĐVT"
-                              className="w-full px-1.5 py-1 text-xs border border-emerald-300 rounded text-center outline-none bg-white font-medium"
+                              className="w-full px-2 py-2 text-xs border border-emerald-300 rounded-lg text-center outline-none bg-white font-medium"
                               required
                             />
                           ) : (
-                            line.unit || '-'
+                            <span className="inline-block py-1.5 font-medium">{line.unit || '-'}</span>
                           )}
                         </td>
 
                         {/* Available Stock */}
-                        <td className="py-2 px-2 text-right tabular-nums text-slate-500">
+                        <td className="py-3.5 px-3 text-right tabular-nums text-slate-600 whitespace-nowrap">
                           {line.isNewItem ? (
-                            <span className="text-[10px] text-emerald-600 font-semibold">Mới (0)</span>
+                            <span className="text-[11px] text-emerald-600 font-semibold">Mới (0)</span>
                           ) : currentItem ? (
                             `${formatNumber(currentItem.currentStock)} ${currentItem.unit}`
                           ) : (
@@ -698,64 +739,73 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                         </td>
 
                         {/* Quantity */}
-                        <td className="py-2 px-2 text-right">
+                        <td className="py-2.5 px-3.5 text-right bg-indigo-50/35 border-x border-indigo-100/70 min-w-[175px] w-44">
                           <input
                             type="number"
-                            min="1"
+                            min="0.001"
                             step="any"
-                            value={line.quantity}
-                            onChange={e => handleQuantityChange(idx, Number(e.target.value))}
-                            className={`w-full px-2 py-1 text-xs border rounded text-right tabular-nums outline-none font-semibold ${
+                            value={rawInputs[`${idx}-quantity`] ?? line.quantity}
+                            onChange={e => handleNumericInputChange(idx, 'quantity', e.target.value)}
+                            onBlur={() => handleNumericInputBlur(idx, 'quantity')}
+                            placeholder="0"
+                            className={`w-full min-w-[145px] px-3 py-2 text-sm border-2 rounded-lg text-right tabular-nums outline-none font-bold bg-white ${
                               isExceedingStock
                                 ? 'border-rose-400 bg-rose-50 text-rose-700'
-                                : 'border-slate-200 focus:border-indigo-500'
+                                : 'border-indigo-300 text-indigo-950 focus:border-indigo-600 focus:ring-2 focus:ring-indigo-500/15'
                             }`}
                             required
                           />
                           {isExceedingStock && (
-                            <span className="text-[10px] text-rose-600 font-bold block">
-                              Vượt tồn!
+                            <span className="mt-1 text-[10px] text-rose-600 font-bold block">
+                              Vượt tồn khả dụng!
                             </span>
                           )}
                         </td>
 
                         {/* Unit Price */}
-                        <td className="py-2 px-2 text-right">
+                        <td className="py-2.5 px-3.5 text-right bg-amber-50/25 border-r border-amber-100/70 min-w-[215px] w-56">
                           <input
                             type="number"
                             min="0"
-                            step="1000"
-                            value={line.unitPrice}
-                            onChange={e => handlePriceChange(idx, Number(e.target.value))}
-                            className="w-full px-2 py-1 text-xs border border-slate-200 rounded text-right tabular-nums outline-none focus:border-indigo-500"
+                            step="any"
+                            value={rawInputs[`${idx}-unitPrice`] ?? line.unitPrice}
+                            onChange={e => handleNumericInputChange(idx, 'unitPrice', e.target.value)}
+                            onBlur={() => handleNumericInputBlur(idx, 'unitPrice')}
+                            placeholder="0"
+                            className="w-full min-w-[185px] px-3 py-2 text-sm font-bold text-slate-900 bg-white border-2 border-amber-300/90 rounded-lg text-right tabular-nums outline-none focus:border-amber-600 focus:ring-2 focus:ring-amber-500/15"
                           />
+                          {line.unitPrice > 0 && (
+                            <div className="mt-1 text-[10px] font-medium text-slate-500 text-right tabular-nums">
+                              {formatCurrency(line.unitPrice)}
+                            </div>
+                          )}
                         </td>
 
                         {/* Amount */}
-                        <td className="py-2 px-3 text-right tabular-nums font-bold text-slate-900">
+                        <td className="py-3.5 px-3.5 text-right tabular-nums text-sm font-bold text-slate-900 whitespace-nowrap">
                           {formatCurrency(line.amount)}
                         </td>
 
                         {/* Serial & Note */}
-                        <td className="py-2 px-2">
+                        <td className="py-2.5 px-3">
                           <input
                             type="text"
                             value={line.note || line.serialNumber || ''}
                             onChange={e => handleFieldChange(idx, 'note', e.target.value)}
-                            placeholder="Số serial, vị trí hoặc lưu ý..."
-                            className="w-full px-2 py-1 text-xs border border-slate-200 rounded outline-none focus:border-indigo-500"
+                            placeholder="Số serial, lô hoặc ghi chú..."
+                            className="w-full px-2.5 py-2 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-500 bg-white"
                           />
                         </td>
 
                         {/* Delete line */}
-                        <td className="py-2 px-2 text-center">
+                        <td className="py-3 px-2 text-center">
                           <button
                             type="button"
                             onClick={() => removeLine(idx)}
                             disabled={lineItems.length <= 1}
-                            className="p-1 text-slate-400 hover:text-rose-600 disabled:opacity-30 disabled:cursor-not-allowed"
+                            className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                           >
-                            <Trash2 className="w-3.5 h-3.5" />
+                            <Trash2 className="w-4 h-4" />
                           </button>
                         </td>
                       </tr>
@@ -763,11 +813,15 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                   })}
                 </tbody>
                 <tfoot>
-                  <tr className="bg-slate-50 border-t border-slate-200 font-bold text-xs">
-                    <td colSpan={5} className="py-2.5 px-3 text-right uppercase">
-                      Tổng tiền phiếu:
+                  <tr className="bg-slate-50 border-t border-slate-200 font-bold text-xs text-slate-900">
+                    <td colSpan={3} className="py-3.5 px-3 text-right uppercase">
+                      Tổng cộng phiếu:
                     </td>
-                    <td className="py-2.5 px-3 text-right tabular-nums text-indigo-700 text-sm">
+                    <td className="py-3.5 px-3.5 text-right tabular-nums text-indigo-700 text-sm bg-indigo-50/60 border-x border-indigo-100">
+                      {formatNumber(totalQuantity)}
+                    </td>
+                    <td className="py-3.5 px-3.5 text-right text-slate-400 border-r border-amber-100/60">-</td>
+                    <td className="py-3.5 px-3.5 text-right tabular-nums text-indigo-900 text-sm whitespace-nowrap">
                       {formatCurrency(totalAmount)}
                     </td>
                     <td colSpan={2}></td>
