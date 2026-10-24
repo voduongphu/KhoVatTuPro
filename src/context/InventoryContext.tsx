@@ -16,16 +16,16 @@ import {
   User,
   Warehouse,
 } from '../types/inventory';
-import { getStockStatus } from '../utils/formatters';
+import { calculateItemWarehouseStocks, getStockStatus } from '../utils/formatters';
 import { SyncStatus, CloudProvider, CentralDataPayload, centralSyncService } from '../services/centralSyncService';
 import { supabaseRealtimeService, RealtimeConnectionState } from '../services/supabaseRealtimeService';
 import { DeviceInfo, getDeviceId, getDeviceInfo, getDeviceName } from '../utils/deviceHelper';
-import { sessionBus, SessionBusMessage } from '../services/sessionBus';
+import { sessionBus } from '../services/sessionBus';
 import {
-  mergeItemsAdditive,
-  mergeTransactionsAdditive,
-  mergeUsersAdditive,
-  mergeWarehousesAdditive,
+  DeletedRegistry,
+  makeTombstoneKey,
+  nextMonotonicIso,
+  reconcileSyncPayloads,
 } from '../utils/mergeSyncData';
 
 interface InventoryContextType {
@@ -117,7 +117,7 @@ interface InventoryContextType {
   getItemLedger: (itemId: string) => StockLedgerEntry[];
   resetToDefaultData: () => void;
 
-  // Central Cloud Synchronization (Vercel KV / Supabase)
+  // Central Cloud Synchronization (Server SSE / Vercel KV / Supabase)
   syncStatus: SyncStatus;
   lastSyncedAt: Date | null;
   autoSyncEnabled: boolean;
@@ -158,6 +158,7 @@ const STORAGE_KEYS = {
   WAREHOUSES: 'nxt_inventory_warehouses_v3',
   USERS: 'nxt_inventory_users_v3',
   AUTH: 'nxt_inventory_current_user_v3',
+  DELETED_REGISTRY: 'nxt_inventory_deleted_registry_v4',
   DELETED_ITEMS: 'nxt_inventory_deleted_items_v3',
   DELETED_TRANSACTIONS: 'nxt_inventory_deleted_transactions_v3',
   DELETED_USERS: 'nxt_inventory_deleted_users_v3',
@@ -165,6 +166,65 @@ const STORAGE_KEYS = {
 };
 
 const RESET_EPOCH = '2026-10-21T10:00:00.000Z';
+
+function computeNetMovementsForItem(
+  itemId: string,
+  itemCode: string,
+  transactions: Transaction[]
+): { totalNet: number; byWarehouse: Record<string, number> } {
+  const normCode = (itemCode || '').trim().toUpperCase();
+  const byWarehouse: Record<string, number> = {};
+  let totalNet = 0;
+
+  transactions.forEach(trx => {
+    if (!trx || trx.status === 'DA_HUY') return;
+    const whId = trx.warehouseId || 'WH-01';
+    (trx.items || []).forEach(line => {
+      const match =
+        (itemId && line.itemId === itemId) ||
+        (normCode && line.itemCode && line.itemCode.trim().toUpperCase() === normCode);
+      if (!match) return;
+      const qty = Number(line.quantity) || 0;
+      const delta = trx.type === 'NHAP_KHO' ? qty : -qty;
+      byWarehouse[whId] = (byWarehouse[whId] || 0) + delta;
+      totalNet += delta;
+    });
+  });
+
+  return { totalNet, byWarehouse };
+}
+
+function recalculateAllItemsStocks(
+  itemsList: InventoryItem[],
+  warehousesList: Warehouse[],
+  transactionsList: Transaction[]
+): InventoryItem[] {
+  return itemsList.map(it => {
+    const stocks = calculateItemWarehouseStocks(it, warehousesList, transactionsList);
+    const total = Object.values(stocks).reduce((sum, q) => sum + (Number(q) || 0), 0);
+    return {
+      ...it,
+      warehouseStocks: stocks,
+      currentStock: Math.max(0, total),
+    };
+  });
+}
+
+function extractLegacyDeletedArrays(reg: DeletedRegistry) {
+  const deletedItemIds: string[] = [];
+  const deletedTransactionIds: string[] = [];
+  const deletedUserIds: string[] = [];
+  const deletedWarehouseIds: string[] = [];
+
+  Object.keys(reg).forEach(k => {
+    if (k.startsWith('ITEM:')) deletedItemIds.push(k.slice(5));
+    else if (k.startsWith('TRX:')) deletedTransactionIds.push(k.slice(4));
+    else if (k.startsWith('USER:')) deletedUserIds.push(k.slice(5));
+    else if (k.startsWith('WH:')) deletedWarehouseIds.push(k.slice(3));
+  });
+
+  return { deletedItemIds, deletedTransactionIds, deletedUserIds, deletedWarehouseIds };
+}
 
 const InventoryContext = createContext<InventoryContextType | null>(null);
 
@@ -218,7 +278,6 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   });
 
   const [currentUser, setCurrentUser] = useState<User | null>(() => {
-    // Luôn đưa về màn hình đăng nhập khi mở lại hoặc tải lại ứng dụng
     try {
       localStorage.removeItem(STORAGE_KEYS.AUTH);
     } catch {
@@ -227,7 +286,19 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return null;
   });
 
-  // Track deleted IDs (Tombstones) to ensure deletions by Admin sync across devices
+  const [deletedRegistry, setDeletedRegistry] = useState<DeletedRegistry>(() => {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEYS.DELETED_REGISTRY);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed && typeof parsed === 'object') return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return {};
+  });
+
   const [deletedItemIds, setDeletedItemIds] = useState<string[]>(() => {
     try {
       const stored = localStorage.getItem(STORAGE_KEYS.DELETED_ITEMS);
@@ -264,6 +335,35 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   });
 
+  // Always-fresh synchronous snapshot ref so async SSE/polling/mutation callbacks never read stale closures
+  const stateRef = useRef({
+    warehouses,
+    items,
+    transactions,
+    users,
+    deletedRegistry,
+    deletedItemIds,
+    deletedTransactionIds,
+    deletedUserIds,
+    deletedWarehouseIds,
+  });
+
+  stateRef.current = {
+    warehouses,
+    items,
+    transactions,
+    users,
+    deletedRegistry,
+    deletedItemIds,
+    deletedTransactionIds,
+    deletedUserIds,
+    deletedWarehouseIds,
+  };
+
+  const clientIdRef = useRef<string>(
+    `CLIENT-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`
+  );
+
   // Multi-device Single Session Tracking state
   const [sessionTerminatedReason, setSessionTerminatedReason] = useState<string | null>(null);
   const [currentDeviceInfo, setCurrentDeviceInfo] = useState<DeviceInfo>(() => getDeviceInfo());
@@ -288,7 +388,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const [filterCriteria, setFilterCriteria] = useState<MultiFilterCriteria>(defaultCriteria);
 
-  // Central Cloud Synchronization state (Vercel KV / Supabase)
+  // Central Cloud Synchronization state
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('synced');
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(new Date());
   const [autoSyncEnabled, setAutoSyncEnabled] = useState<boolean>(true);
@@ -297,9 +397,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return centralSyncService.getProvider();
   });
   const [isSyncModalOpen, setIsSyncModalOpen] = useState<boolean>(false);
-  const [lastServerTimestamp, setLastServerTimestamp] = useState<string>(() => new Date().toISOString());
-  const isRemoteUpdatingRef = useRef<boolean>(false);
-  const pushTimerRef = useRef<any>(null);
+  const [lastServerTimestamp, setLastServerTimestamp] = useState<string>('');
 
   // Supabase Realtime state
   const [realtimeConnectionState, setRealtimeConnectionState] = useState<RealtimeConnectionState>(() =>
@@ -312,159 +410,303 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const clearRealtimeMessage = useCallback(() => setLastRealtimeUpdateMessage(null), []);
 
-  // Central additive merge helper: ensures remote data is added/merged rather than replacing local items/users/transactions
+  const persistSnapshotToLocalStorage = useCallback(
+    (snapshot: {
+      warehouses: Warehouse[];
+      items: InventoryItem[];
+      transactions: Transaction[];
+      users: User[];
+      deletedRegistry: DeletedRegistry;
+      deletedItemIds: string[];
+      deletedTransactionIds: string[];
+      deletedUserIds: string[];
+      deletedWarehouseIds: string[];
+    }) => {
+      try {
+        localStorage.setItem(STORAGE_KEYS.WAREHOUSES, JSON.stringify(snapshot.warehouses));
+        localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(snapshot.items));
+        localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(snapshot.transactions));
+        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(snapshot.users));
+        localStorage.setItem(
+          STORAGE_KEYS.DELETED_REGISTRY,
+          JSON.stringify(snapshot.deletedRegistry)
+        );
+        localStorage.setItem(STORAGE_KEYS.DELETED_ITEMS, JSON.stringify(snapshot.deletedItemIds));
+        localStorage.setItem(
+          STORAGE_KEYS.DELETED_TRANSACTIONS,
+          JSON.stringify(snapshot.deletedTransactionIds)
+        );
+        localStorage.setItem(STORAGE_KEYS.DELETED_USERS, JSON.stringify(snapshot.deletedUserIds));
+        localStorage.setItem(
+          STORAGE_KEYS.DELETED_WAREHOUSES,
+          JSON.stringify(snapshot.deletedWarehouseIds)
+        );
+      } catch {
+        // ignore quota errors
+      }
+    },
+    []
+  );
+
+  /**
+   * Pure, deterministic remote payload reconciliation (no nested React state updaters,
+   * handles empty arrays on full deletions, and propagates shared Supabase credentials).
+   */
   const applyRemotePayloadAdditive = useCallback(
     (payload: CentralDataPayload) => {
       if (!payload) return;
 
-      isRemoteUpdatingRef.current = true;
-
-      // Update deleted tombstones from remote payload
-      let currentDelUsers = deletedUserIds;
-      if (Array.isArray(payload.deletedUserIds) && payload.deletedUserIds.length > 0) {
-        currentDelUsers = Array.from(new Set([...deletedUserIds, ...payload.deletedUserIds]));
-        setDeletedUserIds(currentDelUsers);
-        try {
-          localStorage.setItem(STORAGE_KEYS.DELETED_USERS, JSON.stringify(currentDelUsers));
-        } catch {
-          // ignore
-        }
-      }
-
-      let currentDelTrx = deletedTransactionIds;
-      if (Array.isArray(payload.deletedTransactionIds) && payload.deletedTransactionIds.length > 0) {
-        currentDelTrx = Array.from(new Set([...deletedTransactionIds, ...payload.deletedTransactionIds]));
-        setDeletedTransactionIds(currentDelTrx);
-        try {
-          localStorage.setItem(STORAGE_KEYS.DELETED_TRANSACTIONS, JSON.stringify(currentDelTrx));
-        } catch {
-          // ignore
-        }
-      }
-
-      let currentDelItems = deletedItemIds;
-      if (Array.isArray(payload.deletedItemIds) && payload.deletedItemIds.length > 0) {
-        currentDelItems = Array.from(new Set([...deletedItemIds, ...payload.deletedItemIds]));
-        setDeletedItemIds(currentDelItems);
-        try {
-          localStorage.setItem(STORAGE_KEYS.DELETED_ITEMS, JSON.stringify(currentDelItems));
-        } catch {
-          // ignore
-        }
-      }
-
-      let currentDelWh = deletedWarehouseIds;
-      if (Array.isArray(payload.deletedWarehouseIds) && payload.deletedWarehouseIds.length > 0) {
-        currentDelWh = Array.from(new Set([...deletedWarehouseIds, ...payload.deletedWarehouseIds]));
-        setDeletedWarehouseIds(currentDelWh);
-        try {
-          localStorage.setItem(STORAGE_KEYS.DELETED_WAREHOUSES, JSON.stringify(currentDelWh));
-        } catch {
-          // ignore
-        }
-      }
-
-      // 1. Merge warehouses additively (respecting deletions & admin edits)
-      let currentWh = warehouses;
-      if (Array.isArray(payload.warehouses) && payload.warehouses.length > 0) {
-        setWarehouses(prevWh => {
-          const mergedWh = mergeWarehousesAdditive(prevWh, payload.warehouses, currentDelWh);
-          currentWh = mergedWh;
-          try {
-            localStorage.setItem(STORAGE_KEYS.WAREHOUSES, JSON.stringify(mergedWh));
-          } catch {
-            // ignore
-          }
-          return mergedWh;
-        });
-      }
-
-      // 2. Merge users additively (respecting deletions & admin edits)
-      if (Array.isArray(payload.users) && payload.users.length > 0) {
-        const remoteUsers = payload.users;
-        setUsers(prevUsers => {
-          const mergedUsers = mergeUsersAdditive(prevUsers, remoteUsers, currentDelUsers);
-          try {
-            localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(mergedUsers));
-          } catch {
-            // ignore
-          }
-          return mergedUsers;
-        });
-      }
-
-      // 3. Merge transactions additively (respecting deletions & admin edits)
-      setTransactions(prevTrx => {
-        const mergedTrx =
-          Array.isArray(payload.transactions) && payload.transactions.length > 0
-            ? mergeTransactionsAdditive(prevTrx, payload.transactions, currentDelTrx)
-            : prevTrx.filter(
-                t =>
-                  !currentDelTrx.includes(t.id.toUpperCase()) &&
-                  !currentDelTrx.includes((t.code || '').toUpperCase())
-              );
-        try {
-          localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(mergedTrx));
-        } catch {
-          // ignore
-        }
-
-        // 4. Merge items additively (respecting deletions & admin edits)
-        if (Array.isArray(payload.items) && payload.items.length > 0) {
-          setItems(prevItems => {
-            const mergedItems = mergeItemsAdditive(
-              prevItems,
-              payload.items,
-              currentWh,
-              mergedTrx,
-              currentDelItems
-            );
-            try {
-              localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(mergedItems));
-            } catch {
-              // ignore
-            }
-            return mergedItems;
+      // Auto-propagate shared Supabase credentials across users/browsers if configured by Admin
+      if (payload.supabaseConfig?.url && payload.supabaseConfig?.key) {
+        const currentCreds = supabaseRealtimeService.getCredentials();
+        if (
+          currentCreds.url !== payload.supabaseConfig.url ||
+          currentCreds.key !== payload.supabaseConfig.key
+        ) {
+          supabaseRealtimeService.setCredentials(
+            payload.supabaseConfig.url,
+            payload.supabaseConfig.key
+          );
+          setSupabaseCredentials({
+            url: payload.supabaseConfig.url,
+            key: payload.supabaseConfig.key,
           });
+          setSyncProvider('supabase');
         }
+      }
 
-        return mergedTrx;
-      });
+      if (payload.cleanReset) {
+        const cleanSnapshot = {
+          warehouses:
+            Array.isArray(payload.warehouses) && payload.warehouses.length > 0
+              ? payload.warehouses
+              : INITIAL_WAREHOUSES,
+          items: Array.isArray(payload.items) ? payload.items : [],
+          transactions: Array.isArray(payload.transactions) ? payload.transactions : [],
+          users:
+            Array.isArray(payload.users) && payload.users.length > 0
+              ? payload.users
+              : INITIAL_USERS,
+          deletedRegistry: {},
+          deletedItemIds: [],
+          deletedTransactionIds: [],
+          deletedUserIds: [],
+          deletedWarehouseIds: [],
+        };
+        stateRef.current = cleanSnapshot;
+        setWarehouses(cleanSnapshot.warehouses);
+        setItems(cleanSnapshot.items);
+        setTransactions(cleanSnapshot.transactions);
+        setUsers(cleanSnapshot.users);
+        setDeletedRegistry(cleanSnapshot.deletedRegistry);
+        setDeletedItemIds([]);
+        setDeletedTransactionIds([]);
+        setDeletedUserIds([]);
+        setDeletedWarehouseIds([]);
+        persistSnapshotToLocalStorage(cleanSnapshot);
+        if (payload.lastUpdated) setLastServerTimestamp(payload.lastUpdated);
+        setLastSyncedAt(new Date());
+        setSyncStatus('synced');
+        return;
+      }
+
+      const current = stateRef.current;
+      const reconciled = reconcileSyncPayloads(
+        {
+          users: current.users,
+          warehouses: current.warehouses,
+          transactions: current.transactions,
+          items: current.items,
+          deletedRegistry: current.deletedRegistry,
+          deletedItemIds: current.deletedItemIds,
+          deletedTransactionIds: current.deletedTransactionIds,
+          deletedUserIds: current.deletedUserIds,
+          deletedWarehouseIds: current.deletedWarehouseIds,
+        },
+        {
+          users: Array.isArray(payload.users) ? payload.users : [],
+          warehouses: Array.isArray(payload.warehouses) ? payload.warehouses : [],
+          transactions: Array.isArray(payload.transactions) ? payload.transactions : [],
+          items: Array.isArray(payload.items) ? payload.items : [],
+          deletedRegistry: payload.deletedRegistry,
+          deletedItemIds: payload.deletedItemIds,
+          deletedTransactionIds: payload.deletedTransactionIds,
+          deletedUserIds: payload.deletedUserIds,
+          deletedWarehouseIds: payload.deletedWarehouseIds,
+        }
+      );
+
+      const nextSnapshot = {
+        warehouses: reconciled.warehouses,
+        items: reconciled.items,
+        transactions: reconciled.transactions,
+        users: reconciled.users,
+        deletedRegistry: reconciled.deletedRegistry,
+        deletedItemIds: reconciled.deletedItemIds,
+        deletedTransactionIds: reconciled.deletedTransactionIds,
+        deletedUserIds: reconciled.deletedUserIds,
+        deletedWarehouseIds: reconciled.deletedWarehouseIds,
+      };
+
+      stateRef.current = nextSnapshot;
+      setWarehouses(nextSnapshot.warehouses);
+      setUsers(nextSnapshot.users);
+      setTransactions(nextSnapshot.transactions);
+      setItems(nextSnapshot.items);
+      setDeletedRegistry(nextSnapshot.deletedRegistry);
+      setDeletedItemIds(nextSnapshot.deletedItemIds);
+      setDeletedTransactionIds(nextSnapshot.deletedTransactionIds);
+      setDeletedUserIds(nextSnapshot.deletedUserIds);
+      setDeletedWarehouseIds(nextSnapshot.deletedWarehouseIds);
+      persistSnapshotToLocalStorage(nextSnapshot);
 
       if (payload.lastUpdated) {
         setLastServerTimestamp(payload.lastUpdated);
       }
       setLastSyncedAt(new Date());
       setSyncStatus('synced');
-
-      setTimeout(() => {
-        isRemoteUpdatingRef.current = false;
-      }, 350);
     },
-    [warehouses, deletedUserIds, deletedTransactionIds, deletedItemIds, deletedWarehouseIds]
+    [persistSnapshotToLocalStorage]
   );
 
-  const saveSupabaseCredentials = useCallback((url: string, key: string) => {
-    const configured = supabaseRealtimeService.setCredentials(url, key);
-    setSupabaseCredentials({ url, key });
-    if (configured) {
-      setSyncProvider('supabase');
-      // Immediately attempt fetch from Supabase
-      supabaseRealtimeService.fetchLatest().then((remoteData) => {
-        if (remoteData) {
-          applyRemotePayloadAdditive(remoteData);
+  /**
+   * Direct push helper for instant authoritative multi-user broadcast + immediate response reconciliation
+   */
+  const pushCloudSyncImmediately = useCallback(
+    async (
+      newItems: InventoryItem[],
+      newTransactions: Transaction[],
+      newWarehouses: Warehouse[],
+      newUsers: User[],
+      customDeletedRegistry?: DeletedRegistry,
+      source = 'web-client',
+      extraSupabaseConfig?: { url: string; key: string }
+    ) => {
+      const regToPush = customDeletedRegistry || stateRef.current.deletedRegistry;
+      const legacyArrays = extractLegacyDeletedArrays(regToPush);
+      const activeCreds = extraSupabaseConfig || supabaseRealtimeService.getCredentials();
+      const supabaseConfig =
+        activeCreds.url && activeCreds.key
+          ? { url: activeCreds.url, key: activeCreds.key }
+          : undefined;
+
+      // Update stateRef & localStorage synchronously first so local UI and concurrent reads see new state immediately
+      const immediateSnapshot = {
+        warehouses: newWarehouses,
+        items: newItems,
+        transactions: newTransactions,
+        users: newUsers,
+        deletedRegistry: regToPush,
+        ...legacyArrays,
+      };
+      stateRef.current = immediateSnapshot;
+      persistSnapshotToLocalStorage(immediateSnapshot);
+
+      setSyncStatus('syncing');
+
+      const outboundPayload: CentralDataPayload = {
+        version: Date.now(),
+        lastUpdated: new Date().toISOString(),
+        items: newItems,
+        transactions: newTransactions,
+        warehouses: newWarehouses,
+        users: newUsers,
+        deletedRegistry: regToPush,
+        ...legacyArrays,
+        supabaseConfig,
+        clientId: clientIdRef.current,
+        source,
+      };
+
+      let mergedFromServer: CentralDataPayload | null = null;
+
+      try {
+        const res = await centralSyncService.pushUpdate({
+          items: newItems,
+          transactions: newTransactions,
+          warehouses: newWarehouses,
+          users: newUsers,
+          deletedRegistry: regToPush,
+          ...legacyArrays,
+          supabaseConfig,
+          clientId: clientIdRef.current,
+          source,
+        });
+        if (res.success && res.payload) {
+          mergedFromServer = res.payload;
+          setSyncProvider(res.provider);
         }
-      });
-    }
-    return configured;
+      } catch (err) {
+        console.warn('Immediate centralSync push failed:', err);
+      }
+
+      try {
+        if (supabaseRealtimeService.isConfigured()) {
+          const supaMerged = await supabaseRealtimeService.pushState(
+            mergedFromServer || outboundPayload
+          );
+          if (supaMerged) {
+            mergedFromServer = supaMerged;
+            setSyncProvider('supabase');
+          }
+        }
+      } catch (err) {
+        console.warn('Immediate supabase push failed:', err);
+      }
+
+      if (mergedFromServer) {
+        applyRemotePayloadAdditive(mergedFromServer);
+      } else {
+        setSyncStatus('synced');
+        setLastSyncedAt(new Date());
+      }
+    },
+    [applyRemotePayloadAdditive, persistSnapshotToLocalStorage]
+  );
+
+  const saveSupabaseCredentials = useCallback(
+    (url: string, key: string) => {
+      const configured = supabaseRealtimeService.setCredentials(url, key);
+      setSupabaseCredentials({ url, key });
+      if (configured) {
+        setSyncProvider('supabase');
+        supabaseRealtimeService.fetchLatest().then(remoteData => {
+          if (remoteData) {
+            applyRemotePayloadAdditive(remoteData);
+          }
+          // Share Supabase credentials to central server so all other users connect to the same store
+          const cur = stateRef.current;
+          pushCloudSyncImmediately(
+            cur.items,
+            cur.transactions,
+            cur.warehouses,
+            cur.users,
+            cur.deletedRegistry,
+            'supabase-config-share',
+            { url: url.trim(), key: key.trim() }
+          );
+        });
+      }
+      return configured;
+    },
+    [applyRemotePayloadAdditive, pushCloudSyncImmediately]
+  );
+
+  // 1. Subscribe to Central Server SSE Real-Time Stream (/api/sync/stream) for <50ms multi-user updates
+  useEffect(() => {
+    const unsubscribeStream = centralSyncService.subscribeToStream(payload => {
+      if (!payload) return;
+      applyRemotePayloadAdditive(payload);
+    });
+    return () => {
+      unsubscribeStream();
+    };
   }, [applyRemotePayloadAdditive]);
 
-  // Listen to Supabase Realtime WebSocket events
+  // 2. Listen to Supabase Realtime WebSocket events (when configured)
   useEffect(() => {
-    supabaseRealtimeService.subscribe((payload) => {
+    supabaseRealtimeService.subscribe(payload => {
       if (!payload) return;
-      console.log('[InventoryContext] Instant Supabase Realtime update received:', payload);
-
       applyRemotePayloadAdditive(payload);
 
       const isAI = payload.source === 'google-ai';
@@ -473,13 +715,12 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         : `⚡ Dữ liệu vừa được hợp nhất tự động qua Supabase Realtime WebSocket!`;
       setLastRealtimeUpdateMessage(msg);
 
-      // Auto clear message after 6 seconds
       setTimeout(() => {
         setLastRealtimeUpdateMessage(prev => (prev === msg ? null : prev));
       }, 6000);
     });
 
-    const unsubscribeStatus = supabaseRealtimeService.onConnectionStateChange((state) => {
+    const unsubscribeStatus = supabaseRealtimeService.onConnectionStateChange(state => {
       setRealtimeConnectionState(state);
       if (state === 'CONNECTED') {
         setSyncProvider('supabase');
@@ -490,60 +731,6 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       unsubscribeStatus();
     };
   }, [applyRemotePayloadAdditive]);
-
-  // Direct push helper for instant cloud broadcast without debounce delay
-  const pushCloudSyncImmediately = useCallback(
-    async (
-      newItems: InventoryItem[],
-      newTransactions: Transaction[],
-      newWarehouses: Warehouse[],
-      newUsers: User[],
-      customDeletedItems?: string[],
-      customDeletedTrx?: string[],
-      customDeletedUsers?: string[],
-      customDeletedWh?: string[],
-      source = 'web-client'
-    ) => {
-      const fullPayload: CentralDataPayload = {
-        version: Date.now(),
-        lastUpdated: new Date().toISOString(),
-        items: newItems,
-        transactions: newTransactions,
-        warehouses: newWarehouses,
-        users: newUsers,
-        deletedItemIds: customDeletedItems || deletedItemIds,
-        deletedTransactionIds: customDeletedTrx || deletedTransactionIds,
-        deletedUserIds: customDeletedUsers || deletedUserIds,
-        deletedWarehouseIds: customDeletedWh || deletedWarehouseIds,
-        source,
-      };
-
-      try {
-        if (supabaseRealtimeService.isConfigured()) {
-          await supabaseRealtimeService.pushState(fullPayload);
-        }
-      } catch (err) {
-        console.warn('Immediate supabase push failed:', err);
-      }
-
-      try {
-        await centralSyncService.pushUpdate({
-          items: newItems,
-          transactions: newTransactions,
-          warehouses: newWarehouses,
-          users: newUsers,
-          deletedItemIds: customDeletedItems || deletedItemIds,
-          deletedTransactionIds: customDeletedTrx || deletedTransactionIds,
-          deletedUserIds: customDeletedUsers || deletedUserIds,
-          deletedWarehouseIds: customDeletedWh || deletedWarehouseIds,
-          source,
-        });
-      } catch (err) {
-        console.warn('Immediate centralSync push failed:', err);
-      }
-    },
-    [deletedItemIds, deletedTransactionIds, deletedUserIds, deletedWarehouseIds]
-  );
 
   // Active session monitor: Terminate session if another device logs in with this user account
   useEffect(() => {
@@ -558,16 +745,12 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return;
     }
 
-    // Another device claimed the session
     if (freshUser.activeDeviceId && freshUser.activeDeviceId !== currentDeviceId) {
-      console.warn('[Multi-Device] Account active on another device:', freshUser.activeDeviceName);
       setCurrentUser(null);
       setSessionTerminatedReason(
         `Tài khoản "${freshUser.fullName}" đã được đăng nhập trên một thiết bị khác (${freshUser.activeDeviceName || 'Thiết bị khác'}). Phiên làm việc trên thiết bị này đã được tự động kết thúc để bảo đảm an toàn dữ liệu.`
       );
     } else if (freshUser.activeDeviceId === null) {
-      // Session was logged out remotely or by admin
-      console.warn('[Multi-Device] Account session terminated remotely');
       setCurrentUser(null);
       setSessionTerminatedReason(
         `Tài khoản "${freshUser.fullName}" đã được đăng xuất từ xa hoặc bởi Quản trị viên.`
@@ -577,7 +760,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   // Cross-tab / Cross-window broadcast listener
   useEffect(() => {
-    const unsubscribe = sessionBus.subscribe((msg) => {
+    const unsubscribe = sessionBus.subscribe(msg => {
       if (!currentUser) return;
       if (msg.userId === currentUser.id) {
         const myDeviceId = getDeviceId();
@@ -598,45 +781,48 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return () => unsubscribe();
   }, [currentUser]);
 
-  // Trigger manual or background fetch from central server
+  // Trigger manual or background fetch from BOTH central server AND Supabase (bridging stores)
   const triggerManualSync = useCallback(async () => {
     setSyncStatus('syncing');
     try {
-      // If Supabase client is connected, try direct fetch first
-      if (supabaseRealtimeService.isConfigured()) {
-        const directPayload = await supabaseRealtimeService.fetchLatest();
-        if (directPayload) {
-          applyRemotePayloadAdditive(directPayload);
-          setSyncProvider('supabase');
-          return;
+      let anySuccess = false;
+
+      const centralRes = await centralSyncService.fetchLatestData(lastServerTimestamp);
+      if (centralRes.success) {
+        anySuccess = true;
+        setSyncProvider(centralRes.provider);
+        if (centralRes.payload) {
+          applyRemotePayloadAdditive(centralRes.payload);
         }
       }
 
-      const result = await centralSyncService.fetchLatestData(lastServerTimestamp);
-      if (result.success) {
-        setSyncProvider(result.provider);
-        if (result.payload) {
-          applyRemotePayloadAdditive(result.payload);
+      if (supabaseRealtimeService.isConfigured()) {
+        const directPayload = await supabaseRealtimeService.fetchLatest();
+        if (directPayload) {
+          anySuccess = true;
+          applyRemotePayloadAdditive(directPayload);
+          setSyncProvider('supabase');
         }
+      }
+
+      if (anySuccess) {
         setSyncStatus('synced');
         setLastSyncedAt(new Date());
       } else {
-        setSyncStatus(result.error ? 'error' : 'offline');
+        setSyncStatus(centralRes.error ? 'error' : 'offline');
       }
     } catch {
       setSyncStatus('offline');
     }
   }, [lastServerTimestamp, applyRemotePayloadAdditive]);
 
-  // Real-time automatic polling every 3 seconds (3000ms) as heartbeat fallback
+  // Automatic 3-second polling as resilient fallback alongside SSE + WebSocket
   useEffect(() => {
     if (!autoSyncEnabled) return;
 
-    // Run initial fetch on mount
     triggerManualSync();
 
     const intervalId = setInterval(() => {
-      // Pause polling if user is on another browser tab to save serverless bandwidth
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
         return;
       }
@@ -648,109 +834,82 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         triggerManualSync();
       }
     };
+    const handleWindowFocus = () => {
+      triggerManualSync();
+    };
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleWindowFocus);
 
     return () => {
       clearInterval(intervalId);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleWindowFocus);
     };
   }, [autoSyncEnabled, triggerManualSync]);
 
-  // Push local changes to cloud datastore (Supabase Realtime / Vercel KV)
-  const pushLocalChanges = useCallback(
-    (
-      newItems: InventoryItem[],
-      newTransactions: Transaction[],
-      newWarehouses: Warehouse[],
-      newUsers?: User[],
-      customDeletedItems?: string[],
-      customDeletedTrx?: string[],
-      customDeletedUsers?: string[],
-      customDeletedWh?: string[]
-    ) => {
-      if (isRemoteUpdatingRef.current) return;
-      if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
-      pushTimerRef.current = setTimeout(() => {
-        const usersToPush = newUsers || users;
-        const fullPayload: CentralDataPayload = {
-          version: Date.now(),
-          lastUpdated: new Date().toISOString(),
-          items: newItems,
-          transactions: newTransactions,
-          warehouses: newWarehouses,
-          users: usersToPush,
-          deletedItemIds: customDeletedItems || deletedItemIds,
-          deletedTransactionIds: customDeletedTrx || deletedTransactionIds,
-          deletedUserIds: customDeletedUsers || deletedUserIds,
-          deletedWarehouseIds: customDeletedWh || deletedWarehouseIds,
-          source: 'web-client',
-        };
+  // Persist local state to localStorage ONLY (never blind-push stale state on mount!)
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(items));
+    } catch {
+      // ignore
+    }
+  }, [items]);
 
-        // 1. Direct push to Supabase (broadcasts immediately to all WebSocket subscribers)
-        if (supabaseRealtimeService.isConfigured()) {
-          supabaseRealtimeService.pushState(fullPayload).then((ok) => {
-            if (ok) {
-              setLastServerTimestamp(fullPayload.lastUpdated);
-              setLastSyncedAt(new Date());
-              setSyncStatus('synced');
-            }
-          });
-        }
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(transactions));
+    } catch {
+      // ignore
+    }
+  }, [transactions]);
 
-        // 2. Central API fallback / sync
-        centralSyncService
-          .pushUpdate({
-            items: newItems,
-            transactions: newTransactions,
-            warehouses: newWarehouses,
-            users: usersToPush,
-            deletedItemIds: customDeletedItems || deletedItemIds,
-            deletedTransactionIds: customDeletedTrx || deletedTransactionIds,
-            deletedUserIds: customDeletedUsers || deletedUserIds,
-            deletedWarehouseIds: customDeletedWh || deletedWarehouseIds,
-          })
-          .then((res) => {
-            if (res.success && res.payload) {
-              setLastServerTimestamp(res.payload.lastUpdated);
-              setLastSyncedAt(new Date());
-              setSyncStatus('synced');
-            }
-          })
-          .catch(() => {});
-      }, 400);
-    },
-    [users, deletedItemIds, deletedTransactionIds, deletedUserIds, deletedWarehouseIds]
-  );
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+    } catch {
+      // ignore
+    }
+  }, [users]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.WAREHOUSES, JSON.stringify(warehouses));
+    } catch {
+      // ignore
+    }
+  }, [warehouses]);
 
   // Simulate Google AI generating new inventory numbers & broadcast instantly
   const simulateGoogleAIUpdate = useCallback(async (): Promise<{ success: boolean; message: string }> => {
-    if (items.length === 0) {
+    const cur = stateRef.current;
+    if (cur.items.length === 0) {
       return { success: false, message: 'Chưa có danh mục vật tư để tạo số liệu AI' };
     }
 
-    const targetIdx = Math.floor(Math.random() * items.length);
-    const targetItem = items[targetIdx];
-    const targetWarehouse = warehouses[0] || INITIAL_WAREHOUSES[0];
+    const targetIdx = Math.floor(Math.random() * cur.items.length);
+    const targetItem = cur.items[targetIdx];
+    const targetWarehouse = cur.warehouses[0] || INITIAL_WAREHOUSES[0];
 
     const adjustmentQty = Math.floor(Math.random() * 25) + 5;
-    const newStock = targetItem.currentStock + adjustmentQty;
-
-    const newItems = items.map((it, idx) => (idx === targetIdx ? { ...it, currentStock: newStock } : it));
+    const nowIso = new Date().toISOString();
 
     const aiCode = `AI-NHAP-${Date.now().toString().slice(-4)}`;
     const lineAmount = adjustmentQty * (targetItem.unitPrice || 150000);
     const newTx: Transaction = {
-      id: `tx-ai-${Date.now()}`,
+      id: `TRX-AI-${Date.now()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
       code: aiCode,
       type: 'NHAP_KHO',
       subtype: 'NHAP_DIEU_CHINH',
-      date: new Date().toISOString().split('T')[0],
+      date: nowIso.replace('T', ' ').substring(0, 16),
       warehouseId: targetItem.warehouseId || targetWarehouse.id,
       partnerName: 'Google AI Optimization Engine',
       departmentOrProject: 'Bộ Phận Dự Đoán Tự Động',
       creatorName: 'Google AI Gemini',
       notes: `[Google AI Auto-Analysis] Bổ sung +${adjustmentQty} ${targetItem.unit} cho vật tư "${targetItem.name}"`,
       status: 'HOAN_THANH',
+      updatedAt: nowIso,
       items: [
         {
           itemId: targetItem.id,
@@ -766,85 +925,31 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       totalAmount: lineAmount,
     };
 
-    const newTransactions = [newTx, ...transactions];
+    const newTransactions = [newTx, ...cur.transactions];
+    const rawItems = cur.items.map((it, idx) =>
+      idx === targetIdx ? { ...it, updatedAt: nowIso } : it
+    );
+    const newItems = recalculateAllItemsStocks(rawItems, cur.warehouses, newTransactions);
 
-    // Update local state
-    setItems(newItems);
     setTransactions(newTransactions);
+    setItems(newItems);
 
-    const payload: CentralDataPayload = {
-      version: Date.now(),
-      lastUpdated: new Date().toISOString(),
-      items: newItems,
-      transactions: newTransactions,
-      warehouses: warehouses,
-      users: users,
-      source: 'google-ai',
-      lastUpdatedBy: 'Google AI Gemini',
-    };
+    await pushCloudSyncImmediately(
+      newItems,
+      newTransactions,
+      cur.warehouses,
+      cur.users,
+      cur.deletedRegistry,
+      'google-ai'
+    );
 
-    let sentToRealtime = false;
-    if (supabaseRealtimeService.isConfigured()) {
-      sentToRealtime = await supabaseRealtimeService.pushState(payload);
-    }
-
-    // Also push to central API
-    centralSyncService.pushUpdate({
-      items: newItems,
-      transactions: newTransactions,
-      warehouses: warehouses,
-      users: users,
-      source: 'google-ai',
-      lastUpdatedBy: 'Google AI Gemini',
-    }).catch(() => {});
-
-    setLastServerTimestamp(payload.lastUpdated);
-    setLastSyncedAt(new Date());
-
-    const resultMessage = sentToRealtime
-      ? `⚡ Google AI vừa cập nhật +${adjustmentQty} ${targetItem.unit} cho "${targetItem.name}". Supabase Realtime đã phát sóng WebSocket đến toàn bộ người dùng ngay lập tức!`
-      : `Google AI vừa cập nhật +${adjustmentQty} ${targetItem.unit} cho "${targetItem.name}". Đã lưu lên máy chủ đồng bộ!`;
+    const resultMessage = supabaseRealtimeService.isConfigured()
+      ? `⚡ Google AI vừa cập nhật +${adjustmentQty} ${targetItem.unit} cho "${targetItem.name}". Đã phát sóng Realtime đến toàn bộ người dùng ngay lập tức!`
+      : `Google AI vừa cập nhật +${adjustmentQty} ${targetItem.unit} cho "${targetItem.name}". Đã đồng bộ tức thì lên máy chủ trung tâm!`;
 
     setLastRealtimeUpdateMessage(resultMessage);
     return { success: true, message: resultMessage };
-  }, [items, transactions, warehouses, users]);
-
-  // Sync to local storage & push to Cloud
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(items));
-    } catch {
-      // ignore
-    }
-    pushLocalChanges(items, transactions, warehouses, users);
-  }, [items, pushLocalChanges, transactions, warehouses, users]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(transactions));
-    } catch {
-      // ignore
-    }
-    pushLocalChanges(items, transactions, warehouses, users);
-  }, [transactions, pushLocalChanges, items, warehouses, users]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
-    } catch {
-      // ignore
-    }
-    pushLocalChanges(items, transactions, warehouses, users);
-  }, [users, pushLocalChanges, items, transactions, warehouses]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.WAREHOUSES, JSON.stringify(warehouses));
-    } catch {
-      // ignore
-    }
-    pushLocalChanges(items, transactions, warehouses, users);
-  }, [warehouses, pushLocalChanges, items, transactions, users]);
+  }, [pushCloudSyncImmediately]);
 
   // Auth Operations (Multi-Device Single Session Enforcement)
   const login = async (
@@ -861,35 +966,24 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     };
   }> => {
     const trimmedUsername = username.trim().toLowerCase();
-    let currentUsersList = users;
 
-    // 1. Always refresh users from cloud immediately before login to get real-time device sessions
+    // 1. Always refresh full state from cloud immediately before login so user has latest catalog, vouchers & sessions
     try {
-      let remotePayload: CentralDataPayload | null = null;
+      const syncRes = await centralSyncService.fetchLatestData();
+      if (syncRes.success && syncRes.payload) {
+        applyRemotePayloadAdditive(syncRes.payload);
+      }
       if (supabaseRealtimeService.isConfigured()) {
-        remotePayload = await supabaseRealtimeService.fetchLatest();
-      }
-      if (!remotePayload) {
-        const syncRes = await centralSyncService.fetchLatestData();
-        if (syncRes.success && syncRes.payload) {
-          remotePayload = syncRes.payload;
+        const remoteSupa = await supabaseRealtimeService.fetchLatest();
+        if (remoteSupa) {
+          applyRemotePayloadAdditive(remoteSupa);
         }
-      }
-
-      if (remotePayload && Array.isArray(remotePayload.users) && remotePayload.users.length > 0) {
-        const mergedUsers = mergeUsersAdditive(users, remotePayload.users);
-        setUsers(mergedUsers);
-        try {
-          localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(mergedUsers));
-        } catch {
-          // ignore
-        }
-        currentUsersList = mergedUsers;
       }
     } catch (err) {
-      console.warn('Could not refresh remote users during login:', err);
+      console.warn('Could not refresh remote state during login:', err);
     }
 
+    const currentUsersList = stateRef.current.users;
     const user = currentUsersList.find(u => u.username.toLowerCase() === trimmedUsername);
 
     if (!user) {
@@ -919,7 +1013,6 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const currentDeviceId = getDeviceId();
     const currentDeviceName = getDeviceName();
 
-    // 2. Multi-device check: block if currently active on a different device!
     if (user.activeDeviceId && user.activeDeviceId !== currentDeviceId) {
       return {
         success: false,
@@ -933,17 +1026,18 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       };
     }
 
-    // 3. Login allowed on this device
-    const nowIso = new Date().toISOString();
+    const nowIso = nextMonotonicIso(user.updatedAt, user.lastActiveAt);
     const updatedUser: User = {
       ...user,
       lastLogin: nowIso.replace('T', ' ').substring(0, 16),
       activeDeviceId: currentDeviceId,
       activeDeviceName: currentDeviceName,
       lastActiveAt: nowIso,
+      updatedAt: nowIso,
     };
 
-    const updatedUsers = currentUsersList.map(u => (u.id === user.id ? updatedUser : u));
+    const cur = stateRef.current;
+    const updatedUsers = cur.users.map(u => (u.id === user.id ? updatedUser : u));
     setUsers(updatedUsers);
     try {
       localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
@@ -955,8 +1049,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setCurrentUser(updatedUser);
     setSessionTerminatedReason(null);
 
-    // Instant cloud broadcast & local tab notification
-    pushCloudSyncImmediately(items, transactions, warehouses, updatedUsers);
+    pushCloudSyncImmediately(
+      cur.items,
+      cur.transactions,
+      cur.warehouses,
+      updatedUsers,
+      cur.deletedRegistry,
+      'user-login'
+    );
     sessionBus.broadcast({
       type: 'LOGIN',
       userId: user.id,
@@ -972,28 +1072,24 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     password: string
   ): Promise<{ success: boolean; error?: string }> => {
     const trimmedUsername = username.trim().toLowerCase();
-    let currentUsersList = users;
 
     try {
-      let remotePayload: CentralDataPayload | null = null;
+      const syncRes = await centralSyncService.fetchLatestData();
+      if (syncRes.success && syncRes.payload) {
+        applyRemotePayloadAdditive(syncRes.payload);
+      }
       if (supabaseRealtimeService.isConfigured()) {
-        remotePayload = await supabaseRealtimeService.fetchLatest();
-      }
-      if (!remotePayload) {
-        const syncRes = await centralSyncService.fetchLatestData();
-        if (syncRes.success && syncRes.payload) {
-          remotePayload = syncRes.payload;
+        const remoteSupa = await supabaseRealtimeService.fetchLatest();
+        if (remoteSupa) {
+          applyRemotePayloadAdditive(remoteSupa);
         }
-      }
-      if (remotePayload && Array.isArray(remotePayload.users) && remotePayload.users.length > 0) {
-        setUsers(remotePayload.users);
-        currentUsersList = remotePayload.users;
       }
     } catch (err) {
       console.warn('Could not refresh remote users before takeover:', err);
     }
 
-    const user = currentUsersList.find(u => u.username.toLowerCase() === trimmedUsername);
+    const cur = stateRef.current;
+    const user = cur.users.find(u => u.username.toLowerCase() === trimmedUsername);
     if (!user) {
       return { success: false, error: 'Tên đăng nhập không tồn tại.' };
     }
@@ -1006,7 +1102,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     const currentDeviceId = getDeviceId();
     const currentDeviceName = getDeviceName();
-    const nowIso = new Date().toISOString();
+    const nowIso = nextMonotonicIso(user.updatedAt, user.lastActiveAt);
 
     const updatedUser: User = {
       ...user,
@@ -1014,9 +1110,10 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       activeDeviceId: currentDeviceId,
       activeDeviceName: currentDeviceName,
       lastActiveAt: nowIso,
+      updatedAt: nowIso,
     };
 
-    const updatedUsers = currentUsersList.map(u => (u.id === user.id ? updatedUser : u));
+    const updatedUsers = cur.users.map(u => (u.id === user.id ? updatedUser : u));
     setUsers(updatedUsers);
     try {
       localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
@@ -1028,8 +1125,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setCurrentUser(updatedUser);
     setSessionTerminatedReason(null);
 
-    // Push takeover immediately to invalidate other devices
-    pushCloudSyncImmediately(items, transactions, warehouses, updatedUsers);
+    pushCloudSyncImmediately(
+      cur.items,
+      cur.transactions,
+      cur.warehouses,
+      updatedUsers,
+      cur.deletedRegistry,
+      'session-takeover'
+    );
     sessionBus.broadcast({
       type: 'TAKEOVER',
       userId: user.id,
@@ -1042,14 +1145,22 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const logout = useCallback(() => {
     if (currentUser) {
+      const cur = stateRef.current;
       const currentDeviceId = getDeviceId();
-      const updatedUsers = users.map(u => {
+      const targetSelf = cur.users.find(u => u.id === currentUser.id);
+      const nowIso = nextMonotonicIso(
+        currentUser.updatedAt,
+        targetSelf?.updatedAt,
+        targetSelf?.lastActiveAt
+      );
+      const updatedUsers = cur.users.map(u => {
         if (u.id === currentUser.id) {
           return {
             ...u,
             activeDeviceId: null,
             activeDeviceName: null,
             lastActiveAt: null,
+            updatedAt: nowIso,
           };
         }
         return u;
@@ -1063,7 +1174,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         // ignore
       }
 
-      pushCloudSyncImmediately(items, transactions, warehouses, updatedUsers);
+      pushCloudSyncImmediately(
+        cur.items,
+        cur.transactions,
+        cur.warehouses,
+        updatedUsers,
+        cur.deletedRegistry,
+        'user-logout'
+      );
       sessionBus.broadcast({
         type: 'LOGOUT',
         userId: currentUser.id,
@@ -1071,7 +1189,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       });
     }
     setCurrentUser(null);
-  }, [currentUser, users, items, transactions, warehouses, pushCloudSyncImmediately]);
+  }, [currentUser, pushCloudSyncImmediately]);
 
   const revokeUserSession = useCallback(
     (userId: string): { success: boolean; error?: string } => {
@@ -1079,31 +1197,35 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         return { success: false, error: 'Chỉ Quản trị viên (Admin) mới có quyền đăng xuất phiên người dùng.' };
       }
 
-      const targetUser = users.find(u => u.id === userId);
+      const cur = stateRef.current;
+      const targetUser = cur.users.find(u => u.id === userId);
       if (!targetUser) {
         return { success: false, error: 'Không tìm thấy người dùng.' };
       }
 
-      const updatedUsers = users.map(u => {
+      const nowIso = nextMonotonicIso(targetUser.updatedAt, targetUser.lastActiveAt);
+      const updatedUsers = cur.users.map(u => {
         if (u.id === userId) {
           return {
             ...u,
             activeDeviceId: null,
             activeDeviceName: null,
             lastActiveAt: null,
+            updatedAt: nowIso,
           };
         }
         return u;
       });
 
       setUsers(updatedUsers);
-      try {
-        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
-      } catch {
-        // ignore
-      }
-
-      pushCloudSyncImmediately(items, transactions, warehouses, updatedUsers);
+      pushCloudSyncImmediately(
+        cur.items,
+        cur.transactions,
+        cur.warehouses,
+        updatedUsers,
+        cur.deletedRegistry,
+        'admin-revoke-session'
+      );
       sessionBus.broadcast({
         type: 'LOGOUT',
         userId: userId,
@@ -1113,7 +1235,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
       return { success: true };
     },
-    [currentUser, users, items, transactions, warehouses, pushCloudSyncImmediately]
+    [currentUser, pushCloudSyncImmediately]
   );
 
   // User Management
@@ -1122,51 +1244,40 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Chỉ Quản trị viên (Admin) mới có quyền thêm người sử dụng.' };
     }
 
+    const cur = stateRef.current;
     const trimmedUsername = userData.username.trim().toLowerCase();
-    if (users.some(u => u.username.toLowerCase() === trimmedUsername)) {
+    if (cur.users.some(u => u.username.toLowerCase() === trimmedUsername)) {
       return { success: false, error: `Tên đăng nhập "${userData.username}" đã tồn tại.` };
     }
 
-    const nowIso = new Date().toISOString();
+    const nowIso = nextMonotonicIso(
+      cur.deletedRegistry[makeTombstoneKey('USER', trimmedUsername)]
+    );
     const newUser: User = {
       ...userData,
-      id: `USR-${Date.now()}`,
+      id: `USR-${Date.now()}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`,
       username: trimmedUsername,
       createdAt: nowIso.replace('T', ' ').substring(0, 16),
       updatedAt: nowIso,
     };
 
-    const updatedUsers = [...users, newUser];
-    const newDeletedUsers = deletedUserIds.filter(
-      d => d !== newUser.id && d !== trimmedUsername
-    );
+    const updatedUsers = [...cur.users, newUser];
+    const nextReg = { ...cur.deletedRegistry };
+    delete nextReg[makeTombstoneKey('USER', newUser.id)];
+    delete nextReg[makeTombstoneKey('USER', trimmedUsername)];
+    const legacy = extractLegacyDeletedArrays(nextReg);
 
     setUsers(updatedUsers);
-    setDeletedUserIds(newDeletedUsers);
-    try {
-      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
-      localStorage.setItem(STORAGE_KEYS.DELETED_USERS, JSON.stringify(newDeletedUsers));
-    } catch {
-      // ignore
-    }
+    setDeletedRegistry(nextReg);
+    setDeletedUserIds(legacy.deletedUserIds);
 
     pushCloudSyncImmediately(
-      items,
-      transactions,
-      warehouses,
+      cur.items,
+      cur.transactions,
+      cur.warehouses,
       updatedUsers,
-      undefined,
-      undefined,
-      newDeletedUsers
-    );
-    pushLocalChanges(
-      items,
-      transactions,
-      warehouses,
-      updatedUsers,
-      undefined,
-      undefined,
-      newDeletedUsers
+      nextReg,
+      'add-user'
     );
     return { success: true };
   };
@@ -1176,18 +1287,19 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Chỉ Quản trị viên (Admin) mới có quyền chỉnh sửa người dùng.' };
     }
 
+    const cur = stateRef.current;
     if (updates.username) {
       const trimmed = updates.username.trim().toLowerCase();
-      if (users.some(u => u.id !== id && u.username.toLowerCase() === trimmed)) {
+      if (cur.users.some(u => u.id !== id && u.username.toLowerCase() === trimmed)) {
         return { success: false, error: `Tên đăng nhập "${updates.username}" đã bị trùng lặp.` };
       }
     }
 
-    const nowIso = new Date().toISOString();
-    const updatedUsers = users.map(u => {
+    const existingUser = cur.users.find(u => u.id === id);
+    const nowIso = nextMonotonicIso(existingUser?.updatedAt, existingUser?.lastActiveAt);
+    const updatedUsers = cur.users.map(u => {
       if (u.id === id) {
         const updated = { ...u, ...updates, updatedAt: nowIso };
-        // If updating self, sync currentUser
         if (currentUser.id === id) {
           setCurrentUser(updated);
         }
@@ -1197,14 +1309,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     });
 
     setUsers(updatedUsers);
-    try {
-      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
-    } catch {
-      // ignore
-    }
-
-    pushCloudSyncImmediately(items, transactions, warehouses, updatedUsers);
-    pushLocalChanges(items, transactions, warehouses, updatedUsers);
+    pushCloudSyncImmediately(
+      cur.items,
+      cur.transactions,
+      cur.warehouses,
+      updatedUsers,
+      cur.deletedRegistry,
+      'update-user'
+    );
     return { success: true };
   };
 
@@ -1212,50 +1324,37 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     if (!currentUser || currentUser.role !== 'ADMIN') {
       return { success: false, error: 'Chỉ Quản trị viên (Admin) mới có quyền xóa người dùng.' };
     }
-
     if (currentUser.id === id) {
       return { success: false, error: 'Không thể xóa chính tài khoản bạn đang đăng nhập!' };
     }
 
-    const targetUser = users.find(u => u.id === id);
-    const updatedUsers = users.filter(u => u.id !== id);
-    const newDeletedUsers = Array.from(
-      new Set(
-        [...deletedUserIds, id, targetUser?.username?.trim().toLowerCase()].filter(Boolean)
-      )
-    ) as string[];
+    const cur = stateRef.current;
+    const targetUser = cur.users.find(u => u.id === id);
+    const updatedUsers = cur.users.filter(u => u.id !== id);
+    const nowIso = nextMonotonicIso(targetUser?.updatedAt, targetUser?.lastActiveAt);
+    const nextReg = { ...cur.deletedRegistry };
+    nextReg[makeTombstoneKey('USER', id)] = nowIso;
+    if (targetUser?.username) {
+      nextReg[makeTombstoneKey('USER', targetUser.username)] = nowIso;
+    }
+    const legacy = extractLegacyDeletedArrays(nextReg);
 
     setUsers(updatedUsers);
-    setDeletedUserIds(newDeletedUsers);
-    try {
-      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
-      localStorage.setItem(STORAGE_KEYS.DELETED_USERS, JSON.stringify(newDeletedUsers));
-    } catch {
-      // ignore
-    }
+    setDeletedRegistry(nextReg);
+    setDeletedUserIds(legacy.deletedUserIds);
 
     pushCloudSyncImmediately(
-      items,
-      transactions,
-      warehouses,
+      cur.items,
+      cur.transactions,
+      cur.warehouses,
       updatedUsers,
-      undefined,
-      undefined,
-      newDeletedUsers
-    );
-    pushLocalChanges(
-      items,
-      transactions,
-      warehouses,
-      updatedUsers,
-      undefined,
-      undefined,
-      newDeletedUsers
+      nextReg,
+      'delete-user'
     );
     return { success: true };
   };
 
-  // Warehouse Management (Admin permissions)
+  // Warehouse Management
   const addWarehouse = (
     data: Omit<Warehouse, 'id'>
   ): { success: boolean; error?: string; warehouse?: Warehouse } => {
@@ -1263,6 +1362,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Chỉ Quản trị viên (Admin) mới có quyền thêm kho hàng mới.' };
     }
 
+    const cur = stateRef.current;
     const trimmedCode = data.code.trim().toUpperCase();
     const trimmedName = data.name.trim();
 
@@ -1272,15 +1372,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     if (!trimmedName) {
       return { success: false, error: 'Vui lòng nhập tên kho lưu trữ.' };
     }
-
-    if (warehouses.some(w => w.code.toUpperCase() === trimmedCode)) {
+    if (cur.warehouses.some(w => w.code.toUpperCase() === trimmedCode)) {
       return { success: false, error: `Mã kho "${trimmedCode}" đã tồn tại trong hệ thống.` };
     }
 
-    const nowIso = new Date().toISOString();
+    const nowIso = nextMonotonicIso(cur.deletedRegistry[makeTombstoneKey('WH', trimmedCode)]);
     const newWarehouse: Warehouse = {
       ...data,
-      id: `WH-${Date.now()}`,
+      id: `WH-${Date.now()}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`,
       code: trimmedCode,
       name: trimmedName,
       status: data.status || 'ACTIVE',
@@ -1288,39 +1387,26 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       updatedAt: nowIso,
     };
 
-    const updatedWh = [...warehouses, newWarehouse];
-    const newDeletedWh = deletedWarehouseIds.filter(
-      d => d !== newWarehouse.id && d !== trimmedCode
-    );
+    const updatedWh = [...cur.warehouses, newWarehouse];
+    const nextReg = { ...cur.deletedRegistry };
+    delete nextReg[makeTombstoneKey('WH', newWarehouse.id)];
+    delete nextReg[makeTombstoneKey('WH', trimmedCode)];
+    const legacy = extractLegacyDeletedArrays(nextReg);
+
+    const recalculatedItems = recalculateAllItemsStocks(cur.items, updatedWh, cur.transactions);
 
     setWarehouses(updatedWh);
-    setDeletedWarehouseIds(newDeletedWh);
-    try {
-      localStorage.setItem(STORAGE_KEYS.WAREHOUSES, JSON.stringify(updatedWh));
-      localStorage.setItem(STORAGE_KEYS.DELETED_WAREHOUSES, JSON.stringify(newDeletedWh));
-    } catch {
-      // ignore
-    }
+    setItems(recalculatedItems);
+    setDeletedRegistry(nextReg);
+    setDeletedWarehouseIds(legacy.deletedWarehouseIds);
 
     pushCloudSyncImmediately(
-      items,
-      transactions,
+      recalculatedItems,
+      cur.transactions,
       updatedWh,
-      users,
-      undefined,
-      undefined,
-      undefined,
-      newDeletedWh
-    );
-    pushLocalChanges(
-      items,
-      transactions,
-      updatedWh,
-      users,
-      undefined,
-      undefined,
-      undefined,
-      newDeletedWh
+      cur.users,
+      nextReg,
+      'add-warehouse'
     );
 
     return { success: true, warehouse: newWarehouse };
@@ -1334,25 +1420,29 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Chỉ Quản trị viên (Admin) mới có quyền chỉnh sửa thông tin kho.' };
     }
 
+    const cur = stateRef.current;
     if (updates.code) {
       const trimmedCode = updates.code.trim().toUpperCase();
-      if (warehouses.some(w => w.id !== id && w.code.toUpperCase() === trimmedCode)) {
+      if (cur.warehouses.some(w => w.id !== id && w.code.toUpperCase() === trimmedCode)) {
         return { success: false, error: `Mã kho "${trimmedCode}" đã bị trùng lặp.` };
       }
     }
 
-    const nowIso = new Date().toISOString();
-    const updatedWh = warehouses.map(w => (w.id === id ? { ...w, ...updates, updatedAt: nowIso } : w));
+    const existingWh = cur.warehouses.find(w => w.id === id);
+    const nowIso = nextMonotonicIso(existingWh?.updatedAt);
+    const updatedWh = cur.warehouses.map(w =>
+      w.id === id ? { ...w, ...updates, updatedAt: nowIso } : w
+    );
 
     setWarehouses(updatedWh);
-    try {
-      localStorage.setItem(STORAGE_KEYS.WAREHOUSES, JSON.stringify(updatedWh));
-    } catch {
-      // ignore
-    }
-
-    pushCloudSyncImmediately(items, transactions, updatedWh, users);
-    pushLocalChanges(items, transactions, updatedWh, users);
+    pushCloudSyncImmediately(
+      cur.items,
+      cur.transactions,
+      updatedWh,
+      cur.users,
+      cur.deletedRegistry,
+      'update-warehouse'
+    );
     return { success: true };
   };
 
@@ -1361,11 +1451,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Chỉ Quản trị viên (Admin) mới có quyền xóa kho hàng.' };
     }
 
-    if (warehouses.length <= 1) {
+    const cur = stateRef.current;
+    if (cur.warehouses.length <= 1) {
       return { success: false, error: 'Hệ thống cần duy trì ít nhất 1 kho hàng hoạt động.' };
     }
 
-    const itemsCount = items.filter(i => i.warehouseId === id).length;
+    const itemsCount = cur.items.filter(
+      i => i.warehouseId === id || (i.warehouseStocks?.[id] || 0) > 0
+    ).length;
     if (itemsCount > 0) {
       return {
         success: false,
@@ -1373,7 +1466,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       };
     }
 
-    const trxCount = transactions.filter(t => t.warehouseId === id).length;
+    const trxCount = cur.transactions.filter(t => t.warehouseId === id).length;
     if (trxCount > 0) {
       return {
         success: false,
@@ -1381,40 +1474,27 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       };
     }
 
-    const targetWh = warehouses.find(w => w.id === id);
-    const updatedWh = warehouses.filter(w => w.id !== id);
-    const newDeletedWh = Array.from(
-      new Set([...deletedWarehouseIds, id, targetWh?.code?.trim().toUpperCase()].filter(Boolean))
-    ) as string[];
+    const targetWh = cur.warehouses.find(w => w.id === id);
+    const updatedWh = cur.warehouses.filter(w => w.id !== id);
+    const nowIso = nextMonotonicIso(targetWh?.updatedAt);
+    const nextReg = { ...cur.deletedRegistry };
+    nextReg[makeTombstoneKey('WH', id)] = nowIso;
+    if (targetWh?.code) {
+      nextReg[makeTombstoneKey('WH', targetWh.code)] = nowIso;
+    }
+    const legacy = extractLegacyDeletedArrays(nextReg);
 
     setWarehouses(updatedWh);
-    setDeletedWarehouseIds(newDeletedWh);
-    try {
-      localStorage.setItem(STORAGE_KEYS.WAREHOUSES, JSON.stringify(updatedWh));
-      localStorage.setItem(STORAGE_KEYS.DELETED_WAREHOUSES, JSON.stringify(newDeletedWh));
-    } catch {
-      // ignore
-    }
+    setDeletedRegistry(nextReg);
+    setDeletedWarehouseIds(legacy.deletedWarehouseIds);
 
     pushCloudSyncImmediately(
-      items,
-      transactions,
+      cur.items,
+      cur.transactions,
       updatedWh,
-      users,
-      undefined,
-      undefined,
-      undefined,
-      newDeletedWh
-    );
-    pushLocalChanges(
-      items,
-      transactions,
-      updatedWh,
-      users,
-      undefined,
-      undefined,
-      undefined,
-      newDeletedWh
+      cur.users,
+      nextReg,
+      'delete-warehouse'
     );
     return { success: true };
   };
@@ -1422,7 +1502,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   // Derived lists
   const categories = useMemo(() => {
     const set = new Set<string>();
-    items.forEach(i => set.add(i.category));
+    items.forEach(i => {
+      if (i.category) set.add(i.category);
+    });
     return Array.from(set).sort();
   }, [items]);
 
@@ -1449,7 +1531,6 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setFilterCriteria(defaultCriteria);
   };
 
-  // Presets
   const applyPresetFilter = (presetName: string) => {
     switch (presetName) {
       case 'LOW_STOCK':
@@ -1483,7 +1564,6 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   };
 
-  // Compute active filters count
   const activeFilterCount = useMemo(() => {
     let count = 0;
     if (filterCriteria.searchQuery.trim()) count++;
@@ -1502,14 +1582,12 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return count;
   }, [filterCriteria]);
 
-  // Filtered Items logic
   const filteredItems = useMemo(() => {
     const today = new Date();
     const thirtyDaysLater = new Date();
     thirtyDaysLater.setDate(today.getDate() + 30);
 
     return items.filter(item => {
-      // 1. Text Search (SKU, name, serial, spec)
       if (filterCriteria.searchQuery.trim()) {
         const q = filterCriteria.searchQuery.toLowerCase().trim();
         const matchCode = item.code.toLowerCase().includes(q);
@@ -1522,7 +1600,6 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       }
 
-      // 2. Warehouses
       if (filterCriteria.warehouses.length > 0) {
         const itemWh = item.warehouseId || '';
         const inPrimary = Boolean(itemWh && filterCriteria.warehouses.includes(itemWh));
@@ -1534,17 +1611,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       }
 
-      // 3. Item Types
       if (filterCriteria.itemTypes.length > 0 && !filterCriteria.itemTypes.includes(item.type)) {
         return false;
       }
 
-      // 4. Categories
       if (filterCriteria.categories.length > 0 && !filterCriteria.categories.includes(item.category)) {
         return false;
       }
 
-      // 5. Stock Status
       if (filterCriteria.stockStatuses.length > 0) {
         const status: StockStatus = getStockStatus(item);
         if (!filterCriteria.stockStatuses.includes(status)) {
@@ -1552,14 +1626,12 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       }
 
-      // 6. Equipment Condition
       if (filterCriteria.equipmentConditions.length > 0) {
         if (!item.condition || !filterCriteria.equipmentConditions.includes(item.condition)) {
           return false;
         }
       }
 
-      // 7. Stock Qty Range
       if (filterCriteria.minStockQty !== undefined && item.currentStock < filterCriteria.minStockQty) {
         return false;
       }
@@ -1567,7 +1639,6 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         return false;
       }
 
-      // 8. Total Value Range
       const totalVal = item.currentStock * item.unitPrice;
       if (filterCriteria.minValue !== undefined && totalVal < filterCriteria.minValue) {
         return false;
@@ -1576,12 +1647,10 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         return false;
       }
 
-      // 9. Supplier
       if (filterCriteria.supplier && item.supplierDefault !== filterCriteria.supplier) {
         return false;
       }
 
-      // 10. Inspection / Maintenance Due Check
       if (filterCriteria.needsInspection) {
         if (!item.inspectionDueDate) return false;
         const due = new Date(item.inspectionDueDate);
@@ -1592,10 +1661,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     });
   }, [items, filterCriteria]);
 
-  // Filtered Transactions logic
   const filteredTransactions = useMemo(() => {
     return transactions.filter(t => {
-      // Search
       if (filterCriteria.searchQuery.trim()) {
         const q = filterCriteria.searchQuery.toLowerCase().trim();
         const matchCode = t.code.toLowerCase().includes(q);
@@ -1610,17 +1677,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       }
 
-      // Warehouse
       if (filterCriteria.warehouses.length > 0 && !filterCriteria.warehouses.includes(t.warehouseId)) {
         return false;
       }
 
-      // Supplier / Partner
       if (filterCriteria.supplier && t.partnerName !== filterCriteria.supplier) {
         return false;
       }
 
-      // Date Range Preset
       if (filterCriteria.dateRangePreset && filterCriteria.dateRangePreset !== 'ALL') {
         const tDate = new Date(t.date);
         const now = new Date();
@@ -1643,64 +1707,156 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   // CRUD Items
   const addItem = (itemData: Omit<InventoryItem, 'id' | 'updatedAt'>) => {
-    const newItem: InventoryItem = {
-      ...itemData,
-      id: `ITEM-${Date.now()}`,
-      updatedAt: new Date().toISOString(),
-    };
-    const cleanCode = newItem.code.trim().toUpperCase();
-    const newItems = [newItem, ...items];
-    const newDeleted = deletedItemIds.filter(d => d !== newItem.id && d !== cleanCode);
-    setItems(newItems);
-    setDeletedItemIds(newDeleted);
-    try {
-      localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(newItems));
-      localStorage.setItem(STORAGE_KEYS.DELETED_ITEMS, JSON.stringify(newDeleted));
-    } catch {
-      // ignore
+    const cur = stateRef.current;
+    const cleanCode = itemData.code.trim().toUpperCase();
+    const existingIdx = cur.items.findIndex(it => it.code.trim().toUpperCase() === cleanCode);
+    const existingMatch = existingIdx !== -1 ? cur.items[existingIdx] : undefined;
+    const nowIso = nextMonotonicIso(
+      existingMatch?.updatedAt,
+      existingMatch?.metadataUpdatedAt,
+      cur.deletedRegistry[makeTombstoneKey('ITEM', cleanCode)]
+    );
+    const targetWhId = itemData.warehouseId || cur.warehouses[0]?.id || 'WH-01';
+    const newId = `ITEM-${Date.now()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+
+    const net = computeNetMovementsForItem(newId, cleanCode, cur.transactions);
+    const desiredStock = Math.max(0, Number(itemData.currentStock) || 0);
+    const openingForWh = desiredStock - (net.byWarehouse[targetWhId] || 0);
+
+    let rawItems: InventoryItem[];
+
+    if (existingIdx !== -1) {
+      const existing = cur.items[existingIdx];
+      const nextOpeningWh = {
+        ...(existing.openingWarehouseStocks || {}),
+        [targetWhId]: openingForWh,
+      };
+      rawItems = cur.items.map((it, idx) =>
+        idx === existingIdx
+          ? {
+              ...existing,
+              ...itemData,
+              code: cleanCode,
+              warehouseId: targetWhId,
+              openingStock: Object.values(nextOpeningWh).reduce((s, v) => s + v, 0),
+              openingWarehouseStocks: nextOpeningWh,
+              updatedAt: nowIso,
+              metadataUpdatedAt: nowIso,
+            }
+          : it
+      );
+    } else {
+      const newItem: InventoryItem = {
+        ...itemData,
+        id: newId,
+        code: cleanCode,
+        warehouseId: targetWhId,
+        openingStock: openingForWh,
+        openingWarehouseStocks: { [targetWhId]: openingForWh },
+        currentStock: desiredStock,
+        updatedAt: nowIso,
+        metadataUpdatedAt: nowIso,
+      };
+      rawItems = [newItem, ...cur.items];
     }
-    pushCloudSyncImmediately(newItems, transactions, warehouses, users, newDeleted);
-    pushLocalChanges(newItems, transactions, warehouses, users, newDeleted);
+
+    const newItems = recalculateAllItemsStocks(rawItems, cur.warehouses, cur.transactions);
+
+    const nextReg = { ...cur.deletedRegistry };
+    delete nextReg[makeTombstoneKey('ITEM', newId)];
+    delete nextReg[makeTombstoneKey('ITEM', cleanCode)];
+    const legacy = extractLegacyDeletedArrays(nextReg);
+
+    setItems(newItems);
+    setDeletedRegistry(nextReg);
+    setDeletedItemIds(legacy.deletedItemIds);
+
+    pushCloudSyncImmediately(
+      newItems,
+      cur.transactions,
+      cur.warehouses,
+      cur.users,
+      nextReg,
+      'add-item'
+    );
   };
 
   const updateItem = (id: string, updates: Partial<InventoryItem>) => {
+    const cur = stateRef.current;
     let originalCode = '';
-    const nowIso = new Date().toISOString();
-    const updatedItems = items.map(item => {
+    const targetExisting = cur.items.find(i => i.id === id);
+    const nowIso = nextMonotonicIso(
+      targetExisting?.updatedAt,
+      targetExisting?.metadataUpdatedAt,
+      ...cur.transactions.map(t => t.updatedAt)
+    );
+
+    const rawUpdatedItems = cur.items.map(item => {
       if (item.id === id) {
         originalCode = item.code;
+        const cleanCode = (updates.code || item.code).trim().toUpperCase();
+        const targetWhId = updates.warehouseId || item.warehouseId || cur.warehouses[0]?.id || 'WH-01';
+
+        let nextOpeningWh = item.openingWarehouseStocks
+          ? { ...item.openingWarehouseStocks }
+          : undefined;
+        let nextOpeningStock = item.openingStock;
+
+        // Chỉ hiệu chỉnh lại tồn đầu kỳ nếu người dùng thực sự thay đổi ô "Số lượng tồn hiện tại"
+        if (updates.currentStock !== undefined && updates.currentStock !== item.currentStock) {
+          const currentWhStocks = calculateItemWarehouseStocks(item, cur.warehouses, cur.transactions);
+          const otherWhTotal = Object.entries(currentWhStocks).reduce(
+            (sum, [wId, q]) => (wId === targetWhId ? sum : sum + (Number(q) || 0)),
+            0
+          );
+          const desiredInTargetWh = Math.max(0, Number(updates.currentStock) - otherWhTotal);
+          const net = computeNetMovementsForItem(id, cleanCode, cur.transactions);
+
+          nextOpeningWh = {};
+          cur.warehouses.forEach(w => {
+            if (w.id === targetWhId) {
+              nextOpeningWh![w.id] = desiredInTargetWh - (net.byWarehouse[w.id] || 0);
+            } else if (item.openingWarehouseStocks && item.openingWarehouseStocks[w.id] !== undefined) {
+              nextOpeningWh![w.id] = item.openingWarehouseStocks[w.id];
+            } else {
+              nextOpeningWh![w.id] = (currentWhStocks[w.id] || 0) - (net.byWarehouse[w.id] || 0);
+            }
+          });
+          nextOpeningStock = Object.values(nextOpeningWh).reduce((s, v) => s + v, 0);
+        }
+
         return {
           ...item,
           ...updates,
+          code: cleanCode,
+          warehouseId: targetWhId,
+          openingStock: nextOpeningStock,
+          openingWarehouseStocks: nextOpeningWh,
           updatedAt: nowIso,
+          metadataUpdatedAt: nowIso,
         };
       }
       return item;
     });
-    setItems(updatedItems);
-    try {
-      localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(updatedItems));
-    } catch {
-      // ignore
-    }
 
-    // Tự động đồng bộ cập nhật tên vật tư (hoặc mã/ĐVT) vào toàn bộ phiếu nhập kho & xuất kho
-    let updatedTransactions = transactions;
+    // Đồng bộ tên vật tư / mã SKU / ĐVT vào toàn bộ các phiếu Nhập & Xuất liên quan
+    let updatedTransactions = cur.transactions;
     if (updates.name || updates.code || updates.unit) {
-      updatedTransactions = transactions.map(trx => {
+      const cleanNewCode = updates.code ? updates.code.trim().toUpperCase() : undefined;
+      updatedTransactions = cur.transactions.map(trx => {
         let hasModified = false;
         const updatedLineItems = trx.items.map(line => {
           const isTarget =
             line.itemId === id ||
             (originalCode && line.itemCode.trim().toLowerCase() === originalCode.trim().toLowerCase()) ||
-            (updates.code && line.itemCode.trim().toLowerCase() === updates.code.trim().toLowerCase());
+            (cleanNewCode && line.itemCode.trim().toLowerCase() === cleanNewCode.toLowerCase());
 
           if (isTarget) {
             hasModified = true;
             return {
               ...line,
               ...(updates.name ? { itemName: updates.name } : {}),
-              ...(updates.code ? { itemCode: updates.code } : {}),
+              ...(cleanNewCode ? { itemCode: cleanNewCode } : {}),
               ...(updates.unit ? { unit: updates.unit } : {}),
             };
           }
@@ -1710,96 +1866,289 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         return hasModified ? { ...trx, items: updatedLineItems, updatedAt: nowIso } : trx;
       });
       setTransactions(updatedTransactions);
-      try {
-        localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(updatedTransactions));
-      } catch {
-        // ignore
-      }
     }
 
-    pushCloudSyncImmediately(updatedItems, updatedTransactions, warehouses, users);
-    pushLocalChanges(updatedItems, updatedTransactions, warehouses, users);
+    const updatedItems = recalculateAllItemsStocks(
+      rawUpdatedItems,
+      cur.warehouses,
+      updatedTransactions
+    );
+    setItems(updatedItems);
+
+    pushCloudSyncImmediately(
+      updatedItems,
+      updatedTransactions,
+      cur.warehouses,
+      cur.users,
+      cur.deletedRegistry,
+      'update-item'
+    );
   };
 
   const deleteItem = (id: string) => {
-    const targetItem = items.find(i => i.id === id);
-    const itemCode = targetItem?.code ? targetItem.code.trim().toUpperCase() : '';
-    const newItems = items.filter(i => i.id !== id);
-    const newDeleted = Array.from(new Set([...deletedItemIds, id, itemCode].filter(Boolean))) as string[];
+    const cur = stateRef.current;
+    const targetItem = cur.items.find(i => i.id === id);
+    const newItems = cur.items.filter(i => i.id !== id);
+    const nowIso = nextMonotonicIso(
+      targetItem?.updatedAt,
+      targetItem?.metadataUpdatedAt,
+      ...cur.transactions.map(t => t.updatedAt)
+    );
+
+    const nextReg = { ...cur.deletedRegistry };
+    nextReg[makeTombstoneKey('ITEM', id)] = nowIso;
+    if (targetItem?.code) {
+      nextReg[makeTombstoneKey('ITEM', targetItem.code)] = nowIso;
+    }
+    const legacy = extractLegacyDeletedArrays(nextReg);
 
     setItems(newItems);
-    setDeletedItemIds(newDeleted);
-    try {
-      localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(newItems));
-      localStorage.setItem(STORAGE_KEYS.DELETED_ITEMS, JSON.stringify(newDeleted));
-    } catch {
-      // ignore
-    }
+    setDeletedRegistry(nextReg);
+    setDeletedItemIds(legacy.deletedItemIds);
 
-    pushCloudSyncImmediately(newItems, transactions, warehouses, users, newDeleted);
-    pushLocalChanges(newItems, transactions, warehouses, users, newDeleted);
+    pushCloudSyncImmediately(
+      newItems,
+      cur.transactions,
+      cur.warehouses,
+      cur.users,
+      nextReg,
+      'delete-item'
+    );
   };
 
   const deleteItemsBatch = (ids: string[]) => {
+    const cur = stateRef.current;
     const idSet = new Set(ids);
-    const codes = items
-      .filter(i => idSet.has(i.id))
-      .map(i => i.code?.trim().toUpperCase())
-      .filter(Boolean) as string[];
-    const newItems = items.filter(i => !idSet.has(i.id));
-    const newDeleted = Array.from(new Set([...deletedItemIds, ...ids, ...codes]));
+    const targetItems = cur.items.filter(i => idSet.has(i.id));
+    const newItems = cur.items.filter(i => !idSet.has(i.id));
+    const nowIso = nextMonotonicIso(
+      ...targetItems.flatMap(i => [i.updatedAt, i.metadataUpdatedAt]),
+      ...cur.transactions.map(t => t.updatedAt)
+    );
+
+    const nextReg = { ...cur.deletedRegistry };
+    ids.forEach(id => {
+      nextReg[makeTombstoneKey('ITEM', id)] = nowIso;
+    });
+    targetItems.forEach(it => {
+      if (it.code) {
+        nextReg[makeTombstoneKey('ITEM', it.code)] = nowIso;
+      }
+    });
+    const legacy = extractLegacyDeletedArrays(nextReg);
 
     setItems(newItems);
-    setDeletedItemIds(newDeleted);
-    try {
-      localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(newItems));
-      localStorage.setItem(STORAGE_KEYS.DELETED_ITEMS, JSON.stringify(newDeleted));
-    } catch {
-      // ignore
+    setDeletedRegistry(nextReg);
+    setDeletedItemIds(legacy.deletedItemIds);
+
+    pushCloudSyncImmediately(
+      newItems,
+      cur.transactions,
+      cur.warehouses,
+      cur.users,
+      nextReg,
+      'delete-items-batch'
+    );
+    return { success: true, count: ids.length };
+  };
+
+  // Batch Import Items / Materials Catalog (Fixed pure state computation + immediate cloud broadcast!)
+  const importItemsBatch = (
+    itemsList: Omit<InventoryItem, 'id' | 'updatedAt'>[],
+    updateExisting: boolean = true
+  ): { success: boolean; addedCount: number; updatedCount: number; errors: string[] } => {
+    const cur = stateRef.current;
+    let addedCount = 0;
+    let updatedCount = 0;
+    const errors: string[] = [];
+
+    const workingItems = [...cur.items];
+    let workingTransactions = [...cur.transactions];
+    const nextReg = { ...cur.deletedRegistry };
+    const nowIso = nextMonotonicIso(
+      ...cur.items.flatMap(i => [i.updatedAt, i.metadataUpdatedAt]),
+      ...cur.transactions.map(t => t.updatedAt),
+      ...Object.values(cur.deletedRegistry)
+    );
+
+    for (let i = 0; i < itemsList.length; i++) {
+      const row = itemsList[i];
+      if (!row.code || !row.name) {
+        errors.push(`Dòng ${i + 1}: Thiếu mã SKU hoặc tên vật tư.`);
+        continue;
+      }
+
+      const cleanCode = row.code.trim().toUpperCase();
+      const targetWhId = row.warehouseId || cur.warehouses[0]?.id || 'WH-01';
+      const existingIdx = workingItems.findIndex(
+        it => it.code.trim().toUpperCase() === cleanCode
+      );
+
+      // Clear any previous deletion tombstones for this SKU so imported items always appear across all users
+      delete nextReg[makeTombstoneKey('ITEM', cleanCode)];
+
+      if (existingIdx !== -1) {
+        if (updateExisting) {
+          const oldItem = workingItems[existingIdx];
+          delete nextReg[makeTombstoneKey('ITEM', oldItem.id)];
+
+          let nextOpeningWh = oldItem.openingWarehouseStocks
+            ? { ...oldItem.openingWarehouseStocks }
+            : undefined;
+          let nextOpeningStock = oldItem.openingStock;
+
+          if (row.currentStock !== undefined && row.currentStock !== oldItem.currentStock) {
+            const currentWhStocks = calculateItemWarehouseStocks(
+              oldItem,
+              cur.warehouses,
+              workingTransactions
+            );
+            const otherWhTotal = Object.entries(currentWhStocks).reduce(
+              (sum, [wId, q]) => (wId === targetWhId ? sum : sum + (Number(q) || 0)),
+              0
+            );
+            const desiredInTargetWh = Math.max(0, Number(row.currentStock) - otherWhTotal);
+            const net = computeNetMovementsForItem(oldItem.id, cleanCode, workingTransactions);
+
+            nextOpeningWh = {};
+            cur.warehouses.forEach(w => {
+              if (w.id === targetWhId) {
+                nextOpeningWh![w.id] = desiredInTargetWh - (net.byWarehouse[w.id] || 0);
+              } else if (
+                oldItem.openingWarehouseStocks &&
+                oldItem.openingWarehouseStocks[w.id] !== undefined
+              ) {
+                nextOpeningWh![w.id] = oldItem.openingWarehouseStocks[w.id];
+              } else {
+                nextOpeningWh![w.id] = (currentWhStocks[w.id] || 0) - (net.byWarehouse[w.id] || 0);
+              }
+            });
+            nextOpeningStock = Object.values(nextOpeningWh).reduce((s, v) => s + v, 0);
+          }
+
+          workingItems[existingIdx] = {
+            ...oldItem,
+            ...row,
+            code: cleanCode,
+            warehouseId: targetWhId,
+            openingStock: nextOpeningStock,
+            openingWarehouseStocks: nextOpeningWh,
+            updatedAt: nowIso,
+            metadataUpdatedAt: nowIso,
+          };
+          updatedCount++;
+
+          if (row.name || row.unit) {
+            workingTransactions = workingTransactions.map(trx => {
+              let hasMod = false;
+              const updatedLines = trx.items.map(line => {
+                const isMatch =
+                  line.itemId === oldItem.id ||
+                  line.itemCode.trim().toUpperCase() === cleanCode;
+                if (isMatch) {
+                  hasMod = true;
+                  return {
+                    ...line,
+                    ...(row.name ? { itemName: row.name } : {}),
+                    ...(row.unit ? { unit: row.unit } : {}),
+                  };
+                }
+                return line;
+              });
+              return hasMod ? { ...trx, items: updatedLines, updatedAt: nowIso } : trx;
+            });
+          }
+        }
+      } else {
+        const newId = `ITEM-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
+        delete nextReg[makeTombstoneKey('ITEM', newId)];
+        const net = computeNetMovementsForItem(newId, cleanCode, workingTransactions);
+        const desiredStock = Math.max(0, Number(row.currentStock) || 0);
+        const openingForWh = desiredStock - (net.byWarehouse[targetWhId] || 0);
+
+        const newItem: InventoryItem = {
+          ...row,
+          id: newId,
+          code: cleanCode,
+          warehouseId: targetWhId,
+          openingStock: openingForWh,
+          openingWarehouseStocks: { [targetWhId]: openingForWh },
+          currentStock: desiredStock,
+          updatedAt: nowIso,
+          metadataUpdatedAt: nowIso,
+        };
+        workingItems.unshift(newItem);
+        addedCount++;
+      }
     }
 
-    pushCloudSyncImmediately(newItems, transactions, warehouses, users, newDeleted);
-    pushLocalChanges(newItems, transactions, warehouses, users, newDeleted);
-    return { success: true, count: ids.length };
+    if (addedCount > 0 || updatedCount > 0) {
+      const finalItems = recalculateAllItemsStocks(
+        workingItems,
+        cur.warehouses,
+        workingTransactions
+      );
+      const legacy = extractLegacyDeletedArrays(nextReg);
+
+      setItems(finalItems);
+      setTransactions(workingTransactions);
+      setDeletedRegistry(nextReg);
+      setDeletedItemIds(legacy.deletedItemIds);
+
+      pushCloudSyncImmediately(
+        finalItems,
+        workingTransactions,
+        cur.warehouses,
+        cur.users,
+        nextReg,
+        'import-items-batch'
+      );
+    }
+
+    return {
+      success: addedCount > 0 || updatedCount > 0,
+      addedCount,
+      updatedCount,
+      errors,
+    };
   };
 
   const generateUniqueTransactionCode = (
     type: TransactionType,
-    currentTrx: Transaction[],
-    delIds: string[] = []
+    currentTrx: Transaction[]
   ): string => {
     const prefix = type === 'NHAP_KHO' ? 'PN' : 'PX';
     const year = new Date().getFullYear();
     const pattern = new RegExp(`^${prefix}-${year}-(\\d+)$`, 'i');
 
-    const takenNumbers = new Set<number>();
+    let maxNum = 0;
     currentTrx.forEach(t => {
       const m = (t.code || '').trim().match(pattern);
-      if (m) takenNumbers.add(parseInt(m[1], 10));
-    });
-    delIds.forEach(d => {
-      const m = d.trim().match(pattern);
-      if (m) takenNumbers.add(parseInt(m[1], 10));
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (n > maxNum) maxNum = n;
+      }
     });
 
-    let num = 1;
-    while (takenNumbers.has(num)) {
-      num++;
-    }
-    return `${prefix}-${year}-${String(num).padStart(4, '0')}`;
+    return `${prefix}-${year}-${String(maxNum + 1).padStart(4, '0')}`;
   };
 
   // Create Transaction (NHAP / XUAT)
   const createTransaction = (data: Omit<Transaction, 'id' | 'code'> & { code?: string }) => {
+    const cur = stateRef.current;
+
     if (data.type === 'XUAT_KHO') {
       for (const line of data.items) {
-        const currentItem = items.find(
+        const currentItem = cur.items.find(
           i =>
             (line.itemId && i.id === line.itemId) ||
             (line.itemCode && i.code && i.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
         );
         if (!currentItem) {
-          return { success: false, error: `Không tìm thấy vật tư mã "${line.itemCode || line.itemName}".` };
+          return {
+            success: false,
+            error: `Không tìm thấy vật tư mã "${line.itemCode || line.itemName}".`,
+          };
         }
         if (currentItem.currentStock < line.quantity) {
           return {
@@ -1812,27 +2161,28 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     let code = data.code && data.code.trim() ? data.code.trim().toUpperCase() : '';
     if (!code) {
-      code = generateUniqueTransactionCode(data.type, transactions, deletedTransactionIds);
+      code = generateUniqueTransactionCode(data.type, cur.transactions);
     }
 
-    const nowIso = new Date().toISOString();
-    let updatedItems = [...items];
+    const nowIso = nextMonotonicIso(
+      ...cur.items.flatMap(i => [i.updatedAt, i.metadataUpdatedAt]),
+      ...cur.transactions.map(t => t.updatedAt),
+      ...Object.values(cur.deletedRegistry)
+    );
+    let workingItems = [...cur.items];
+    const nextReg = { ...cur.deletedRegistry };
     const resolvedLines: TransactionLineItem[] = [];
 
     for (const line of data.items) {
       const lineCopy: TransactionLineItem = { ...line };
-      // Find existing item by id or SKU code (case-insensitive)
-      let idx = updatedItems.findIndex(
+      const idx = workingItems.findIndex(
         i =>
           (lineCopy.itemId && i.id === lineCopy.itemId) ||
           (lineCopy.itemCode && i.code && i.code.trim().toUpperCase() === lineCopy.itemCode.trim().toUpperCase())
       );
 
       if (idx !== -1) {
-        const item = updatedItems[idx];
-        const qtyDelta = data.type === 'NHAP_KHO' ? lineCopy.quantity : -lineCopy.quantity;
-        const newStock = Math.max(0, item.currentStock + qtyDelta);
-
+        const item = workingItems[idx];
         let condition = item.condition;
         if (item.type === 'THIET_BI' || item.type === 'CONG_CU') {
           if (data.type === 'XUAT_KHO' && data.subtype === 'XUAT_CHO_MUON') {
@@ -1845,18 +2195,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         const unitPrice =
           data.type === 'NHAP_KHO' && lineCopy.unitPrice > 0 ? lineCopy.unitPrice : item.unitPrice;
 
-        const prevWhStocks = item.warehouseStocks || {};
-        const prevWhQty = prevWhStocks[data.warehouseId] || 0;
-        const newWhQty = Math.max(0, prevWhQty + qtyDelta);
-        const newWhStocks = {
-          ...prevWhStocks,
-          [data.warehouseId]: newWhQty,
-        };
-
-        updatedItems[idx] = {
+        workingItems[idx] = {
           ...item,
-          currentStock: newStock,
-          warehouseStocks: newWhStocks,
           unitPrice,
           condition,
           supplierDefault:
@@ -1869,9 +2209,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         lineCopy.itemName = item.name;
         lineCopy.unit = item.unit;
       } else if (data.type === 'NHAP_KHO') {
-        // Tự động thêm vật tư mới vào danh mục vật tư khi lập phiếu nhập kho
-        const newItemId = `ITEM-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-        const cleanCode = (lineCopy.itemCode || `VT-${Date.now().toString().slice(-4)}`).trim().toUpperCase();
+        const newItemId = `ITEM-${Date.now()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+        const cleanCode = (lineCopy.itemCode || `VT-${Date.now().toString().slice(-4)}`)
+          .trim()
+          .toUpperCase();
+
+        delete nextReg[makeTombstoneKey('ITEM', newItemId)];
+        delete nextReg[makeTombstoneKey('ITEM', cleanCode)];
+
         const newItem: InventoryItem = {
           id: newItemId,
           code: cleanCode,
@@ -1880,6 +2225,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           category: (lineCopy.category || 'Vật tư nhập mới').trim(),
           unit: (lineCopy.unit || 'Cái').trim(),
           warehouseId: data.warehouseId,
+          openingStock: 0,
+          openingWarehouseStocks: { [data.warehouseId]: 0 },
           warehouseStocks: { [data.warehouseId]: Math.max(0, lineCopy.quantity) },
           location: (lineCopy.location || 'Khu vực tiếp nhận').trim(),
           minStock: lineCopy.minStock !== undefined && lineCopy.minStock >= 0 ? lineCopy.minStock : 5,
@@ -1891,59 +2238,50 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           supplierDefault: data.partnerName.trim(),
           spec: (lineCopy.spec || '').trim(),
           updatedAt: nowIso,
+          metadataUpdatedAt: nowIso,
         };
-        updatedItems = [newItem, ...updatedItems];
+        workingItems = [newItem, ...workingItems];
         lineCopy.itemId = newItemId;
         lineCopy.itemCode = cleanCode;
+        lineCopy.isNewItem = true;
       }
       resolvedLines.push(lineCopy);
     }
 
     const newTransaction: Transaction = {
       ...data,
-      id: `TRX-${Date.now()}`,
+      id: `TRX-${Date.now()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
       code,
       items: resolvedLines,
       updatedAt: nowIso,
     };
 
-    const newTransactionsList = [newTransaction, ...transactions];
-    const newDeletedTrx = deletedTransactionIds.filter(
-      d => d !== newTransaction.id && d !== newTransaction.code.trim().toUpperCase()
-    );
+    delete nextReg[makeTombstoneKey('TRX', newTransaction.id)];
+    delete nextReg[makeTombstoneKey('TRX', newTransaction.code)];
+    const legacy = extractLegacyDeletedArrays(nextReg);
 
-    setItems(updatedItems);
+    const newTransactionsList = [newTransaction, ...cur.transactions];
+    const finalItems = recalculateAllItemsStocks(workingItems, cur.warehouses, newTransactionsList);
+
+    setItems(finalItems);
     setTransactions(newTransactionsList);
-    setDeletedTransactionIds(newDeletedTrx);
-    try {
-      localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(updatedItems));
-      localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(newTransactionsList));
-      localStorage.setItem(STORAGE_KEYS.DELETED_TRANSACTIONS, JSON.stringify(newDeletedTrx));
-    } catch {
-      // ignore
-    }
+    setDeletedRegistry(nextReg);
+    setDeletedItemIds(legacy.deletedItemIds);
+    setDeletedTransactionIds(legacy.deletedTransactionIds);
 
     pushCloudSyncImmediately(
-      updatedItems,
+      finalItems,
       newTransactionsList,
-      warehouses,
-      users,
-      undefined,
-      newDeletedTrx
-    );
-    pushLocalChanges(
-      updatedItems,
-      newTransactionsList,
-      warehouses,
-      users,
-      undefined,
-      newDeletedTrx
+      cur.warehouses,
+      cur.users,
+      nextReg,
+      'create-transaction'
     );
 
     return { success: true, transaction: newTransaction };
   };
 
-  // Update Transaction (Admin and Stockkeeper can edit details, items, quantities and recalculate stock)
+  // Update Transaction
   const updateTransaction = (
     id: string,
     updates: Partial<Transaction>
@@ -1952,162 +2290,155 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Bạn không có quyền chỉnh sửa phiếu này.' };
     }
 
-    const existing = transactions.find(t => t.id === id);
+    const cur = stateRef.current;
+    const existing = cur.transactions.find(t => t.id === id);
     if (!existing) {
       return { success: false, error: 'Không tìm thấy phiếu giao dịch.' };
     }
 
-    let updatedItemsList = [...items];
+    const nowIso = nextMonotonicIso(
+      existing.updatedAt,
+      ...cur.items.flatMap(i => [i.updatedAt, i.metadataUpdatedAt]),
+      ...Object.values(cur.deletedRegistry)
+    );
+    const targetWarehouseId = updates.warehouseId || existing.warehouseId;
+    const targetType = updates.type || existing.type;
+    const nextReg = { ...cur.deletedRegistry };
 
-    // If items or warehouse were updated, adjust inventory balances
-    if (updates.items) {
-      // 1. Revert existing transaction's stock effects:
-      for (const oldLine of existing.items) {
-        const idx = updatedItemsList.findIndex(
+    let workingItems = [...cur.items];
+    const resolvedLines: TransactionLineItem[] = (updates.items || existing.items).map(l => ({ ...l }));
+
+    // Nếu là phiếu xuất đang hoạt động, kiểm tra tồn khả dụng (sau khi đã hoàn tác lượng xuất cũ của chính phiếu này)
+    const targetStatus = updates.status || existing.status;
+    if (targetType === 'XUAT_KHO' && targetStatus !== 'DA_HUY' && updates.items) {
+      const trxWithoutExisting = cur.transactions.filter(t => t.id !== id);
+      const tempItemsWithoutExisting = recalculateAllItemsStocks(
+        workingItems,
+        cur.warehouses,
+        trxWithoutExisting
+      );
+
+      for (const line of resolvedLines) {
+        const availableItem = tempItemsWithoutExisting.find(
           i =>
-            (oldLine.itemId && i.id === oldLine.itemId) ||
-            (oldLine.itemCode &&
-              i.code.trim().toUpperCase() === oldLine.itemCode.trim().toUpperCase())
+            (line.itemId && i.id === line.itemId) ||
+            (line.itemCode && i.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
         );
-        if (idx !== -1) {
-          const item = updatedItemsList[idx];
-          const revertDelta = existing.type === 'NHAP_KHO' ? -oldLine.quantity : oldLine.quantity;
-          const prevWhStocks = item.warehouseStocks || {};
-          const prevWhQty = prevWhStocks[existing.warehouseId] || 0;
-          const newWhQty = Math.max(0, prevWhQty + revertDelta);
-          const newWhStocks = {
-            ...prevWhStocks,
-            [existing.warehouseId]: newWhQty,
-          };
-          updatedItemsList[idx] = {
-            ...item,
-            currentStock: Math.max(0, item.currentStock + revertDelta),
-            warehouseStocks: newWhStocks,
+        if (!availableItem) {
+          return {
+            success: false,
+            error: `Không tìm thấy vật tư mã "${line.itemCode || line.itemName}".`,
           };
         }
-      }
-
-      // 2. Apply new items' stock effects:
-      const targetWarehouseId = updates.warehouseId || existing.warehouseId;
-      const targetType = updates.type || existing.type;
-
-      for (const newLine of updates.items) {
-        const idx = updatedItemsList.findIndex(
-          i =>
-            (newLine.itemId && i.id === newLine.itemId) ||
-            (newLine.itemCode &&
-              i.code.trim().toUpperCase() === newLine.itemCode.trim().toUpperCase())
-        );
-        if (idx !== -1) {
-          const item = updatedItemsList[idx];
-          const applyDelta = targetType === 'NHAP_KHO' ? newLine.quantity : -newLine.quantity;
-          const newUnitPrice =
-            targetType === 'NHAP_KHO' && newLine.unitPrice > 0 ? newLine.unitPrice : item.unitPrice;
-          const prevWhStocks = item.warehouseStocks || {};
-          const prevWhQty = prevWhStocks[targetWarehouseId] || 0;
-          const newWhQty = Math.max(0, prevWhQty + applyDelta);
-          const newWhStocks = {
-            ...prevWhStocks,
-            [targetWarehouseId]: newWhQty,
+        if (availableItem.currentStock < line.quantity) {
+          return {
+            success: false,
+            error: `Số lượng xuất của "${availableItem.name}" (${line.quantity} ${availableItem.unit}) vượt quá tồn kho khả dụng (${availableItem.currentStock} ${availableItem.unit})!`,
           };
-          updatedItemsList[idx] = {
-            ...item,
-            currentStock: Math.max(0, item.currentStock + applyDelta),
-            warehouseStocks: newWhStocks,
-            unitPrice: newUnitPrice,
-            updatedAt: new Date().toISOString().replace('T', ' ').substring(0, 16),
-          };
-          newLine.itemId = item.id;
-          newLine.itemCode = item.code;
-          newLine.itemName = item.name;
-          newLine.unit = item.unit;
-        } else if (targetType === 'NHAP_KHO') {
-          // If new item row was added into a Goods Receipt
-          const newItemId = newLine.itemId || `ITEM-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-          const cleanCode = (newLine.itemCode || `VT-${Date.now().toString().slice(-4)}`).trim().toUpperCase();
-          const newItem: InventoryItem = {
-            id: newItemId,
-            code: cleanCode,
-            name: (newLine.itemName || 'Vật tư nhập mới').trim(),
-            type: newLine.type || 'VAT_TU',
-            category: (newLine.category || 'Vật tư dự án').trim(),
-            unit: (newLine.unit || 'Cái').trim(),
-            warehouseId: targetWarehouseId,
-            warehouseStocks: { [targetWarehouseId]: Math.max(0, newLine.quantity) },
-            location: (newLine.location || 'Khu vực tiếp nhận').trim(),
-            minStock: newLine.minStock ?? 5,
-            maxStock: newLine.maxStock ?? 200,
-            currentStock: Math.max(0, newLine.quantity),
-            unitPrice: Math.max(0, newLine.unitPrice || 0),
-            serialOrLot: (newLine.serialNumber || '').trim(),
-            condition: newLine.condition || 'SAN_SANG',
-            supplierDefault: (updates.partnerName || existing.partnerName).trim(),
-            spec: (newLine.spec || '').trim(),
-            updatedAt: new Date().toISOString().replace('T', ' ').substring(0, 16),
-          };
-          updatedItemsList.unshift(newItem);
-          newLine.itemId = newItemId;
-          newLine.itemCode = cleanCode;
         }
-      }
-
-      setItems(updatedItemsList);
-      try {
-        localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(updatedItemsList));
-      } catch {
-        // ignore
       }
     }
 
-    const finalItems = updates.items || existing.items;
+    for (const line of resolvedLines) {
+      const idx = workingItems.findIndex(
+        i =>
+          (line.itemId && i.id === line.itemId) ||
+          (line.itemCode && i.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
+      );
+
+      if (idx !== -1) {
+        const item = workingItems[idx];
+        const newUnitPrice =
+          targetType === 'NHAP_KHO' && line.unitPrice > 0 ? line.unitPrice : item.unitPrice;
+        workingItems[idx] = {
+          ...item,
+          unitPrice: newUnitPrice,
+          updatedAt: nowIso,
+        };
+        line.itemId = item.id;
+        line.itemCode = item.code;
+        line.itemName = item.name;
+        line.unit = item.unit;
+      } else if (targetType === 'NHAP_KHO') {
+        const newItemId =
+          line.itemId || `ITEM-${Date.now()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+        const cleanCode = (line.itemCode || `VT-${Date.now().toString().slice(-4)}`)
+          .trim()
+          .toUpperCase();
+
+        delete nextReg[makeTombstoneKey('ITEM', newItemId)];
+        delete nextReg[makeTombstoneKey('ITEM', cleanCode)];
+
+        const newItem: InventoryItem = {
+          id: newItemId,
+          code: cleanCode,
+          name: (line.itemName || 'Vật tư nhập mới').trim(),
+          type: line.type || 'VAT_TU',
+          category: (line.category || 'Vật tư dự án').trim(),
+          unit: (line.unit || 'Cái').trim(),
+          warehouseId: targetWarehouseId,
+          openingStock: 0,
+          openingWarehouseStocks: { [targetWarehouseId]: 0 },
+          warehouseStocks: { [targetWarehouseId]: Math.max(0, line.quantity) },
+          location: (line.location || 'Khu vực tiếp nhận').trim(),
+          minStock: line.minStock ?? 5,
+          maxStock: line.maxStock ?? 200,
+          currentStock: Math.max(0, line.quantity),
+          unitPrice: Math.max(0, line.unitPrice || 0),
+          serialOrLot: (line.serialNumber || '').trim(),
+          condition: line.condition || 'SAN_SANG',
+          supplierDefault: (updates.partnerName || existing.partnerName).trim(),
+          spec: (line.spec || '').trim(),
+          updatedAt: nowIso,
+          metadataUpdatedAt: nowIso,
+        };
+        workingItems.unshift(newItem);
+        line.itemId = newItemId;
+        line.itemCode = cleanCode;
+        line.isNewItem = true;
+      }
+    }
+
     const computedTotalAmount =
       updates.totalAmount !== undefined
         ? updates.totalAmount
-        : finalItems.reduce((acc, it) => acc + (it.amount || it.quantity * it.unitPrice), 0);
+        : resolvedLines.reduce((acc, it) => acc + (it.amount || it.quantity * it.unitPrice), 0);
 
-    const nowIso = new Date().toISOString();
     const updatedTrx: Transaction = {
       ...existing,
       ...updates,
-      items: finalItems,
+      warehouseId: targetWarehouseId,
+      type: targetType,
+      items: resolvedLines,
       totalAmount: computedTotalAmount,
       updatedAt: nowIso,
     };
 
-    const newTransactionsList = transactions.map(t => (t.id === id ? updatedTrx : t));
-    const newDeletedTrx = deletedTransactionIds.filter(
-      d => d !== id && d !== (existing.code || '').trim().toUpperCase()
-    );
+    delete nextReg[makeTombstoneKey('TRX', id)];
+    delete nextReg[makeTombstoneKey('TRX', updatedTrx.code)];
+    const legacy = extractLegacyDeletedArrays(nextReg);
 
+    const newTransactionsList = cur.transactions.map(t => (t.id === id ? updatedTrx : t));
+    const finalItems = recalculateAllItemsStocks(workingItems, cur.warehouses, newTransactionsList);
+
+    setItems(finalItems);
     setTransactions(newTransactionsList);
-    setDeletedTransactionIds(newDeletedTrx);
-    try {
-      localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(newTransactionsList));
-      localStorage.setItem(STORAGE_KEYS.DELETED_TRANSACTIONS, JSON.stringify(newDeletedTrx));
-    } catch {
-      // ignore
-    }
+    setDeletedRegistry(nextReg);
+    setDeletedItemIds(legacy.deletedItemIds);
+    setDeletedTransactionIds(legacy.deletedTransactionIds);
 
     pushCloudSyncImmediately(
-      updatedItemsList,
+      finalItems,
       newTransactionsList,
-      warehouses,
-      users,
-      undefined,
-      newDeletedTrx
-    );
-    pushLocalChanges(
-      updatedItemsList,
-      newTransactionsList,
-      warehouses,
-      users,
-      undefined,
-      newDeletedTrx
+      cur.warehouses,
+      cur.users,
+      nextReg,
+      'update-transaction'
     );
     return { success: true };
   };
 
-  // Delete Transaction (Admin only, reverses stock impact and syncs deletion across devices)
+  // Delete Transaction
   const deleteTransaction = (id: string): { success: boolean; error?: string } => {
     if (!currentUser || currentUser.role !== 'ADMIN') {
       return {
@@ -2116,86 +2447,78 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       };
     }
 
-    const targetTrx = transactions.find(t => t.id === id);
+    const cur = stateRef.current;
+    const targetTrx = cur.transactions.find(t => t.id === id);
     if (!targetTrx) {
       return { success: false, error: 'Phiếu không tồn tại hoặc đã bị xóa.' };
     }
 
-    // Revert inventory balances:
-    let updatedItemsList = [...items];
-    const nowIso = new Date().toISOString();
-    for (const line of targetTrx.items) {
-      const idx = updatedItemsList.findIndex(
-        i =>
-          i.id === line.itemId ||
-          (line.itemCode && i.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
-      );
-      if (idx !== -1) {
-        const item = updatedItemsList[idx];
-        const qtyDelta = targetTrx.type === 'NHAP_KHO' ? -line.quantity : line.quantity;
-        const newStock = Math.max(0, item.currentStock + qtyDelta);
-
-        updatedItemsList[idx] = {
-          ...item,
-          currentStock: newStock,
-          updatedAt: nowIso,
-        };
-      }
-    }
-
-    const newTransactionsList = transactions.filter(t => t.id !== id);
-    const newDeletedTrx = Array.from(
-      new Set([...deletedTransactionIds, id, (targetTrx.code || '').trim().toUpperCase()])
+    const nowIso = nextMonotonicIso(
+      targetTrx.updatedAt,
+      ...cur.items.flatMap(i => [i.updatedAt, i.metadataUpdatedAt])
     );
+    const newTransactionsList = cur.transactions.filter(t => t.id !== id);
 
-    setItems(updatedItemsList);
-    setTransactions(newTransactionsList);
-    setDeletedTransactionIds(newDeletedTrx);
-    try {
-      localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(updatedItemsList));
-      localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(newTransactionsList));
-      localStorage.setItem(STORAGE_KEYS.DELETED_TRANSACTIONS, JSON.stringify(newDeletedTrx));
-    } catch {
-      // ignore
+    // Stamp timestamped tombstone so all other users' browsers delete this voucher immediately
+    const nextReg = { ...cur.deletedRegistry };
+    nextReg[makeTombstoneKey('TRX', id)] = nowIso;
+    if (targetTrx.code) {
+      nextReg[makeTombstoneKey('TRX', targetTrx.code)] = nowIso;
     }
+    const legacy = extractLegacyDeletedArrays(nextReg);
+
+    // Recalculate exact warehouseStocks & currentStock across all items
+    const affectedCodes = new Set(
+      (targetTrx.items || []).map(l => (l.itemCode || '').trim().toUpperCase()).filter(Boolean)
+    );
+    const affectedIds = new Set((targetTrx.items || []).map(l => l.itemId).filter(Boolean));
+    const stampedItems = cur.items.map(it =>
+      affectedIds.has(it.id) || affectedCodes.has(it.code.trim().toUpperCase())
+        ? { ...it, updatedAt: nowIso }
+        : it
+    );
+    const finalItems = recalculateAllItemsStocks(stampedItems, cur.warehouses, newTransactionsList);
+
+    setItems(finalItems);
+    setTransactions(newTransactionsList);
+    setDeletedRegistry(nextReg);
+    setDeletedTransactionIds(legacy.deletedTransactionIds);
 
     pushCloudSyncImmediately(
-      updatedItemsList,
+      finalItems,
       newTransactionsList,
-      warehouses,
-      users,
-      undefined,
-      newDeletedTrx
-    );
-    pushLocalChanges(
-      updatedItemsList,
-      newTransactionsList,
-      warehouses,
-      users,
-      undefined,
-      newDeletedTrx
+      cur.warehouses,
+      cur.users,
+      nextReg,
+      'delete-transaction'
     );
     return { success: true };
   };
 
-  // Batch Import Transactions (Atomic multi-transaction processing)
+  // Batch Import Transactions
   const importTransactionsBatch = (
     importedList: (Omit<Transaction, 'id' | 'code'> & { code?: string })[]
   ): { success: boolean; importedCount: number; errors: string[] } => {
+    const cur = stateRef.current;
     const errors: string[] = [];
-    let updatedItemsList = [...items];
+    let workingItems = [...cur.items];
     const newTransactionsToAdd: Transaction[] = [];
-    const activeDelTrxSet = new Set(deletedTransactionIds);
-    const nowIso = new Date().toISOString();
+    const nextReg = { ...cur.deletedRegistry };
+    const nowIso = nextMonotonicIso(
+      ...cur.transactions.map(t => t.updatedAt),
+      ...cur.items.flatMap(i => [i.updatedAt, i.metadataUpdatedAt]),
+      ...Object.values(cur.deletedRegistry)
+    );
 
     for (let i = 0; i < importedList.length; i++) {
       const data = importedList[i];
+      const currentCombinedTrx = [...newTransactionsToAdd, ...cur.transactions];
+      workingItems = recalculateAllItemsStocks(workingItems, cur.warehouses, currentCombinedTrx);
 
-      // Validate stock for XUAT_KHO
       if (data.type === 'XUAT_KHO') {
         let stockError = '';
         for (const line of data.items) {
-          const currentItem = updatedItemsList.find(
+          const currentItem = workingItems.find(
             it =>
               (line.itemId && it.id === line.itemId) ||
               (line.itemCode && it.code && it.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
@@ -2215,49 +2538,27 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       }
 
-      // Generate or use provided code
       let finalCode = data.code && data.code.trim() ? data.code.trim().toUpperCase() : '';
       if (!finalCode) {
-        finalCode = generateUniqueTransactionCode(
-          data.type,
-          [...newTransactionsToAdd, ...transactions],
-          Array.from(activeDelTrxSet)
-        );
+        finalCode = generateUniqueTransactionCode(data.type, currentCombinedTrx);
       }
 
-      // Ensure code is not suppressed by deletion tombstones
-      activeDelTrxSet.delete(finalCode);
-
-      // Process line items
       const resolvedLines: TransactionLineItem[] = [];
       for (const line of data.items) {
         const lineCopy: TransactionLineItem = { ...line };
-        let idx = updatedItemsList.findIndex(
+        const idx = workingItems.findIndex(
           it =>
             (lineCopy.itemId && it.id === lineCopy.itemId) ||
             (lineCopy.itemCode && it.code && it.code.trim().toUpperCase() === lineCopy.itemCode.trim().toUpperCase())
         );
 
         if (idx !== -1) {
-          const item = updatedItemsList[idx];
-          const qtyDelta = data.type === 'NHAP_KHO' ? lineCopy.quantity : -lineCopy.quantity;
-          const newStock = Math.max(0, item.currentStock + qtyDelta);
-
+          const item = workingItems[idx];
           const unitPrice =
             data.type === 'NHAP_KHO' && lineCopy.unitPrice > 0 ? lineCopy.unitPrice : item.unitPrice;
 
-          const prevWhStocks = item.warehouseStocks || {};
-          const prevWhQty = prevWhStocks[data.warehouseId] || 0;
-          const newWhQty = Math.max(0, prevWhQty + qtyDelta);
-          const newWhStocks = {
-            ...prevWhStocks,
-            [data.warehouseId]: newWhQty,
-          };
-
-          updatedItemsList[idx] = {
+          workingItems[idx] = {
             ...item,
-            currentStock: newStock,
-            warehouseStocks: newWhStocks,
             unitPrice,
             supplierDefault:
               item.supplierDefault ||
@@ -2269,8 +2570,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           lineCopy.itemName = item.name;
           lineCopy.unit = item.unit;
         } else if (data.type === 'NHAP_KHO') {
-          const newItemId = `ITEM-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-          const cleanCode = (lineCopy.itemCode || `VT-${Date.now().toString().slice(-4)}`).trim().toUpperCase();
+          const newItemId = `ITEM-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+          const cleanCode = (lineCopy.itemCode || `VT-${Date.now().toString().slice(-4)}`)
+            .trim()
+            .toUpperCase();
+
+          delete nextReg[makeTombstoneKey('ITEM', newItemId)];
+          delete nextReg[makeTombstoneKey('ITEM', cleanCode)];
+
           const newItem: InventoryItem = {
             id: newItemId,
             code: cleanCode,
@@ -2279,6 +2586,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             category: (lineCopy.category || 'Vật tư nhập mới').trim(),
             unit: (lineCopy.unit || 'Cái').trim(),
             warehouseId: data.warehouseId,
+            openingStock: 0,
+            openingWarehouseStocks: { [data.warehouseId]: 0 },
             warehouseStocks: { [data.warehouseId]: Math.max(0, lineCopy.quantity) },
             location: (lineCopy.location || 'Khu vực tiếp nhận').trim(),
             minStock: lineCopy.minStock !== undefined && lineCopy.minStock >= 0 ? lineCopy.minStock : 5,
@@ -2290,22 +2599,26 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             supplierDefault: data.partnerName.trim(),
             spec: (lineCopy.spec || '').trim(),
             updatedAt: nowIso,
+            metadataUpdatedAt: nowIso,
           };
-          updatedItemsList = [newItem, ...updatedItemsList];
+          workingItems = [newItem, ...workingItems];
           lineCopy.itemId = newItemId;
           lineCopy.itemCode = cleanCode;
+          lineCopy.isNewItem = true;
         }
         resolvedLines.push(lineCopy);
       }
 
       const newTrx: Transaction = {
         ...data,
-        id: `TRX-${Date.now()}-${i}`,
+        id: `TRX-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
         code: finalCode,
         items: resolvedLines,
         updatedAt: nowIso,
       };
-      activeDelTrxSet.delete(newTrx.id);
+
+      delete nextReg[makeTombstoneKey('TRX', newTrx.id)];
+      delete nextReg[makeTombstoneKey('TRX', finalCode)];
       newTransactionsToAdd.push(newTrx);
     }
 
@@ -2313,35 +2626,23 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, importedCount: 0, errors };
     }
 
-    const newTransactionsList = [...newTransactionsToAdd, ...transactions];
-    const newDeletedTrx = Array.from(activeDelTrxSet);
+    const newTransactionsList = [...newTransactionsToAdd, ...cur.transactions];
+    const finalItems = recalculateAllItemsStocks(workingItems, cur.warehouses, newTransactionsList);
+    const legacy = extractLegacyDeletedArrays(nextReg);
 
-    setItems(updatedItemsList);
+    setItems(finalItems);
     setTransactions(newTransactionsList);
-    setDeletedTransactionIds(newDeletedTrx);
-    try {
-      localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(updatedItemsList));
-      localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(newTransactionsList));
-      localStorage.setItem(STORAGE_KEYS.DELETED_TRANSACTIONS, JSON.stringify(newDeletedTrx));
-    } catch {
-      // ignore
-    }
+    setDeletedRegistry(nextReg);
+    setDeletedItemIds(legacy.deletedItemIds);
+    setDeletedTransactionIds(legacy.deletedTransactionIds);
 
     pushCloudSyncImmediately(
-      updatedItemsList,
+      finalItems,
       newTransactionsList,
-      warehouses,
-      users,
-      undefined,
-      newDeletedTrx
-    );
-    pushLocalChanges(
-      updatedItemsList,
-      newTransactionsList,
-      warehouses,
-      users,
-      undefined,
-      newDeletedTrx
+      cur.warehouses,
+      cur.users,
+      nextReg,
+      'import-transactions-batch'
     );
 
     return {
@@ -2351,97 +2652,32 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     };
   };
 
-  // Batch Import Items / Materials Catalog
-  const importItemsBatch = (
-    itemsList: Omit<InventoryItem, 'id' | 'updatedAt'>[],
-    updateExisting: boolean = true
-  ): { success: boolean; addedCount: number; updatedCount: number; errors: string[] } => {
-    let addedCount = 0;
-    let updatedCount = 0;
-    const errors: string[] = [];
-
-    setItems(prev => {
-      const updated = [...prev];
-      const now = new Date().toISOString().replace('T', ' ').substring(0, 16);
-
-      for (let i = 0; i < itemsList.length; i++) {
-        const row = itemsList[i];
-        if (!row.code || !row.name) {
-          errors.push(`Dòng ${i + 1}: Thiếu mã SKU hoặc tên vật tư.`);
-          continue;
-        }
-
-        const cleanCode = row.code.trim().toUpperCase();
-        const existingIdx = updated.findIndex(
-          it => it.code.trim().toUpperCase() === cleanCode
-        );
-
-        if (existingIdx !== -1) {
-          if (updateExisting) {
-            const oldItem = updated[existingIdx];
-            updated[existingIdx] = {
-              ...oldItem,
-              ...row,
-              code: cleanCode,
-              updatedAt: now,
-            };
-            updatedCount++;
-
-            // Đồng bộ tên vật tư và đơn vị tính vào các phiếu nếu có thay đổi
-            if (row.name || row.unit) {
-              setTransactions(prevTrx =>
-                prevTrx.map(trx => {
-                  let hasMod = false;
-                  const updatedLines = trx.items.map(line => {
-                    const isMatch =
-                      line.itemId === oldItem.id ||
-                      line.itemCode.trim().toLowerCase() === cleanCode.toLowerCase();
-                    if (isMatch) {
-                      hasMod = true;
-                      return {
-                        ...line,
-                        ...(row.name ? { itemName: row.name } : {}),
-                        ...(row.unit ? { unit: row.unit } : {}),
-                      };
-                    }
-                    return line;
-                  });
-                  return hasMod ? { ...trx, items: updatedLines } : trx;
-                })
-              );
-            }
-          }
-        } else {
-          const newItem: InventoryItem = {
-            ...row,
-            code: cleanCode,
-            id: `ITEM-${Date.now()}-${i}`,
-            updatedAt: now,
-          };
-          updated.unshift(newItem);
-          addedCount++;
-        }
-      }
-
-      return updated;
-    });
-
-    return {
-      success: addedCount > 0 || updatedCount > 0,
-      addedCount,
-      updatedCount,
-      errors,
-    };
-  };
-
-  // Generate Chronological Stock Ledger for an Item (Scoped strictly to item's storage warehouse)
+  // Generate Chronological Stock Ledger for an Item across all warehouses
   const getItemLedger = (itemId: string): StockLedgerEntry[] => {
     const targetItem = items.find(i => i.id === itemId);
     const sorted = [...transactions]
-      .filter(t => t.status !== 'DA_HUY' && (!targetItem || t.warehouseId === targetItem.warehouseId))
+      .filter(t => t.status !== 'DA_HUY')
       .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
+    // Start running balance from opening stock so final balance matches currentStock
     let runningBalance = 0;
+    if (targetItem) {
+      if (
+        targetItem.openingWarehouseStocks &&
+        Object.keys(targetItem.openingWarehouseStocks).length > 0
+      ) {
+        runningBalance = Object.values(targetItem.openingWarehouseStocks).reduce(
+          (sum, v) => sum + (Number(v) || 0),
+          0
+        );
+      } else if (targetItem.openingStock !== undefined) {
+        runningBalance = Number(targetItem.openingStock) || 0;
+      } else {
+        const net = computeNetMovementsForItem(targetItem.id, targetItem.code, transactions);
+        runningBalance = Math.max(0, (Number(targetItem.currentStock) || 0) - net.totalNet);
+      }
+    }
+
     const entries: StockLedgerEntry[] = [];
 
     for (const trx of sorted) {
@@ -2456,7 +2692,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       for (const line of matchingLines) {
         const inQty = trx.type === 'NHAP_KHO' ? line.quantity : 0;
         const outQty = trx.type === 'XUAT_KHO' ? line.quantity : 0;
-        runningBalance = runningBalance + inQty - outQty;
+        runningBalance = Math.max(0, runningBalance + inQty - outQty);
 
         entries.push({
           transactionId: trx.id,
@@ -2479,17 +2715,38 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   };
 
   const resetToDefaultData = () => {
+    const cleanSnapshot = {
+      warehouses: INITIAL_WAREHOUSES,
+      items: INITIAL_ITEMS,
+      transactions: INITIAL_TRANSACTIONS,
+      users: INITIAL_USERS,
+      deletedRegistry: {},
+      deletedItemIds: [],
+      deletedTransactionIds: [],
+      deletedUserIds: [],
+      deletedWarehouseIds: [],
+    };
+    stateRef.current = cleanSnapshot;
     setWarehouses(INITIAL_WAREHOUSES);
     setItems(INITIAL_ITEMS);
     setTransactions(INITIAL_TRANSACTIONS);
     setUsers(INITIAL_USERS);
+    setDeletedRegistry({});
+    setDeletedItemIds([]);
+    setDeletedTransactionIds([]);
+    setDeletedUserIds([]);
+    setDeletedWarehouseIds([]);
     localStorage.removeItem(STORAGE_KEYS.WAREHOUSES);
     localStorage.removeItem(STORAGE_KEYS.ITEMS);
     localStorage.removeItem(STORAGE_KEYS.TRANSACTIONS);
     localStorage.removeItem(STORAGE_KEYS.USERS);
     localStorage.removeItem(STORAGE_KEYS.AUTH);
+    localStorage.removeItem(STORAGE_KEYS.DELETED_REGISTRY);
+    localStorage.removeItem(STORAGE_KEYS.DELETED_ITEMS);
+    localStorage.removeItem(STORAGE_KEYS.DELETED_TRANSACTIONS);
+    localStorage.removeItem(STORAGE_KEYS.DELETED_USERS);
+    localStorage.removeItem(STORAGE_KEYS.DELETED_WAREHOUSES);
 
-    // Sync clean state to /api/sync
     fetch('/api/sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2504,6 +2761,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           warehouses: INITIAL_WAREHOUSES,
           items: INITIAL_ITEMS,
           transactions: INITIAL_TRANSACTIONS,
+          deletedRegistry: {},
           source: 'admin-clean-reset',
         },
       }),

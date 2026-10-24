@@ -1,5 +1,6 @@
 import { createClient, SupabaseClient, RealtimeChannel } from '@supabase/supabase-js';
 import { CentralDataPayload } from './centralSyncService';
+import { reconcileSyncPayloads } from '../utils/mergeSyncData';
 
 export type RealtimeConnectionState = 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'ERROR' | 'UNCONFIGURED';
 
@@ -66,13 +67,13 @@ class SupabaseRealtimeService {
     this.listeners.push(listener);
     listener(this.currentState);
     return () => {
-      this.listeners = this.listeners.filter((l) => l !== listener);
+      this.listeners = this.listeners.filter(l => l !== listener);
     };
   }
 
   private setConnectionState(state: RealtimeConnectionState) {
     this.currentState = state;
-    this.listeners.forEach((listener) => {
+    this.listeners.forEach(listener => {
       try {
         listener(state);
       } catch (err) {
@@ -94,7 +95,7 @@ class SupabaseRealtimeService {
       this.client = createClient(url, key, {
         realtime: {
           params: {
-            eventsPerSecond: 10,
+            eventsPerSecond: 20,
           },
         },
       });
@@ -121,9 +122,12 @@ class SupabaseRealtimeService {
       this.channel = null;
     }
 
-    // Subscribe to postgres_changes on inventory_state table
     this.channel = this.client
-      .channel('supabase_realtime_inventory')
+      .channel('supabase_realtime_inventory', {
+        config: {
+          broadcast: { self: false },
+        },
+      })
       .on(
         'postgres_changes',
         {
@@ -131,19 +135,19 @@ class SupabaseRealtimeService {
           schema: 'public',
           table: 'inventory_state',
         },
-        (payload) => {
-          console.log('[Supabase Realtime] postgres_changes event received:', payload);
+        payload => {
           const newRow = payload.new as any;
-          if (newRow && newRow.data) {
-            const data = newRow.data as CentralDataPayload;
-            if (this.onDataCallback) {
-              this.onDataCallback(data);
-            }
+          if (newRow && newRow.data && this.onDataCallback) {
+            this.onDataCallback(newRow.data as CentralDataPayload);
           }
         }
       )
-      .subscribe((status, err) => {
-        console.log('[Supabase Realtime] Channel status:', status, err);
+      .on('broadcast', { event: 'inventory_broadcast' }, msg => {
+        if (msg?.payload && this.onDataCallback) {
+          this.onDataCallback(msg.payload as CentralDataPayload);
+        }
+      })
+      .subscribe(status => {
         if (status === 'SUBSCRIBED') {
           this.setConnectionState('CONNECTED');
         } else if (status === 'TIMED_OUT' || status === 'CHANNEL_ERROR') {
@@ -169,7 +173,7 @@ class SupabaseRealtimeService {
         return null;
       }
 
-      if (data && data.data) {
+      if (data && data.data && Object.keys(data.data).length > 0) {
         return data.data as CentralDataPayload;
       }
       return null;
@@ -179,14 +183,64 @@ class SupabaseRealtimeService {
     }
   }
 
-  public async pushState(payload: CentralDataPayload): Promise<boolean> {
-    if (!this.client) return false;
+  /**
+   * Fetch-and-merge trước khi Upsert lên Supabase để KHÔNG BAO GIỜ ghi đè làm mất
+   * vật tư hoặc phiếu nhập/xuất của người dùng khác vừa tạo đồng thời!
+   */
+  public async pushState(payload: CentralDataPayload): Promise<CentralDataPayload | null> {
+    if (!this.client) return null;
 
     try {
+      const existingRemote = await this.fetchLatest();
+      let finalPayload: CentralDataPayload = payload;
+
+      if (existingRemote && !payload.cleanReset) {
+        const reconciled = reconcileSyncPayloads(
+          {
+            users: existingRemote.users || [],
+            warehouses: existingRemote.warehouses || [],
+            transactions: existingRemote.transactions || [],
+            items: existingRemote.items || [],
+            deletedRegistry: existingRemote.deletedRegistry,
+            deletedItemIds: existingRemote.deletedItemIds,
+            deletedTransactionIds: existingRemote.deletedTransactionIds,
+            deletedUserIds: existingRemote.deletedUserIds,
+            deletedWarehouseIds: existingRemote.deletedWarehouseIds,
+          },
+          {
+            users: payload.users || [],
+            warehouses: payload.warehouses || [],
+            transactions: payload.transactions || [],
+            items: payload.items || [],
+            deletedRegistry: payload.deletedRegistry,
+            deletedItemIds: payload.deletedItemIds,
+            deletedTransactionIds: payload.deletedTransactionIds,
+            deletedUserIds: payload.deletedUserIds,
+            deletedWarehouseIds: payload.deletedWarehouseIds,
+          }
+        );
+
+        finalPayload = {
+          ...existingRemote,
+          ...payload,
+          version: Math.max(Number(existingRemote.version) || 0, Number(payload.version) || 0) + 1,
+          lastUpdated: new Date().toISOString(),
+          users: reconciled.users,
+          warehouses: reconciled.warehouses,
+          transactions: reconciled.transactions,
+          items: reconciled.items,
+          deletedRegistry: reconciled.deletedRegistry,
+          deletedItemIds: reconciled.deletedItemIds,
+          deletedTransactionIds: reconciled.deletedTransactionIds,
+          deletedUserIds: reconciled.deletedUserIds,
+          deletedWarehouseIds: reconciled.deletedWarehouseIds,
+        };
+      }
+
       const { error } = await this.client.from('inventory_state').upsert(
         {
           id: 'default',
-          data: payload,
+          data: finalPayload,
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'id' }
@@ -194,13 +248,24 @@ class SupabaseRealtimeService {
 
       if (error) {
         console.error('[Supabase Realtime] Upsert error:', error);
-        return false;
+        return null;
       }
 
-      return true;
+      // Broadcast ngay qua WebSocket channel (phòng trường hợp bảng chưa bật REPLICA IDENTITY FULL)
+      if (this.channel && this.currentState === 'CONNECTED') {
+        this.channel
+          .send({
+            type: 'broadcast',
+            event: 'inventory_broadcast',
+            payload: finalPayload,
+          })
+          .catch(() => {});
+      }
+
+      return finalPayload;
     } catch (err) {
       console.error('[Supabase Realtime] Exception pushing state:', err);
-      return false;
+      return null;
     }
   }
 

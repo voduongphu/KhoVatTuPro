@@ -170,41 +170,53 @@ export const exportToCSV = (filename: string, headers: string[], rows: (string |
 
 /**
  * Tính toán phân bổ số lượng tồn kho của một mặt hàng theo từng kho lưu trữ cụ thể.
- * Kết hợp thông tin cấu hình ban đầu và toàn bộ luồng giao dịch Nhập - Xuất kho thực tế.
+ * Dựa trên tồn đầu kỳ (openingWarehouseStocks / openingStock) cộng phát sinh ròng
+ * từ toàn bộ các phiếu Nhập - Xuất kho hợp lệ (không bị hủy).
+ * Đảm bảo nhất quán tuyệt đối khi nhiều người dùng cùng lập phiếu nhập/xuất trên các trình duyệt khác nhau.
  */
 export const calculateItemWarehouseStocks = (
   item: InventoryItem,
   warehouses: Warehouse[],
   transactions: Transaction[]
 ): Record<string, number> => {
-  const result: Record<string, number> = {};
+  const allWhIds = new Set<string>();
   warehouses.forEach(w => {
-    result[w.id] = 0;
+    if (w.id) allWhIds.add(w.id);
   });
+  if (item.warehouseId) allWhIds.add(item.warehouseId);
+  if (item.openingWarehouseStocks) {
+    Object.keys(item.openingWarehouseStocks).forEach(k => allWhIds.add(k));
+  }
+  if (item.warehouseStocks) {
+    Object.keys(item.warehouseStocks).forEach(k => allWhIds.add(k));
+  }
 
-  // Calculate actual transaction movements per warehouse
   const activeTrx = transactions.filter(t => t.status !== 'DA_HUY');
   const whMovements: Record<string, { inQty: number; outQty: number }> = {};
-  warehouses.forEach(w => {
-    whMovements[w.id] = { inQty: 0, outQty: 0 };
+  allWhIds.forEach(whId => {
+    whMovements[whId] = { inQty: 0, outQty: 0 };
   });
 
   let totalNetTransactions = 0;
+  let wasAutoCreatedByReceipt = false;
+  const normCode = (item.code || '').trim().toUpperCase();
 
   activeTrx.forEach(trx => {
-    const whId = trx.warehouseId;
+    const whId = trx.warehouseId || item.warehouseId || warehouses[0]?.id || 'WH-01';
+    allWhIds.add(whId);
     if (!whMovements[whId]) {
       whMovements[whId] = { inQty: 0, outQty: 0 };
     }
     const matchingLines = (trx.items || []).filter(
       l =>
         (l.itemId && l.itemId === item.id) ||
-        (l.itemCode &&
-          item.code &&
-          l.itemCode.trim().toUpperCase() === item.code.trim().toUpperCase())
+        (normCode && l.itemCode && l.itemCode.trim().toUpperCase() === normCode)
     );
     matchingLines.forEach(line => {
       const q = Number(line.quantity) || 0;
+      if (line.isNewItem && trx.type === 'NHAP_KHO') {
+        wasAutoCreatedByReceipt = true;
+      }
       if (trx.type === 'NHAP_KHO') {
         whMovements[whId].inQty += q;
         totalNetTransactions += q;
@@ -216,35 +228,40 @@ export const calculateItemWarehouseStocks = (
   });
 
   const primaryWhId = item.warehouseId || warehouses[0]?.id || 'WH-01';
+  allWhIds.add(primaryWhId);
 
-  if (item.warehouseStocks && Object.keys(item.warehouseStocks).length > 0) {
-    warehouses.forEach(w => {
-      const recorded = item.warehouseStocks?.[w.id] ?? 0;
-      result[w.id] = Math.max(0, recorded);
-    });
-    // Ensure warehouses with transactions reflect movements
-    warehouses.forEach(w => {
-      const net = (whMovements[w.id]?.inQty || 0) - (whMovements[w.id]?.outQty || 0);
-      if (result[w.id] === 0 && net > 0) {
-        result[w.id] = Math.max(0, net);
-      }
+  const result: Record<string, number> = {};
+
+  if (item.openingWarehouseStocks && Object.keys(item.openingWarehouseStocks).length > 0) {
+    allWhIds.forEach(whId => {
+      const opening = Number(item.openingWarehouseStocks?.[whId]) || 0;
+      const net = (whMovements[whId]?.inQty || 0) - (whMovements[whId]?.outQty || 0);
+      result[whId] = Math.max(0, opening + net);
     });
   } else {
-    const baselineOpening = Math.max(0, (item.currentStock || 0) - totalNetTransactions);
-    warehouses.forEach(w => {
-      const net = (whMovements[w.id]?.inQty || 0) - (whMovements[w.id]?.outQty || 0);
-      if (w.id === primaryWhId) {
-        result[w.id] = Math.max(0, baselineOpening + net);
+    const inferredOpening =
+      item.openingStock !== undefined
+        ? Number(item.openingStock) || 0
+        : wasAutoCreatedByReceipt
+        ? 0
+        : Math.max(0, (Number(item.currentStock) || 0) - totalNetTransactions);
+
+    allWhIds.forEach(whId => {
+      const net = (whMovements[whId]?.inQty || 0) - (whMovements[whId]?.outQty || 0);
+      if (whId === primaryWhId) {
+        result[whId] = Math.max(0, inferredOpening + net);
       } else {
-        result[w.id] = Math.max(0, net);
+        result[whId] = Math.max(0, net);
       }
     });
   }
 
-  const sumAll = Object.values(result).reduce((a, b) => a + b, 0);
-  if (sumAll === 0 && item.currentStock > 0) {
-    result[primaryWhId] = item.currentStock;
-  }
+  // Ensure every configured warehouse key exists in result
+  warehouses.forEach(w => {
+    if (result[w.id] === undefined) {
+      result[w.id] = 0;
+    }
+  });
 
   return result;
 };

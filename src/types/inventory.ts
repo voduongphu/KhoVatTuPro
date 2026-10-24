@@ -27,6 +27,8 @@ export interface InventoryItem {
   warehouseId?: string;
   location: string; // e.g. Kệ A2-03, Khoang B
   warehouseStocks?: Record<string, number>; // Phân bổ số lượng tồn theo từng kho (key là warehouseId, value là số lượng tồn)
+  openingStock?: number; // Tồn đầu kỳ khai báo ban đầu (trước khi tính phát sinh phiếu Nhập/Xuất)
+  openingWarehouseStocks?: Record<string, number>; // Tồn đầu kỳ phân bổ theo từng kho
   minStock: number; // Mức tồn tối thiểu
   maxStock: number; // Mức tồn tối đa
   currentStock: number; // Tổng tồn hiện tại các kho
@@ -37,6 +39,7 @@ export interface InventoryItem {
   inspectionDueDate?: string; // Hạn kiểm định / bảo dưỡng thiết bị
   spec?: string; // Thông số kỹ thuật
   updatedAt: string;
+  metadataUpdatedAt?: string; // Thời điểm chỉnh sửa thông tin danh mục gần nhất
 }
 
 export type TransactionType = 'NHAP_KHO' | 'XUAT_KHO';

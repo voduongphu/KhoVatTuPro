@@ -1,7 +1,8 @@
 import { InventoryItem, Transaction, User, Warehouse } from '../types/inventory';
+import { DeletedRegistry } from '../utils/mergeSyncData';
 
 export type SyncStatus = 'synced' | 'syncing' | 'offline' | 'error';
-export type CloudProvider = 'vercel-edge-config' | 'vercel-kv' | 'supabase' | 'local';
+export type CloudProvider = 'vercel-edge-config' | 'vercel-kv' | 'supabase' | 'central-server' | 'local';
 
 export interface CentralDataPayload {
   version: number;
@@ -10,10 +11,16 @@ export interface CentralDataPayload {
   transactions: Transaction[];
   warehouses: Warehouse[];
   users?: User[];
+  deletedRegistry?: DeletedRegistry;
   deletedUserIds?: string[];
   deletedTransactionIds?: string[];
   deletedItemIds?: string[];
   deletedWarehouseIds?: string[];
+  supabaseConfig?: {
+    url: string;
+    key: string;
+  };
+  clientId?: string;
   lastUpdatedBy?: string;
   source?: string;
   resetEpoch?: string;
@@ -31,23 +38,23 @@ export interface SyncResult {
 class CentralSyncService {
   private lastFetchedTimestamp: string | null = null;
   private currentVersion: number = 1;
-  private provider: CloudProvider = 'local';
+  private provider: CloudProvider = 'central-server';
+  private eventSource: EventSource | null = null;
+  private reconnectTimer: any = null;
 
   constructor() {
     this.detectProvider();
   }
 
   public detectProvider(): CloudProvider {
-    // Check if Supabase or Vercel KV env vars are available
     if (typeof import.meta !== 'undefined' && import.meta.env) {
       if (import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY) {
         this.provider = 'supabase';
         return 'supabase';
       }
     }
-    // Default serverless API route connects to Vercel KV on Vercel deployment
-    this.provider = 'vercel-kv';
-    return 'vercel-kv';
+    this.provider = 'central-server';
+    return 'central-server';
   }
 
   public getProvider(): CloudProvider {
@@ -55,13 +62,91 @@ class CentralSyncService {
   }
 
   /**
-   * Fetch central state from serverless endpoint (/api/sync) or Supabase.
-   * If remote data has a newer lastUpdated timestamp, returns it.
+   * Lắng nghe luồng đồng bộ thời gian thực (SSE) từ máy chủ trung tâm (/api/sync/stream)
+   * giúp mọi trình duyệt của các người dùng khác nhau nhận cập nhật tức thì (<50ms).
+   */
+  public subscribeToStream(
+    onPayload: (payload: CentralDataPayload) => void,
+    onStatusChange?: (connected: boolean) => void
+  ): () => void {
+    if (typeof window === 'undefined' || typeof EventSource === 'undefined') {
+      return () => {};
+    }
+
+    let isDisposed = false;
+
+    const connect = () => {
+      if (isDisposed) return;
+      if (this.eventSource) {
+        this.eventSource.close();
+        this.eventSource = null;
+      }
+
+      try {
+        const es = new EventSource('/api/sync/stream');
+        this.eventSource = es;
+
+        es.onopen = () => {
+          if (isDisposed) return;
+          onStatusChange?.(true);
+        };
+
+        es.onmessage = event => {
+          if (isDisposed || !event.data) return;
+          try {
+            const parsed = JSON.parse(event.data);
+            if (parsed && parsed.type === 'SYNC_STATE' && parsed.payload) {
+              const payload = parsed.payload as CentralDataPayload;
+              this.lastFetchedTimestamp = payload.lastUpdated;
+              this.currentVersion = Math.max(this.currentVersion, Number(payload.version) || 1);
+              onPayload(payload);
+            }
+          } catch {
+            // ignore malformed frame
+          }
+        };
+
+        es.onerror = () => {
+          onStatusChange?.(false);
+          es.close();
+          if (this.eventSource === es) {
+            this.eventSource = null;
+          }
+          if (!isDisposed) {
+            if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = setTimeout(connect, 2500);
+          }
+        };
+      } catch {
+        onStatusChange?.(false);
+        if (!isDisposed) {
+          if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = setTimeout(connect, 3000);
+        }
+      }
+    };
+
+    connect();
+
+    return () => {
+      isDisposed = true;
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      if (this.eventSource) {
+        this.eventSource.close();
+        this.eventSource = null;
+      }
+    };
+  }
+
+  /**
+   * Fetch central state from /api/sync
    */
   public async fetchLatestData(currentLastUpdated?: string): Promise<SyncResult> {
     try {
-      // 1. First attempt to call the Vercel serverless /api/sync endpoint
-      const response = await fetch('/api/sync', {
+      const response = await fetch(`/api/sync?t=${Date.now()}`, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
@@ -75,28 +160,30 @@ class CentralSyncService {
           const payload = data.payload as CentralDataPayload;
           const remoteTime = new Date(payload.lastUpdated).getTime();
           const localTime = currentLastUpdated ? new Date(currentLastUpdated).getTime() : 0;
-          const isNewer = isNaN(remoteTime) || remoteTime > localTime;
+          const isNewer =
+            isNaN(remoteTime) ||
+            remoteTime > localTime ||
+            (Number(payload.version) || 0) > this.currentVersion;
 
           this.lastFetchedTimestamp = payload.lastUpdated;
-          this.currentVersion = payload.version || this.currentVersion;
+          this.currentVersion = Math.max(this.currentVersion, Number(payload.version) || 1);
+          this.provider = data.provider || 'central-server';
 
           return {
             success: true,
             payload,
-            provider: data.provider || 'vercel-kv',
+            provider: this.provider,
             isNewer,
           };
         }
       }
 
-      // If /api/sync returned 404 or running in pure client-only dev mode without active serverless backend
       return {
         success: true,
         provider: 'local',
         isNewer: false,
       };
     } catch (err: any) {
-      // Graceful error handling - will fall back to local state and continue auto-polling
       return {
         success: false,
         provider: this.provider,
@@ -106,14 +193,16 @@ class CentralSyncService {
   }
 
   /**
-   * Push current state to central datastore (Vercel KV / Supabase)
+   * Push current state to central server (/api/sync) and return the authoritative merged state!
    */
-  public async pushUpdate(payload: Omit<CentralDataPayload, 'version' | 'lastUpdated'>): Promise<SyncResult> {
+  public async pushUpdate(
+    payload: Omit<CentralDataPayload, 'version' | 'lastUpdated'>
+  ): Promise<SyncResult> {
     const fullPayload: CentralDataPayload = {
       ...payload,
       version: this.currentVersion + 1,
       lastUpdated: new Date().toISOString(),
-      source: 'web-client',
+      source: payload.source || 'web-client',
     };
 
     try {
@@ -127,19 +216,26 @@ class CentralSyncService {
 
       if (response.ok) {
         const resData = await response.json();
-        this.currentVersion = fullPayload.version;
-        this.lastFetchedTimestamp = fullPayload.lastUpdated;
+        const serverMergedPayload = (resData?.payload as CentralDataPayload) || fullPayload;
+        this.currentVersion = Math.max(
+          this.currentVersion,
+          Number(serverMergedPayload.version) || fullPayload.version
+        );
+        this.lastFetchedTimestamp = serverMergedPayload.lastUpdated || fullPayload.lastUpdated;
+        this.provider = resData?.provider || 'central-server';
+
         return {
           success: true,
-          payload: fullPayload,
-          provider: resData.provider || 'vercel-kv',
+          payload: serverMergedPayload,
+          provider: this.provider,
         };
       }
 
       return {
-        success: true,
+        success: false,
         payload: fullPayload,
         provider: 'local',
+        error: `Máy chủ trả về mã lỗi ${response.status}`,
       };
     } catch (err: any) {
       return {
