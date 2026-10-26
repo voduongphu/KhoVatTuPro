@@ -13,6 +13,7 @@ import {
   Square,
   X,
   FileSpreadsheet,
+  FolderTree,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
 import { InventoryItem } from '../types/inventory';
@@ -36,6 +37,7 @@ interface InventoryTableViewProps {
   onOpenCreateItem: () => void;
   onQuickGoodsIn: (item: InventoryItem) => void;
   onOpenImportItems?: () => void;
+  onOpenCategories?: () => void;
 }
 
 export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
@@ -44,10 +46,12 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
   onOpenCreateItem,
   onQuickGoodsIn,
   onOpenImportItems,
+  onOpenCategories,
 }) => {
   const {
     filteredItems,
     items,
+    materialCategories,
     warehouses,
     transactions,
     deleteItem,
@@ -103,12 +107,31 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
     0
   );
 
+  const resolveItemCategoryDisplay = (item: InventoryItem) => {
+    const matched =
+      (item.categoryId && materialCategories.find(c => c.id === item.categoryId)) ||
+      (item.categoryCode &&
+        materialCategories.find(
+          c => c.code.trim().toUpperCase() === item.categoryCode!.trim().toUpperCase()
+        )) ||
+      (item.category
+        ? materialCategories.find(
+            c => c.name.trim().toLowerCase() === (item.category || '').trim().toLowerCase()
+          )
+        : undefined);
+    return {
+      code: matched?.code || item.categoryCode || '',
+      name: matched?.name || item.category || 'Chưa phân loại',
+    };
+  };
+
   const handleExportCSV = () => {
     const headers = [
       'Mã SKU',
       'Tên Vật tư / Thiết bị',
       'Phân loại',
-      'Nhóm ngành',
+      'Mã danh mục',
+      'Tên danh mục',
       'ĐVT',
       'Kho lưu trữ',
       'Vị trí kệ',
@@ -126,11 +149,13 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
 
     const rows = filteredItems.map(item => {
       const wh = warehouses.find(w => w.id === item.warehouseId);
+      const catInfo = resolveItemCategoryDisplay(item);
       return [
         item.code,
         item.name,
         getItemTypeLabel(item.type),
-        item.category,
+        catInfo.code,
+        catInfo.name,
         item.unit,
         wh?.name || item.warehouseId || '',
         item.location,
@@ -172,7 +197,19 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
           </div>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center flex-wrap gap-2 shrink-0">
+          {onOpenCategories && (
+            <button
+              type="button"
+              onClick={onOpenCategories}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-indigo-700 bg-indigo-50/70 hover:bg-indigo-100 border border-indigo-200 rounded-lg transition-colors whitespace-nowrap"
+              title="Quản lý mã danh mục và tên danh mục vật tư"
+            >
+              <FolderTree className="w-3.5 h-3.5" />
+              <span>Quản lý danh mục ({materialCategories.length})</span>
+            </button>
+          )}
+
           <button
             onClick={handleExportCSV}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg transition-colors whitespace-nowrap"
@@ -325,13 +362,25 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
                         {item.code}
                       </td>
 
-                      {/* Name & specs */}
+                      {/* Name, Category Link & Specs */}
                       <td className="py-3.5 px-4">
                         <div className="font-semibold text-slate-900 line-clamp-1" title={item.name}>
                           {item.name}
                         </div>
                         <div className="text-[11px] text-slate-500 mt-0.5 flex items-center gap-1.5 flex-wrap">
-                          <span>{item.category}</span>
+                          {(() => {
+                            const catInfo = resolveItemCategoryDisplay(item);
+                            return (
+                              <span>
+                                {catInfo.code ? (
+                                  <span className="font-mono font-semibold text-indigo-700 mr-1">
+                                    [{catInfo.code}]
+                                  </span>
+                                ) : null}
+                                <span className="text-slate-600">{catInfo.name}</span>
+                              </span>
+                            );
+                          })()}
                           {item.spec && (
                             <>
                               <span aria-hidden="true">&bull;</span>

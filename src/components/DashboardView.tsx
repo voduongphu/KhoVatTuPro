@@ -35,7 +35,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onSelectStockCard,
   onOpenCreateTransaction,
 }) => {
-  const { items, transactions, warehouses } = useInventory();
+  const { items, materialCategories, transactions, warehouses } = useInventory();
   const [selectedReportWarehouse, setSelectedReportWarehouse] = useState<string>('ALL');
   const [reportViewMode, setReportViewMode] = useState<'matrix' | 'nxt'>('matrix');
 
@@ -58,26 +58,45 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const totalReceiptValue = totalReceipts.reduce((acc, t) => acc + t.totalAmount, 0);
   const totalIssueValue = totalIssues.reduce((acc, t) => acc + t.totalAmount, 0);
 
-  // Category breakdown
+  // Category breakdown linked with MaterialCategory
   const categoryBreakdown = useMemo(() => {
-    const map = new Map<string, { count: number; value: number }>();
+    const map = new Map<string, { code?: string; name: string; count: number; value: number }>();
     items.forEach(item => {
-      const existing = map.get(item.category) || { count: 0, value: 0 };
-      map.set(item.category, {
+      const matchedCat =
+        (item.categoryId && materialCategories.find(c => c.id === item.categoryId)) ||
+        (item.categoryCode &&
+          materialCategories.find(
+            c => c.code.trim().toUpperCase() === item.categoryCode!.trim().toUpperCase()
+          )) ||
+        (item.category
+          ? materialCategories.find(
+              c => c.name.trim().toLowerCase() === (item.category || '').trim().toLowerCase()
+            )
+          : undefined);
+      const key = matchedCat ? matchedCat.id : `RAW:${item.category || 'Chưa phân loại'}`;
+      const existing = map.get(key) || {
+        code: matchedCat?.code || item.categoryCode,
+        name: matchedCat?.name || item.category || 'Chưa phân loại',
+        count: 0,
+        value: 0,
+      };
+      map.set(key, {
+        ...existing,
         count: existing.count + 1,
         value: existing.value + item.currentStock * item.unitPrice,
       });
     });
 
-    const list = Array.from(map.entries()).map(([cat, val]) => ({
-      category: cat,
+    const list = Array.from(map.values()).map(val => ({
+      category: val.name,
+      categoryCode: val.code,
       count: val.count,
       value: val.value,
       percentage: totalInventoryValue > 0 ? (val.value / totalInventoryValue) * 100 : 0,
     }));
 
     return list.sort((a, b) => b.value - a.value);
-  }, [items, totalInventoryValue]);
+  }, [items, materialCategories, totalInventoryValue]);
 
   // Warehouse breakdown with exact totalStock quantity and value per warehouse
   const warehouseBreakdown = useMemo(() => {
@@ -426,9 +445,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <div className="space-y-3.5">
             {categoryBreakdown.map(cat => (
-              <div key={cat.category} className="space-y-1">
+              <div key={`${cat.categoryCode || ''}-${cat.category}`} className="space-y-1">
                 <div className="flex items-center justify-between text-xs">
                   <span className="font-medium text-slate-700 truncate pr-2">
+                    {cat.categoryCode && (
+                      <span className="font-mono font-semibold text-indigo-700 mr-1.5">
+                        [{cat.categoryCode}]
+                      </span>
+                    )}
                     {cat.category}
                   </span>
                   <div className="flex items-center gap-3 shrink-0 tabular-nums">

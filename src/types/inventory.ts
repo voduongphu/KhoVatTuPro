@@ -17,12 +17,23 @@ export interface Warehouse {
   updatedAt?: string;
 }
 
+export interface MaterialCategory {
+  id: string;
+  code: string; // Mã danh mục: VD DM-CD, DM-TB, DM-AT...
+  name: string; // Tên danh mục: VD Cơ điện & Dây cáp, Thiết bị đo đạc...
+  description?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface InventoryItem {
   id: string;
   code: string; // SKU: e.g. VT-CD-001, TB-DK-012
   name: string;
   type: ItemType;
-  category: string; // e.g. Cơ điện, Xây dựng, An toàn BHLĐ, Thiết bị đo đạc, v.v.
+  categoryId?: string; // ID liên kết đến MaterialCategory
+  categoryCode?: string; // Mã danh mục liên kết (VD: DM-CD)
+  category: string; // Tên danh mục hiển thị (VD: Cơ điện, Xây dựng, An toàn BHLĐ...)
   unit: string; // e.g. Cái, Mét, Kg, Bộ, Cuộn, Cây, Thùng
   warehouseId?: string;
   location: string; // e.g. Kệ A2-03, Khoang B
@@ -74,6 +85,8 @@ export interface TransactionLineItem {
   // Metadata for auto-registering new item when creating Goods Receipt
   isNewItem?: boolean;
   type?: ItemType;
+  categoryId?: string;
+  categoryCode?: string;
   category?: string;
   location?: string;
   minStock?: number;

@@ -27,6 +27,8 @@ interface ParsedItemRow {
   code: string;
   name: string;
   type: ItemType;
+  categoryId?: string;
+  categoryCode?: string;
   category: string;
   unit: string;
   warehouseId: string;
@@ -49,7 +51,7 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
   onClose,
   onSuccess,
 }) => {
-  const { warehouses, items, importItemsBatch } = useInventory();
+  const { warehouses, materialCategories, items, importItemsBatch } = useInventory();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [fileName, setFileName] = useState('');
@@ -57,6 +59,7 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
   const [isProcessing, setIsProcessing] = useState(false);
   const [updateExisting, setUpdateExisting] = useState(true);
   const [filterTab, setFilterTab] = useState<'ALL' | 'NEW' | 'UPDATE' | 'ERROR'>('ALL');
+  const [parseError, setParseError] = useState('');
   const [importSummary, setImportSummary] = useState<{
     success: boolean;
     addedCount: number;
@@ -119,7 +122,8 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
         'Mã SKU (*)': 'VT-CD-105',
         'Tên Vật Tư / Thiết Bị (*)': 'Cáp đồng trần tiếp địa M50 Cadivi',
         'Phân Loại (VAT_TU/THIET_BI/CONG_CU/PHU_TUNG)': 'VAT_TU',
-        'Nhóm Ngành / Danh Mục (*)': 'Cơ điện & Dây cáp',
+        'Mã Danh Mục': materialCategories[0]?.code || 'DM-CD',
+        'Nhóm Ngành / Danh Mục (*)': materialCategories[0]?.name || 'Cơ điện & Vật tư công trình',
         'Đơn Vị Tính (*)': 'Mét',
         'Mã Kho Lưu Trữ (*)': warehouses[0]?.code || 'WH-HN',
         'Vị Trí Kệ': 'Kệ C1-04',
@@ -137,7 +141,8 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
         'Mã SKU (*)': 'TB-DK-205',
         'Tên Vật Tư / Thiết Bị (*)': 'Máy hàn que điện tử Inverter Jasic ARC-200',
         'Phân Loại (VAT_TU/THIET_BI/CONG_CU/PHU_TUNG)': 'THIET_BI',
-        'Nhóm Ngành / Danh Mục (*)': 'Máy móc & Thiết bị cơ khí',
+        'Mã Danh Mục': materialCategories[1]?.code || 'DM-TB',
+        'Nhóm Ngành / Danh Mục (*)': materialCategories[1]?.name || 'Máy móc & Thiết bị thi công',
         'Đơn Vị Tính (*)': 'Cái',
         'Mã Kho Lưu Trữ (*)': warehouses[1]?.code || warehouses[0]?.code || 'WH-HP',
         'Vị Trí Kệ': 'Kệ M2-01',
@@ -155,7 +160,8 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
         'Mã SKU (*)': 'CC-DC-301',
         'Tên Vật Tư / Thiết Bị (*)': 'Bộ cờ lê tròng tự động Kingtony 8-24mm',
         'Phân Loại (VAT_TU/THIET_BI/CONG_CU/PHU_TUNG)': 'CONG_CU',
-        'Nhóm Ngành / Danh Mục (*)': 'Dụng cụ cầm tay',
+        'Mã Danh Mục': materialCategories[2]?.code || 'DM-CC',
+        'Nhóm Ngành / Danh Mục (*)': materialCategories[2]?.name || 'Công cụ dụng cụ & Đo lường',
         'Đơn Vị Tính (*)': 'Bộ',
         'Mã Kho Lưu Trữ (*)': warehouses[0]?.code || 'WH-HN',
         'Vị Trí Kệ': 'Tủ Tool-02',
@@ -176,7 +182,8 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
       { wch: 16 }, // SKU
       { wch: 38 }, // Name
       { wch: 22 }, // Type
-      { wch: 26 }, // Category
+      { wch: 16 }, // Category Code
+      { wch: 28 }, // Category Name
       { wch: 14 }, // Unit
       { wch: 18 }, // Warehouse
       { wch: 16 }, // Location
@@ -193,6 +200,18 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
 
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Danh_Muc_Vat_Tu');
+
+    // Add category reference sheet
+    const catSheetData = materialCategories.map(c => ({
+      'Mã Danh Mục': c.code,
+      'Tên Danh Mục': c.name,
+      'Mô Tả': c.description || '',
+    }));
+    if (catSheetData.length > 0) {
+      const catWorksheet = XLSX.utils.json_to_sheet(catSheetData);
+      catWorksheet['!cols'] = [{ wch: 18 }, { wch: 34 }, { wch: 42 }];
+      XLSX.utils.book_append_sheet(workbook, catWorksheet, 'Danh_Sach_Ma_Danh_Muc');
+    }
 
     // Add warehouse reference sheet to help user enter correct warehouse codes
     const whSheetData = warehouses.map(w => ({
@@ -217,6 +236,7 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
     setFileName(file.name);
     setIsProcessing(true);
     setImportSummary(null);
+    setParseError('');
 
     const reader = new FileReader();
     reader.onload = evt => {
@@ -228,7 +248,7 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
         const rawData: any[] = XLSX.utils.sheet_to_json(ws);
 
         if (!rawData || rawData.length === 0) {
-          alert('File Excel trống hoặc không đọc được dữ liệu.');
+          setParseError('File Excel trống hoặc không đọc được dữ liệu.');
           setIsProcessing(false);
           return;
         }
@@ -281,16 +301,41 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
           const rawType = getCleanVal(row, 'Phân Loại', 'Loại', 'Type', 'phan_loai');
           const type = parseItemType(rawType);
 
-          // 4. Category
+          // 4. Category (by Code or Name)
+          const rawCatCode = getCleanVal(
+            row,
+            'Mã Danh Mục',
+            'Mã DM',
+            'Category Code',
+            'ma_danh_muc'
+          );
           const rawCat = getCleanVal(
             row,
             'Nhóm Ngành / Danh Mục (*)',
+            'Tên Danh Mục',
             'Nhóm Ngành',
             'Danh Mục',
             'Category',
             'danh_muc'
           );
-          const category = String(rawCat || 'Vật tư tổng hợp').trim();
+          const cleanCatCode = rawCatCode ? String(rawCatCode).trim().toUpperCase() : '';
+          const cleanCatName = rawCat ? String(rawCat).trim() : '';
+
+          const matchedCategory =
+            (cleanCatCode
+              ? materialCategories.find(c => c.code.trim().toUpperCase() === cleanCatCode)
+              : undefined) ||
+            (cleanCatName
+              ? materialCategories.find(
+                  c =>
+                    c.name.trim().toLowerCase() === cleanCatName.toLowerCase() ||
+                    c.code.trim().toLowerCase() === cleanCatName.toLowerCase()
+                )
+              : undefined);
+
+          const categoryId = matchedCategory?.id;
+          const categoryCode = matchedCategory?.code || cleanCatCode || undefined;
+          const category = matchedCategory?.name || cleanCatName || 'Vật tư tổng hợp';
 
           // 5. Unit
           const rawUnit = getCleanVal(row, 'Đơn Vị Tính (*)', 'Đơn Vị Tính', 'ĐVT', 'Unit', 'don_vi_tinh');
@@ -374,6 +419,8 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
             code,
             name,
             type,
+            categoryId,
+            categoryCode,
             category,
             unit,
             warehouseId: matchedWh?.id || 'WH-HN',
@@ -395,7 +442,7 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
 
         setParsedRows(parsed);
       } catch (err: any) {
-        alert('Lỗi đọc file Excel: ' + (err.message || 'File không hợp lệ'));
+        setParseError('Lỗi đọc file Excel: ' + (err.message || 'File không hợp lệ'));
       } finally {
         setIsProcessing(false);
       }
@@ -428,7 +475,7 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
     });
 
     if (validRows.length === 0) {
-      alert('Không có mặt hàng hợp lệ nào để import.');
+      setParseError('Không có mặt hàng hợp lệ nào để import.');
       return;
     }
 
@@ -436,6 +483,8 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
       code: r.code,
       name: r.name,
       type: r.type,
+      categoryId: r.categoryId,
+      categoryCode: r.categoryCode,
       category: r.category,
       unit: r.unit,
       warehouseId: r.warehouseId,
@@ -490,6 +539,13 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
 
         {/* Modal Body */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-5">
+          {parseError && (
+            <div className="p-3.5 rounded-xl border border-rose-200 bg-rose-50 text-rose-800 text-xs flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>{parseError}</span>
+            </div>
+          )}
+
           {/* Success Result Banner */}
           {importSummary && (
             <div
@@ -731,6 +787,7 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
                                   </div>
                                 )}
                                 <div className="text-[10px] text-slate-400">
+                                  {row.categoryCode ? `[${row.categoryCode}] ` : ''}
                                   {row.category} {row.location ? `• ${row.location}` : ''}
                                 </div>
                               </td>

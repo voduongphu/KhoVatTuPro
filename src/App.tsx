@@ -7,6 +7,7 @@ import { TransactionListView } from './components/TransactionListView';
 import { AlertsView } from './components/AlertsView';
 import { UserManagementView } from './components/UserManagementView';
 import { WarehouseManagementView } from './components/WarehouseManagementView';
+import { CategoryManagementView } from './components/CategoryManagementView';
 import { StockCardModal } from './components/StockCardModal';
 import { CreateTransactionModal } from './components/CreateTransactionModal';
 import { CreateItemModal } from './components/CreateItemModal';
@@ -108,6 +109,14 @@ function InventoryApp() {
             onOpenCreateItem={() => handleOpenCreateItem()}
             onQuickGoodsIn={item => handleOpenCreateTransaction('NHAP_KHO', item)}
             onOpenImportItems={() => setIsItemsExcelImportOpen(true)}
+            onOpenCategories={() => setActiveTab('categories')}
+          />
+        )}
+
+        {activeTab === 'categories' && (
+          <CategoryManagementView
+            onNavigateToInventoryWithCategory={() => setActiveTab('inventory')}
+            onEditItem={item => handleOpenCreateItem(item)}
           />
         )}
 

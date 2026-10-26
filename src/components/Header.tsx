@@ -10,6 +10,7 @@ import {
   LogOut,
   ChevronDown,
   Building2,
+  FolderTree,
   Zap,
   X,
   Menu,
@@ -19,6 +20,7 @@ import { useInventory } from '../context/InventoryContext';
 export type ActiveTabType =
   | 'dashboard'
   | 'inventory'
+  | 'categories'
   | 'warehouses'
   | 'receipts'
   | 'issues'
@@ -41,6 +43,7 @@ export const Header: React.FC<HeaderProps> = ({
 }) => {
   const {
     items,
+    materialCategories,
     currentUser,
     logout,
     syncStatus,
@@ -77,6 +80,13 @@ export const Header: React.FC<HeaderProps> = ({
       id: 'inventory',
       label: 'Vật tư',
       icon: <Boxes className="w-3.5 h-3.5" />,
+    },
+    {
+      id: 'categories',
+      label: 'Danh mục',
+      icon: <FolderTree className="w-3.5 h-3.5" />,
+      badge: materialCategories.length > 0 ? materialCategories.length : undefined,
+      badgeColor: 'bg-slate-700 text-white',
     },
     {
       id: 'warehouses',
@@ -268,6 +278,17 @@ export const Header: React.FC<HeaderProps> = ({
                       >
                         <Plus className="w-4 h-4 text-indigo-600" />
                         <span>Thêm Vật tư / Thiết bị</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsCreateMenuOpen(false);
+                          setActiveTab('categories');
+                        }}
+                        className="w-full text-left px-3.5 py-2 hover:bg-slate-50 flex items-center gap-2 text-slate-700 font-medium"
+                      >
+                        <FolderTree className="w-4 h-4 text-indigo-600" />
+                        <span>Quản lý danh mục vật tư</span>
                       </button>
                       {isAdmin && (
                         <>

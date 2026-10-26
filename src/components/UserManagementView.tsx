@@ -37,15 +37,29 @@ export const UserManagementView: React.FC = () => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingUser, setEditingUser] = useState<User | null>(null);
   const [showResetAllModal, setShowResetAllModal] = useState(false);
+  const [userToRevoke, setUserToRevoke] = useState<User | null>(null);
+
+  const activeAdminCount = users.filter(u => u.role === 'ADMIN' && u.status === 'ACTIVE').length;
 
   const handleRevokeSession = (user: User) => {
-    if (
-      window.confirm(
-        `Đăng xuất tài khoản "${user.fullName}" khỏi thiết bị "${user.activeDeviceName || 'đang online'}" ngay lập tức?`
-      )
-    ) {
-      revokeUserSession(user.id);
+    setUserToRevoke(user);
+  };
+
+  const handleConfirmRevokeSession = () => {
+    if (!userToRevoke) return;
+    const res = revokeUserSession(userToRevoke.id);
+    if (res.success) {
+      setNotification({
+        text: `Đã đăng xuất từ xa tài khoản ${userToRevoke.fullName}.`,
+        type: 'success',
+      });
+    } else {
+      setNotification({
+        text: res.error || 'Không thể đăng xuất từ xa.',
+        type: 'error',
+      });
     }
+    setUserToRevoke(null);
   };
 
   // Form states
@@ -155,7 +169,14 @@ export const UserManagementView: React.FC = () => {
       return;
     }
     const newStatus = user.status === 'ACTIVE' ? 'LOCKED' : 'ACTIVE';
-    updateUser(user.id, { status: newStatus });
+    const res = updateUser(user.id, { status: newStatus });
+    if (!res.success) {
+      setNotification({
+        text: res.error || 'Không thể thay đổi trạng thái tài khoản.',
+        type: 'error',
+      });
+      return;
+    }
     setNotification({
       text: `Đã ${newStatus === 'ACTIVE' ? 'mở khóa' : 'khóa'} tài khoản ${user.fullName}.`,
       type: 'success',
@@ -166,6 +187,13 @@ export const UserManagementView: React.FC = () => {
     if (user.id === currentUser?.id) {
       setNotification({
         text: 'Không thể xóa chính tài khoản bạn đang đăng nhập!',
+        type: 'error',
+      });
+      return;
+    }
+    if (user.role === 'ADMIN' && user.status === 'ACTIVE' && activeAdminCount <= 1) {
+      setNotification({
+        text: 'Hệ thống phải giữ lại ít nhất 1 tài khoản Quản trị viên (Admin) đang hoạt động!',
         type: 'error',
       });
       return;
@@ -318,6 +346,8 @@ export const UserManagementView: React.FC = () => {
               {users.map(u => {
                 const assignedWh = warehouses.find(w => w.id === u.assignedWarehouseId);
                 const isCurrent = u.id === currentUser?.id;
+                const isOnlyActiveAdmin =
+                  u.role === 'ADMIN' && u.status === 'ACTIVE' && activeAdminCount <= 1;
 
                 return (
                   <tr key={`${u.id}-${u.username}`} className="hover:bg-slate-50/80 transition-colors">
@@ -445,15 +475,23 @@ export const UserManagementView: React.FC = () => {
 
                           <button
                             onClick={() => handleToggleLock(u)}
-                            disabled={isCurrent}
+                            disabled={isCurrent || isOnlyActiveAdmin}
                             className={`p-1.5 rounded transition-colors ${
-                              isCurrent
+                              isCurrent || isOnlyActiveAdmin
                                 ? 'text-slate-200 cursor-not-allowed'
                                 : u.status === 'ACTIVE'
                                 ? 'text-slate-400 hover:text-amber-600 hover:bg-amber-50'
                                 : 'text-amber-600 hover:bg-amber-100'
                             }`}
-                            title={u.status === 'ACTIVE' ? 'Khóa tài khoản' : 'Mở khóa tài khoản'}
+                            title={
+                              isCurrent
+                                ? 'Không thể khóa tài khoản đang đăng nhập'
+                                : isOnlyActiveAdmin
+                                ? 'Không thể khóa Quản trị viên hoạt động duy nhất'
+                                : u.status === 'ACTIVE'
+                                ? 'Khóa tài khoản'
+                                : 'Mở khóa tài khoản'
+                            }
                           >
                             {u.status === 'ACTIVE' ? (
                               <Lock className="w-4 h-4" />
@@ -464,13 +502,19 @@ export const UserManagementView: React.FC = () => {
 
                           <button
                             onClick={() => handleDelete(u)}
-                            disabled={isCurrent}
+                            disabled={isCurrent || isOnlyActiveAdmin}
                             className={`p-1.5 rounded transition-colors ${
-                              isCurrent
+                              isCurrent || isOnlyActiveAdmin
                                 ? 'text-slate-200 cursor-not-allowed'
                                 : 'text-slate-400 hover:text-rose-600 hover:bg-rose-50'
                             }`}
-                            title={isCurrent ? 'Không thể xóa tài khoản đang đăng nhập' : 'Xóa tài khoản'}
+                            title={
+                              isCurrent
+                                ? 'Không thể xóa tài khoản đang đăng nhập'
+                                : isOnlyActiveAdmin
+                                ? 'Không thể xóa Quản trị viên hoạt động duy nhất'
+                                : 'Xóa tài khoản'
+                            }
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
@@ -666,6 +710,23 @@ export const UserManagementView: React.FC = () => {
         </div>
       )}
 
+      {/* Revoke User Session In-App Modal */}
+      {userToRevoke && (
+        <ConfirmDeleteModal
+          isOpen={Boolean(userToRevoke)}
+          title={`Đăng xuất từ xa ${userToRevoke.fullName}`}
+          message={`Bạn có muốn đăng xuất tài khoản @${userToRevoke.username} khỏi thiết bị "${userToRevoke.activeDeviceName || 'đang online'}" ngay lập tức?`}
+          itemDetails={[
+            { label: 'Tài khoản', value: `@${userToRevoke.username} (${userToRevoke.fullName})` },
+            { label: 'Thiết bị đang online', value: userToRevoke.activeDeviceName || '1 thiết bị' },
+          ]}
+          warningNote="Người dùng sẽ bị kết thúc phiên làm việc hiện tại trên thiết bị đó ngay tức thì."
+          confirmLabel="Đăng xuất thiết bị ngay"
+          onConfirm={handleConfirmRevokeSession}
+          onClose={() => setUserToRevoke(null)}
+        />
+      )}
+
       {/* Delete User In-App Modal */}
       {userToDelete && (
         <ConfirmDeleteModal
@@ -678,7 +739,7 @@ export const UserManagementView: React.FC = () => {
             { label: 'Vai trò', value: getUserRoleLabel(userToDelete.role) },
             { label: 'Email', value: userToDelete.email || 'Chưa cập nhật' },
           ]}
-          warningNote="Thao tác này sẽ gỡ bỏ quyền truy cập của người dùng này khỏi hệ thống ngay lập tức."
+          warningNote="Thao tác này sẽ gỡ bỏ vĩnh viễn quyền truy cập của tài khoản này và đồng bộ xóa trên toàn bộ thiết bị."
           confirmLabel="Xác nhận xóa tài khoản"
           onConfirm={handleConfirmDeleteUser}
           onClose={() => setUserToDelete(null)}

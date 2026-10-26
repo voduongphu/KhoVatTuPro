@@ -199,6 +199,7 @@ class SupabaseRealtimeService {
           {
             users: existingRemote.users || [],
             warehouses: existingRemote.warehouses || [],
+            materialCategories: existingRemote.materialCategories || [],
             transactions: existingRemote.transactions || [],
             items: existingRemote.items || [],
             deletedRegistry: existingRemote.deletedRegistry,
@@ -206,10 +207,12 @@ class SupabaseRealtimeService {
             deletedTransactionIds: existingRemote.deletedTransactionIds,
             deletedUserIds: existingRemote.deletedUserIds,
             deletedWarehouseIds: existingRemote.deletedWarehouseIds,
+            deletedCategoryIds: existingRemote.deletedCategoryIds,
           },
           {
             users: payload.users || [],
             warehouses: payload.warehouses || [],
+            materialCategories: payload.materialCategories || [],
             transactions: payload.transactions || [],
             items: payload.items || [],
             deletedRegistry: payload.deletedRegistry,
@@ -217,6 +220,7 @@ class SupabaseRealtimeService {
             deletedTransactionIds: payload.deletedTransactionIds,
             deletedUserIds: payload.deletedUserIds,
             deletedWarehouseIds: payload.deletedWarehouseIds,
+            deletedCategoryIds: payload.deletedCategoryIds,
           }
         );
 
@@ -227,6 +231,7 @@ class SupabaseRealtimeService {
           lastUpdated: new Date().toISOString(),
           users: reconciled.users,
           warehouses: reconciled.warehouses,
+          materialCategories: reconciled.materialCategories,
           transactions: reconciled.transactions,
           items: reconciled.items,
           deletedRegistry: reconciled.deletedRegistry,
@@ -234,6 +239,7 @@ class SupabaseRealtimeService {
           deletedTransactionIds: reconciled.deletedTransactionIds,
           deletedUserIds: reconciled.deletedUserIds,
           deletedWarehouseIds: reconciled.deletedWarehouseIds,
+          deletedCategoryIds: reconciled.deletedCategoryIds,
         };
       }
 

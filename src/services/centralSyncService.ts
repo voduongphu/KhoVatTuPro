@@ -1,4 +1,4 @@
-import { InventoryItem, Transaction, User, Warehouse } from '../types/inventory';
+import { InventoryItem, MaterialCategory, Transaction, User, Warehouse } from '../types/inventory';
 import { DeletedRegistry } from '../utils/mergeSyncData';
 
 export type SyncStatus = 'synced' | 'syncing' | 'offline' | 'error';
@@ -10,12 +10,14 @@ export interface CentralDataPayload {
   items: InventoryItem[];
   transactions: Transaction[];
   warehouses: Warehouse[];
+  materialCategories?: MaterialCategory[];
   users?: User[];
   deletedRegistry?: DeletedRegistry;
   deletedUserIds?: string[];
   deletedTransactionIds?: string[];
   deletedItemIds?: string[];
   deletedWarehouseIds?: string[];
+  deletedCategoryIds?: string[];
   supabaseConfig?: {
     url: string;
     key: string;

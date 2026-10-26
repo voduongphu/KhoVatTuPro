@@ -30,7 +30,34 @@ function parseSafeUtcTime(ts?: string | null): number {
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
-function makeTombstoneKey(prefix: 'ITEM' | 'TRX' | 'USER' | 'WH', rawId?: string | null): string {
+function toCategoryAsciiSlug(text?: string | null): string {
+  return String(text || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/gi, 'd')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function generateCategoryCodeFromName(name: string, usedCodes: Set<string>): string {
+  const words = toCategoryAsciiSlug(name).split('-').filter(Boolean);
+  let initials = words.map(w => w.charAt(0)).join('').slice(0, 4);
+  if (!initials) initials = 'TH';
+  let candidate = `DM-${initials}`;
+  let counter = 2;
+  while (usedCodes.has(candidate.toUpperCase())) {
+    candidate = `DM-${initials}${counter}`;
+    counter++;
+  }
+  usedCodes.add(candidate.toUpperCase());
+  return candidate;
+}
+
+function makeTombstoneKey(
+  prefix: 'ITEM' | 'TRX' | 'USER' | 'WH' | 'CAT',
+  rawId?: string | null
+): string {
   if (!rawId) return '';
   const cleaned = String(rawId).trim();
   if (!cleaned) return '';
@@ -45,6 +72,7 @@ function buildMergedDeletedRegistry(
     deletedTransactionIds?: string[];
     deletedUserIds?: string[];
     deletedWarehouseIds?: string[];
+    deletedCategoryIds?: string[];
   }
 ): DeletedRegistry {
   const merged: DeletedRegistry = {};
@@ -74,12 +102,15 @@ function buildMergedDeletedRegistry(
     });
     (legacyArrays.deletedUserIds || []).forEach(id => {
       const norm = String(id || '').trim().toLowerCase();
-      if (norm === 'admin' || norm === 'usr-admin') return;
       const k = makeTombstoneKey('USER', norm);
       if (k && !merged[k]) merged[k] = LEGACY_TOMBSTONE_ISO;
     });
     (legacyArrays.deletedWarehouseIds || []).forEach(id => {
       const k = makeTombstoneKey('WH', id);
+      if (k && !merged[k]) merged[k] = LEGACY_TOMBSTONE_ISO;
+    });
+    (legacyArrays.deletedCategoryIds || []).forEach(id => {
+      const k = makeTombstoneKey('CAT', id);
       if (k && !merged[k]) merged[k] = LEGACY_TOMBSTONE_ISO;
     });
   }
@@ -203,16 +234,47 @@ function mergeStateAdditive(existing: any, incoming: any): any {
         ...(existing.deletedWarehouseIds || []),
         ...(incoming.deletedWarehouseIds || []),
       ],
+      deletedCategoryIds: [
+        ...(existing.deletedCategoryIds || []),
+        ...(incoming.deletedCategoryIds || []),
+      ],
     }
   );
+
+  const isUnmodifiedDefaultSeedAdmin = (u: any): boolean => {
+    if (!u) return false;
+    const uname = String(u.username || '').trim().toLowerCase();
+    const uid = String(u.id || '').trim().toUpperCase();
+    return (
+      uname === 'admin' &&
+      (uid === 'USR-ADMIN' || !uid) &&
+      !u.updatedAt &&
+      !u.lastLogin &&
+      !u.lastActiveAt &&
+      !u.activeDeviceId
+    );
+  };
+
+  const allInputUsers = [...(existing.users || []), ...(incoming.users || [])];
+  const hasRealNonSeedActiveAdmin = allInputUsers.some((u: any) => {
+    if (!u || u.role !== 'ADMIN' || u.status === 'LOCKED' || isUnmodifiedDefaultSeedAdmin(u)) {
+      return false;
+    }
+    const tKeys = [makeTombstoneKey('USER', u.id), makeTombstoneKey('USER', u.username)].filter(Boolean);
+    const uTime = Math.max(parseSafeUtcTime(u.updatedAt), parseSafeUtcTime(u.lastActiveAt));
+    return !isEntityDeleted(registry, tKeys, uTime);
+  });
 
   const userMap = new Map<string, any>();
   const processUser = (u: any, isIncoming: boolean) => {
     if (!u || (!u.username && !u.id)) return;
+    if (hasRealNonSeedActiveAdmin && isUnmodifiedDefaultSeedAdmin(u)) {
+      return;
+    }
     const unameKey = String(u.username || u.id).trim().toLowerCase();
     const tKeys = [makeTombstoneKey('USER', u.id), makeTombstoneKey('USER', u.username)].filter(Boolean);
-    const uTime = parseSafeUtcTime(u.updatedAt) || parseSafeUtcTime(u.lastActiveAt) || 0;
-    if (unameKey !== 'admin' && isEntityDeleted(registry, tKeys, uTime)) {
+    const uTime = Math.max(parseSafeUtcTime(u.updatedAt), parseSafeUtcTime(u.lastActiveAt));
+    if (isEntityDeleted(registry, tKeys, uTime)) {
       userMap.delete(unameKey);
       return;
     }
@@ -221,14 +283,34 @@ function mergeStateAdditive(existing: any, incoming: any): any {
     if (!prev) {
       userMap.set(unameKey, u);
     } else {
-      const prevTime =
-        parseSafeUtcTime(prev.updatedAt) || parseSafeUtcTime(prev.lastActiveAt) || 0;
+      const prevTime = Math.max(
+        parseSafeUtcTime(prev.updatedAt),
+        parseSafeUtcTime(prev.lastActiveAt)
+      );
       const useNew = isIncoming ? uTime >= prevTime : uTime > prevTime;
       userMap.set(unameKey, { ...(useNew ? prev : u), ...(useNew ? u : prev), id: prev.id || u.id });
     }
   };
   (existing.users || []).forEach((u: any) => processUser(u, false));
   (incoming.users || []).forEach((u: any) => processUser(u, true));
+
+  if (
+    allInputUsers.length > 0 &&
+    !Array.from(userMap.values()).some((u: any) => u.role === 'ADMIN' && u.status !== 'LOCKED')
+  ) {
+    const adminCandidates = [...(incoming.users || []), ...(existing.users || [])]
+      .filter((u: any) => u && u.role === 'ADMIN')
+      .sort(
+        (a: any, b: any) =>
+          Math.max(parseSafeUtcTime(b.updatedAt), parseSafeUtcTime(b.lastActiveAt)) -
+          Math.max(parseSafeUtcTime(a.updatedAt), parseSafeUtcTime(a.lastActiveAt))
+      );
+    if (adminCandidates.length > 0) {
+      const fallbackAdmin = { ...adminCandidates[0], status: 'ACTIVE' };
+      const fallbackKey = String(fallbackAdmin.username || fallbackAdmin.id).trim().toLowerCase();
+      userMap.set(fallbackKey, fallbackAdmin);
+    }
+  }
 
   const seenUserIds = new Set<string>();
   const sanitizedUsers = Array.from(userMap.values()).map((u: any) => {
@@ -393,6 +475,8 @@ function mergeStateAdditive(existing: any, incoming: any): any {
         code: cleanCode,
         name: String(line.itemName || cleanCode).trim(),
         type: line.type || 'VAT_TU',
+        categoryId: line.categoryId,
+        categoryCode: line.categoryCode,
         category: String(line.category || 'Vật tư nhập kho').trim(),
         unit: String(line.unit || 'Cái').trim(),
         warehouseId: whId,
@@ -410,21 +494,175 @@ function mergeStateAdditive(existing: any, incoming: any): any {
     });
   });
 
+  const catById = new Map<string, any>();
+  const processCategory = (cat: any, isIncoming: boolean) => {
+    if (!cat || (!cat.id && !cat.code && !cat.name)) return;
+    const normCode = String(cat.code || '').trim().toUpperCase();
+    const normName = String(cat.name || '').trim();
+    if (!normCode && !normName) return;
+    const key = String(cat.id || `CAT-${normCode || toCategoryAsciiSlug(normName)}`).trim().toUpperCase();
+    const tKeys = [
+      makeTombstoneKey('CAT', cat.id),
+      normCode ? makeTombstoneKey('CAT', normCode) : '',
+    ].filter(Boolean);
+    const cTime = parseSafeUtcTime(cat.updatedAt) || 0;
+    if (isEntityDeleted(registry, tKeys, cTime)) {
+      catById.delete(key);
+      return;
+    }
+    clearTombstonesIfRevived(registry, tKeys, cTime);
+    const prev = catById.get(key);
+    if (!prev) {
+      catById.set(key, {
+        ...cat,
+        id: cat.id || key,
+        code: normCode || cat.code,
+        name: normName || normCode,
+      });
+    } else {
+      const prevTime = parseSafeUtcTime(prev.updatedAt) || 0;
+      const useNew = isIncoming ? cTime >= prevTime : cTime > prevTime;
+      const older = useNew ? prev : cat;
+      const newer = useNew ? cat : prev;
+      catById.set(key, {
+        ...older,
+        ...newer,
+        id: prev.id || cat.id || key,
+        code: String(newer.code || older.code).trim().toUpperCase(),
+        name: String(newer.name || older.name).trim(),
+      });
+    }
+  };
+  (existing.materialCategories || []).forEach((c: any) => processCategory(c, false));
+  (incoming.materialCategories || []).forEach((c: any) => processCategory(c, true));
+
+  const dedupByCode = new Map<string, any>();
+  const aliasIdMap = new Map<string, any>();
+  Array.from(catById.values())
+    .sort((a: any, b: any) => (parseSafeUtcTime(a.updatedAt) || 0) - (parseSafeUtcTime(b.updatedAt) || 0))
+    .forEach((c: any) => {
+      const codeKey = String(c.code || '').trim().toUpperCase();
+      const prev = dedupByCode.get(codeKey);
+      if (!prev) {
+        dedupByCode.set(codeKey, c);
+        aliasIdMap.set(c.id, c);
+      } else {
+        const mergedCat = { ...prev, ...c, id: prev.id, code: codeKey };
+        dedupByCode.set(codeKey, mergedCat);
+        aliasIdMap.set(prev.id, mergedCat);
+        aliasIdMap.set(c.id, mergedCat);
+      }
+    });
+
+  const mergedCategories: any[] = Array.from(dedupByCode.values());
+  const usedCatCodes = new Set<string>(mergedCategories.map((c: any) => String(c.code || '').trim().toUpperCase()));
+
   const mergedItems = Array.from(itemMap.values()).map((item: any) => {
     const stocks = computeWarehouseStocks(item, mergedWarehouses, mergedTransactions);
     const totalStock = Object.values(stocks).reduce((sum, qty) => sum + (Number(qty) || 0), 0);
-    return { ...item, warehouseStocks: stocks, currentStock: Math.max(0, totalStock) };
+
+    const rawCatId = String(item.categoryId || '').trim();
+    const rawCatCode = String(item.categoryCode || '').trim().toUpperCase();
+    const rawCatName = String(item.category || '').trim();
+    const itemMetaMs = Math.max(
+      parseSafeUtcTime(item.metadataUpdatedAt),
+      parseSafeUtcTime(item.updatedAt)
+    );
+
+    let linkedCat: any = undefined;
+    let isUncategorized =
+      (!rawCatId && !rawCatCode && !rawCatName) ||
+      (!rawCatId && !rawCatCode && rawCatName.toLowerCase() === 'chưa phân loại');
+
+    if (!isUncategorized && rawCatId) {
+      const byId =
+        mergedCategories.find(
+          (c: any) => c.id === rawCatId || String(c.id).toUpperCase() === rawCatId.toUpperCase()
+        ) || aliasIdMap.get(rawCatId);
+      if (byId) {
+        const catUpdatedMs = parseSafeUtcTime(byId.updatedAt) || 0;
+        if (
+          !rawCatName ||
+          rawCatName.toLowerCase() === String(byId.name).toLowerCase() ||
+          catUpdatedMs >= itemMetaMs
+        ) {
+          linkedCat = byId;
+        }
+      } else if (isEntityDeleted(registry, [makeTombstoneKey('CAT', rawCatId)], itemMetaMs)) {
+        isUncategorized = true;
+      }
+    }
+
+    if (!isUncategorized && !linkedCat && rawCatCode) {
+      linkedCat = mergedCategories.find(
+        (c: any) => String(c.code || '').trim().toUpperCase() === rawCatCode
+      );
+      if (!linkedCat && isEntityDeleted(registry, [makeTombstoneKey('CAT', rawCatCode)], itemMetaMs)) {
+        isUncategorized = true;
+      }
+    }
+
+    if (!isUncategorized && !linkedCat && rawCatName) {
+      const lowerName = rawCatName.toLowerCase();
+      linkedCat = mergedCategories.find(
+        (c: any) =>
+          String(c.name || '').trim().toLowerCase() === lowerName ||
+          String(c.code || '').trim().toLowerCase() === lowerName
+      );
+    }
+
+    if (!isUncategorized && !linkedCat && rawCatName && rawCatName.toLowerCase() !== 'chưa phân loại') {
+      const slug = toCategoryAsciiSlug(rawCatName) || 'GENERAL';
+      const autoId = `CAT-AUTO-${slug}`;
+      const autoTKeys = [
+        makeTombstoneKey('CAT', autoId),
+        rawCatCode ? makeTombstoneKey('CAT', rawCatCode) : '',
+      ].filter(Boolean);
+
+      if (isEntityDeleted(registry, autoTKeys, itemMetaMs)) {
+        isUncategorized = true;
+      } else {
+        const autoCode =
+          rawCatCode && !usedCatCodes.has(rawCatCode)
+            ? (usedCatCodes.add(rawCatCode), rawCatCode)
+            : generateCategoryCodeFromName(rawCatName, usedCatCodes);
+        const fallbackIso = item.metadataUpdatedAt || item.updatedAt || '2026-01-01T00:00:00.000Z';
+        linkedCat = {
+          id: autoId,
+          code: autoCode,
+          name: rawCatName,
+          description: 'Danh mục tự động liên kết từ vật tư kho',
+          createdAt: String(fallbackIso).replace('T', ' ').substring(0, 16),
+          updatedAt: fallbackIso,
+        };
+        mergedCategories.push(linkedCat);
+        aliasIdMap.set(autoId, linkedCat);
+      }
+    }
+
+    return {
+      ...item,
+      categoryId: linkedCat ? linkedCat.id : undefined,
+      categoryCode: linkedCat ? linkedCat.code : undefined,
+      category: linkedCat ? linkedCat.name : 'Chưa phân loại',
+      warehouseStocks: stocks,
+      currentStock: Math.max(0, totalStock),
+    };
   });
+
+  mergedCategories.sort((a: any, b: any) => String(a.code || '').localeCompare(String(b.code || ''), 'vi'));
 
   const deletedItemIds: string[] = [];
   const deletedTransactionIds: string[] = [];
   const deletedUserIds: string[] = [];
   const deletedWarehouseIds: string[] = [];
+  const deletedCategoryIds: string[] = [];
   Object.keys(registry).forEach(k => {
     if (k.startsWith('ITEM:')) deletedItemIds.push(k.slice(5));
     else if (k.startsWith('TRX:')) deletedTransactionIds.push(k.slice(4));
     else if (k.startsWith('USER:')) deletedUserIds.push(k.slice(5));
     else if (k.startsWith('WH:')) deletedWarehouseIds.push(k.slice(3));
+    else if (k.startsWith('CAT:')) deletedCategoryIds.push(k.slice(4));
   });
 
   return {
@@ -433,12 +671,14 @@ function mergeStateAdditive(existing: any, incoming: any): any {
     users: sanitizedUsers,
     transactions: mergedTransactions,
     warehouses: mergedWarehouses,
+    materialCategories: mergedCategories,
     items: mergedItems,
     deletedRegistry: registry,
     deletedUserIds,
     deletedTransactionIds,
     deletedItemIds,
     deletedWarehouseIds,
+    deletedCategoryIds,
     supabaseConfig:
       incoming.supabaseConfig?.url && incoming.supabaseConfig?.key
         ? incoming.supabaseConfig

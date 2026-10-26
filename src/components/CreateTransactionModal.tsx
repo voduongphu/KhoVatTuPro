@@ -36,7 +36,8 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
   onClose,
   onSuccess,
 }) => {
-  const { warehouses, items, createTransaction, currentUser } = useInventory();
+  const { warehouses, materialCategories, items, createTransaction, currentUser } = useInventory();
+  const defaultCat = materialCategories[0];
 
   const [type, setType] = useState<TransactionType>(initialType);
   const [subtype, setSubtype] = useState<string>(
@@ -92,7 +93,9 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
         note: '',
         isNewItem: shouldStartNew,
         type: 'VAT_TU',
-        category: 'Cơ điện & Vật tư công trình',
+        categoryId: defaultCat?.id,
+        categoryCode: defaultCat?.code,
+        category: defaultCat?.name || 'Chưa phân loại',
         location: 'Khu vực tiếp nhận',
         minStock: 5,
         maxStock: 200,
@@ -147,7 +150,9 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
           serialNumber: '',
           isNewItem: true,
           type: 'VAT_TU',
-          category: 'Cơ điện & Vật tư công trình',
+          categoryId: defaultCat?.id,
+          categoryCode: defaultCat?.code,
+          category: defaultCat?.name || 'Chưa phân loại',
           location: 'Kệ A1-01',
           minStock: 5,
           maxStock: 200,
@@ -260,7 +265,9 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
         note: '',
         isNewItem: isNew,
         type: 'VAT_TU',
-        category: 'Cơ điện & Vật tư công trình',
+        categoryId: defaultCat?.id,
+        categoryCode: defaultCat?.code,
+        category: defaultCat?.name || 'Chưa phân loại',
         location: 'Khu vực tiếp nhận',
         minStock: 5,
         maxStock: 200,
@@ -658,15 +665,31 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                                 />
                               </div>
                               <div className="grid grid-cols-2 gap-1.5">
-                                <input
-                                  type="text"
-                                  placeholder="Nhóm ngành (Cáp điện, Cơ khí...)"
-                                  value={line.category || ''}
-                                  onChange={e =>
-                                    handleFieldChange(idx, 'category', e.target.value)
-                                  }
-                                  className="w-full px-2.5 py-1.5 text-[11px] border border-slate-200 rounded-lg outline-none bg-white"
-                                />
+                                <select
+                                  value={line.categoryId || '__UNCATEGORIZED__'}
+                                  onChange={e => {
+                                    const val = e.target.value;
+                                    const matched = materialCategories.find(c => c.id === val);
+                                    setLineItems(prev => {
+                                      const updated = [...prev];
+                                      updated[idx] = {
+                                        ...updated[idx],
+                                        categoryId: matched ? matched.id : '__UNCATEGORIZED__',
+                                        categoryCode: matched?.code,
+                                        category: matched ? matched.name : 'Chưa phân loại',
+                                      };
+                                      return updated;
+                                    });
+                                  }}
+                                  className="w-full px-2.5 py-1.5 text-[11px] border border-slate-200 rounded-lg outline-none bg-white font-medium"
+                                >
+                                  {materialCategories.map(cat => (
+                                    <option key={cat.id} value={cat.id}>
+                                      [{cat.code}] {cat.name}
+                                    </option>
+                                  ))}
+                                  <option value="__UNCATEGORIZED__">-- Chưa phân loại --</option>
+                                </select>
                                 <input
                                   type="text"
                                   placeholder="Vị trí kệ (Kệ A1-02)"

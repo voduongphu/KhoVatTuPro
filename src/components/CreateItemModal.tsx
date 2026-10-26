@@ -19,17 +19,43 @@ export const CreateItemModal: React.FC<CreateItemModalProps> = ({
   onClose,
   onSuccess,
 }) => {
-  const { warehouses, categories, addItem, updateItem } = useInventory();
+  const { warehouses, materialCategories, addMaterialCategory, addItem, updateItem } = useInventory();
 
   const isEdit = Boolean(itemToEdit);
+
+  // Resolve initial categoryId from itemToEdit or first available MaterialCategory
+  const initialMatchedCategory = (() => {
+    if (itemToEdit) {
+      if (itemToEdit.categoryId) {
+        const byId = materialCategories.find(c => c.id === itemToEdit.categoryId);
+        if (byId) return byId.id;
+      }
+      if (itemToEdit.categoryCode) {
+        const byCode = materialCategories.find(
+          c => c.code.trim().toUpperCase() === itemToEdit.categoryCode!.trim().toUpperCase()
+        );
+        if (byCode) return byCode.id;
+      }
+      if (itemToEdit.category && itemToEdit.category !== 'Chưa phân loại') {
+        const byName = materialCategories.find(
+          c => c.name.trim().toLowerCase() === itemToEdit.category.trim().toLowerCase()
+        );
+        if (byName) return byName.id;
+      }
+      if (itemToEdit.category === 'Chưa phân loại') {
+        return '__UNCATEGORIZED__';
+      }
+    }
+    return materialCategories[0]?.id || '__UNCATEGORIZED__';
+  })();
 
   const [code, setCode] = useState(itemToEdit?.code || '');
   const [name, setName] = useState(itemToEdit?.name || '');
   const [type, setType] = useState<ItemType>(itemToEdit?.type || 'VAT_TU');
-  const [category, setCategory] = useState(
-    itemToEdit?.category || categories[0] || 'Cơ điện & Dây cáp'
-  );
-  const [customCategory, setCustomCategory] = useState('');
+  const [selectedCategoryId, setSelectedCategoryId] = useState<string>(initialMatchedCategory);
+  const [isCreatingNewCat, setIsCreatingNewCat] = useState(false);
+  const [newCatCode, setNewCatCode] = useState('');
+  const [newCatName, setNewCatName] = useState('');
   const [unit, setUnit] = useState(itemToEdit?.unit || 'Cái');
   const [warehouseId, setWarehouseId] = useState(
     itemToEdit?.warehouseId || warehouses[0]?.id || ''
@@ -69,14 +95,47 @@ export const CreateItemModal: React.FC<CreateItemModalProps> = ({
       return;
     }
 
-    const finalCategory = customCategory.trim() ? customCategory.trim() : category;
+    let resolvedCategoryId: string | undefined;
+    let resolvedCategoryCode: string | undefined;
+    let resolvedCategoryName = 'Chưa phân loại';
+
+    if (isCreatingNewCat) {
+      if (!newCatCode.trim() || !newCatName.trim()) {
+        setError('Vui lòng nhập đầy đủ Mã danh mục và Tên danh mục mới (hoặc hủy tạo nhanh).');
+        return;
+      }
+      const catRes = addMaterialCategory({
+        code: newCatCode.trim().toUpperCase(),
+        name: newCatName.trim(),
+      });
+      if (!catRes.success || !catRes.category) {
+        setError(catRes.error || 'Không thể tạo danh mục mới.');
+        return;
+      }
+      resolvedCategoryId = catRes.category.id;
+      resolvedCategoryCode = catRes.category.code;
+      resolvedCategoryName = catRes.category.name;
+    } else if (selectedCategoryId && selectedCategoryId !== '__UNCATEGORIZED__') {
+      const foundCat = materialCategories.find(c => c.id === selectedCategoryId);
+      if (foundCat) {
+        resolvedCategoryId = foundCat.id;
+        resolvedCategoryCode = foundCat.code;
+        resolvedCategoryName = foundCat.name;
+      }
+    } else {
+      resolvedCategoryId = '__UNCATEGORIZED__';
+      resolvedCategoryCode = undefined;
+      resolvedCategoryName = 'Chưa phân loại';
+    }
 
     if (isEdit && itemToEdit) {
       updateItem(itemToEdit.id, {
         code: code.trim(),
         name: name.trim(),
         type,
-        category: finalCategory,
+        categoryId: resolvedCategoryId,
+        categoryCode: resolvedCategoryCode,
+        category: resolvedCategoryName,
         unit: unit.trim(),
         warehouseId,
         location: location.trim(),
@@ -95,7 +154,9 @@ export const CreateItemModal: React.FC<CreateItemModalProps> = ({
         code: code.trim(),
         name: name.trim(),
         type,
-        category: finalCategory,
+        categoryId: resolvedCategoryId === '__UNCATEGORIZED__' ? undefined : resolvedCategoryId,
+        categoryCode: resolvedCategoryCode,
+        category: resolvedCategoryName,
         unit: unit.trim(),
         warehouseId,
         location: location.trim(),
@@ -128,7 +189,7 @@ export const CreateItemModal: React.FC<CreateItemModalProps> = ({
                 {isEdit ? 'Chỉnh Sửa Thông Tin Vật Tư / Thiết Bị' : 'Khai Báo Vật Tư / Thiết Bị Mới'}
               </h2>
               <p className="text-xs text-slate-500">
-                Quản lý thuộc tính định mức tồn và thông số thiết bị
+                Quản lý thuộc tính định mức tồn, danh mục vật tư và thông số thiết bị
               </p>
             </div>
           </div>
@@ -211,30 +272,63 @@ export const CreateItemModal: React.FC<CreateItemModalProps> = ({
             />
           </div>
 
-          {/* Row 2: Category & Warehouse */}
+          {/* Row 2: Category & Warehouse Shelf */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
-                Nhóm ngành / Danh mục
-              </label>
-              <select
-                value={category}
-                onChange={e => setCategory(e.target.value)}
-                className="w-full px-3 py-2 text-xs border border-slate-200 rounded-lg bg-white focus:border-indigo-500 outline-none mb-1.5"
-              >
-                {categories.map(c => (
-                  <option key={c} value={c}>
-                    {c}
-                  </option>
-                ))}
-              </select>
-              <input
-                type="text"
-                value={customCategory}
-                onChange={e => setCustomCategory(e.target.value)}
-                placeholder="Hoặc nhập nhóm danh mục mới..."
-                className="w-full px-3 py-1.5 text-[11px] border border-slate-200 rounded outline-none placeholder:text-slate-400"
-              />
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-xs font-semibold text-slate-700">
+                  Danh mục vật tư liên kết *
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setIsCreatingNewCat(prev => !prev)}
+                  className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800"
+                >
+                  {isCreatingNewCat ? 'Chọn danh mục có sẵn' : '+ Tạo nhanh danh mục mới'}
+                </button>
+              </div>
+
+              {!isCreatingNewCat ? (
+                <>
+                  <select
+                    value={selectedCategoryId}
+                    onChange={e => setSelectedCategoryId(e.target.value)}
+                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-lg bg-white focus:border-indigo-500 outline-none font-medium"
+                  >
+                    {materialCategories.map(c => (
+                      <option key={c.id} value={c.id}>
+                        [{c.code}] {c.name}
+                      </option>
+                    ))}
+                    <option value="__UNCATEGORIZED__">-- Chưa phân loại --</option>
+                  </select>
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    Liên kết vật tư với mã danh mục và tên danh mục tương ứng
+                  </p>
+                </>
+              ) : (
+                <div className="p-2.5 bg-indigo-50/50 border border-indigo-200 rounded-lg space-y-2">
+                  <div className="grid grid-cols-3 gap-2">
+                    <input
+                      type="text"
+                      value={newCatCode}
+                      onChange={e => setNewCatCode(e.target.value.toUpperCase())}
+                      placeholder="Mã DM (VD: DM-dien)"
+                      className="col-span-1 px-2.5 py-1.5 text-xs font-mono font-bold border border-slate-300 rounded bg-white outline-none focus:border-indigo-500 uppercase"
+                    />
+                    <input
+                      type="text"
+                      value={newCatName}
+                      onChange={e => setNewCatName(e.target.value)}
+                      placeholder="Tên danh mục mới..."
+                      className="col-span-2 px-2.5 py-1.5 text-xs border border-slate-300 rounded bg-white outline-none focus:border-indigo-500 font-medium"
+                    />
+                  </div>
+                  <p className="text-[10px] text-indigo-700">
+                    Danh mục mới sẽ được lưu vào hệ thống và liên kết ngay với vật tư này.
+                  </p>
+                </div>
+              )}
             </div>
 
             <div>

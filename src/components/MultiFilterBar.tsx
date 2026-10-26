@@ -31,6 +31,7 @@ import {
 export const MultiFilterBar: React.FC = () => {
   const {
     warehouses,
+    materialCategories,
     categories,
     suppliers,
     filterCriteria,
@@ -344,11 +345,14 @@ export const MultiFilterBar: React.FC = () => {
             {/* Danh mục / Nhóm */}
             <div className="bg-white p-3.5 rounded-lg border border-slate-200">
               <label className="block text-xs font-semibold text-slate-800 mb-2">
-                Nhóm ngành / Danh mục vật tư
+                Danh mục vật tư
               </label>
               <div className="space-y-1.5 max-h-32 overflow-y-auto text-xs pr-1">
                 {categories.map(cat => {
                   const checked = filterCriteria.categories.includes(cat);
+                  const matchedCat = materialCategories.find(
+                    c => c.name.trim().toLowerCase() === cat.trim().toLowerCase()
+                  );
                   return (
                     <label
                       key={cat}
@@ -360,7 +364,18 @@ export const MultiFilterBar: React.FC = () => {
                         onChange={() => toggleCategory(cat)}
                         className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 w-3.5 h-3.5"
                       />
-                      <span className="text-slate-700">{cat}</span>
+                      <span className="text-slate-700 truncate" title={cat}>
+                        {matchedCat ? (
+                          <>
+                            <span className="font-mono font-semibold text-indigo-700 mr-1">
+                              [{matchedCat.code}]
+                            </span>
+                            {cat}
+                          </>
+                        ) : (
+                          cat
+                        )}
+                      </span>
                     </label>
                   );
                 })}
@@ -545,20 +560,27 @@ export const MultiFilterBar: React.FC = () => {
             </span>
           ))}
 
-          {filterCriteria.categories.map(cat => (
-            <span
-              key={cat}
-              className="inline-flex items-center gap-1 px-2.5 py-0.5 bg-white border border-slate-200 rounded text-slate-700"
-            >
-              <span>Nhóm: {cat}</span>
-              <button
-                onClick={() => toggleCategory(cat)}
-                className="hover:text-rose-600"
+          {filterCriteria.categories.map(cat => {
+            const matchedCat = materialCategories.find(
+              c => c.name.trim().toLowerCase() === cat.trim().toLowerCase()
+            );
+            return (
+              <span
+                key={cat}
+                className="inline-flex items-center gap-1 px-2.5 py-0.5 bg-white border border-slate-200 rounded text-slate-700"
               >
-                <X className="w-3 h-3" />
-              </button>
-            </span>
-          ))}
+                <span>
+                  Danh mục: {matchedCat ? `[${matchedCat.code}] ${cat}` : cat}
+                </span>
+                <button
+                  onClick={() => toggleCategory(cat)}
+                  className="hover:text-rose-600"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </span>
+            );
+          })}
 
           {filterCriteria.minValue !== undefined && (
             <span className="inline-flex items-center gap-1 px-2.5 py-0.5 bg-white border border-slate-200 rounded text-slate-700">
