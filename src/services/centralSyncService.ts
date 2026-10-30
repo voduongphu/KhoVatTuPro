@@ -35,11 +35,12 @@ export interface SyncResult {
   provider: CloudProvider;
   error?: string;
   isNewer?: boolean;
+  notModified?: boolean;
 }
 
 class CentralSyncService {
   private lastFetchedTimestamp: string | null = null;
-  private currentVersion: number = 1;
+  private currentVersion: number = 0;
   private provider: CloudProvider = 'central-server';
   private eventSource: EventSource | null = null;
   private reconnectTimer: any = null;
@@ -63,9 +64,12 @@ class CentralSyncService {
     return this.provider;
   }
 
+  public getCurrentVersion(): number {
+    return this.currentVersion;
+  }
+
   /**
    * Lắng nghe luồng đồng bộ thời gian thực (SSE) từ máy chủ trung tâm (/api/sync/stream)
-   * giúp mọi trình duyệt của các người dùng khác nhau nhận cập nhật tức thì (<50ms).
    */
   public subscribeToStream(
     onPayload: (payload: CentralDataPayload) => void,
@@ -100,7 +104,7 @@ class CentralSyncService {
             if (parsed && parsed.type === 'SYNC_STATE' && parsed.payload) {
               const payload = parsed.payload as CentralDataPayload;
               this.lastFetchedTimestamp = payload.lastUpdated;
-              this.currentVersion = Math.max(this.currentVersion, Number(payload.version) || 1);
+              this.currentVersion = Math.max(this.currentVersion, Number(payload.version) || 0);
               onPayload(payload);
             }
           } catch {
@@ -144,11 +148,17 @@ class CentralSyncService {
   }
 
   /**
-   * Fetch central state from /api/sync
+   * Fetch central state from /api/sync.
+   * Uses `sinceVersion` when `forceFull` is false so 3-second polling doesn't re-download or re-merge 5,000+ rows when unchanged.
    */
-  public async fetchLatestData(currentLastUpdated?: string): Promise<SyncResult> {
+  public async fetchLatestData(
+    currentLastUpdated?: string,
+    forceFull: boolean = false
+  ): Promise<SyncResult> {
     try {
-      const response = await fetch(`/api/sync?t=${Date.now()}`, {
+      const versionParam =
+        !forceFull && this.currentVersion > 0 ? `&sinceVersion=${this.currentVersion}` : '';
+      const response = await fetch(`/api/sync?t=${Date.now()}${versionParam}`, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
@@ -158,6 +168,16 @@ class CentralSyncService {
 
       if (response.ok) {
         const data = await response.json();
+        if (data && data.notModified) {
+          this.provider = data.provider || 'central-server';
+          return {
+            success: true,
+            provider: this.provider,
+            isNewer: false,
+            notModified: true,
+          };
+        }
+
         if (data && data.success && data.payload) {
           const payload = data.payload as CentralDataPayload;
           const remoteTime = new Date(payload.lastUpdated).getTime();
@@ -168,7 +188,7 @@ class CentralSyncService {
             (Number(payload.version) || 0) > this.currentVersion;
 
           this.lastFetchedTimestamp = payload.lastUpdated;
-          this.currentVersion = Math.max(this.currentVersion, Number(payload.version) || 1);
+          this.currentVersion = Math.max(this.currentVersion, Number(payload.version) || 0);
           this.provider = data.provider || 'central-server';
 
           return {
@@ -202,7 +222,7 @@ class CentralSyncService {
   ): Promise<SyncResult> {
     const fullPayload: CentralDataPayload = {
       ...payload,
-      version: this.currentVersion + 1,
+      version: Math.max(1, this.currentVersion) + 1,
       lastUpdated: new Date().toISOString(),
       source: payload.source || 'web-client',
     };

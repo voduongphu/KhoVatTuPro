@@ -18,7 +18,11 @@ import {
   User,
   Warehouse,
 } from '../types/inventory';
-import { calculateItemWarehouseStocks, getStockStatus } from '../utils/formatters';
+import {
+  calculateAllItemsWarehouseStocks,
+  calculateItemWarehouseStocks,
+  getStockStatus,
+} from '../utils/formatters';
 import { SyncStatus, CloudProvider, CentralDataPayload, centralSyncService } from '../services/centralSyncService';
 import { supabaseRealtimeService, RealtimeConnectionState } from '../services/supabaseRealtimeService';
 import { DeviceInfo, getDeviceId, getDeviceInfo, getDeviceName } from '../utils/deviceHelper';
@@ -104,6 +108,10 @@ interface InventoryContextType {
     id: string,
     reassignToCategoryId?: string
   ) => { success: boolean; error?: string };
+  linkItemsToCategoryBatch: (
+    categoryId: string,
+    selectedItemIds: string[]
+  ) => { linkedCount: number; unlinkedCount: number };
 
   // Filter state
   filterCriteria: MultiFilterCriteria;
@@ -197,13 +205,46 @@ const STORAGE_KEYS = {
 
 const RESET_EPOCH = '2026-10-21T10:00:00.000Z';
 
+interface CategoryLookupCache {
+  byId: Map<string, MaterialCategory>;
+  byCode: Map<string, MaterialCategory>;
+  byName: Map<string, MaterialCategory>;
+  usedCodes: Set<string>;
+}
+
+function buildCategoryLookupCache(categories: MaterialCategory[]): CategoryLookupCache {
+  const byId = new Map<string, MaterialCategory>();
+  const byCode = new Map<string, MaterialCategory>();
+  const byName = new Map<string, MaterialCategory>();
+  const usedCodes = new Set<string>();
+
+  for (let i = 0; i < categories.length; i++) {
+    const c = categories[i];
+    byId.set(c.id, c);
+    byId.set(c.id.toUpperCase(), c);
+    const codeUpper = c.code.trim().toUpperCase();
+    if (codeUpper) {
+      byCode.set(codeUpper, c);
+      byName.set(codeUpper.toLowerCase(), c);
+      usedCodes.add(codeUpper);
+    }
+    const nameLower = c.name.trim().toLowerCase();
+    if (nameLower) {
+      byName.set(nameLower, c);
+    }
+  }
+
+  return { byId, byCode, byName, usedCodes };
+}
+
 function resolveOrEnsureCategoryLink(
   rawCategoryId: string | undefined,
   rawCategoryCode: string | undefined,
   rawCategoryName: string | undefined,
   workingCategories: MaterialCategory[],
   nextReg: DeletedRegistry,
-  nowIso: string
+  nowIso: string,
+  cache?: CategoryLookupCache
 ): { categoryId?: string; categoryCode?: string; category: string } {
   if (
     rawCategoryId === '__UNCATEGORIZED__' ||
@@ -215,9 +256,11 @@ function resolveOrEnsureCategoryLink(
   }
 
   if (rawCategoryId) {
-    const matchedById = workingCategories.find(
-      c => c.id === rawCategoryId || c.id.toUpperCase() === rawCategoryId.toUpperCase()
-    );
+    const matchedById = cache
+      ? cache.byId.get(rawCategoryId) || cache.byId.get(rawCategoryId.toUpperCase())
+      : workingCategories.find(
+          c => c.id === rawCategoryId || c.id.toUpperCase() === rawCategoryId.toUpperCase()
+        );
     if (matchedById) {
       return {
         categoryId: matchedById.id,
@@ -229,7 +272,9 @@ function resolveOrEnsureCategoryLink(
 
   if (rawCategoryCode && rawCategoryCode.trim()) {
     const cleanCode = rawCategoryCode.trim().toUpperCase();
-    const matchedByCode = workingCategories.find(c => c.code.trim().toUpperCase() === cleanCode);
+    const matchedByCode = cache
+      ? cache.byCode.get(cleanCode)
+      : workingCategories.find(c => c.code.trim().toUpperCase() === cleanCode);
     if (matchedByCode) {
       return {
         categoryId: matchedByCode.id,
@@ -242,9 +287,11 @@ function resolveOrEnsureCategoryLink(
   const cleanName = (rawCategoryName || '').trim();
   if (cleanName && cleanName.toLowerCase() !== 'chưa phân loại') {
     const lower = cleanName.toLowerCase();
-    const matchedByName = workingCategories.find(
-      c => c.name.trim().toLowerCase() === lower || c.code.trim().toLowerCase() === lower
-    );
+    const matchedByName = cache
+      ? cache.byName.get(lower)
+      : workingCategories.find(
+          c => c.name.trim().toLowerCase() === lower || c.code.trim().toLowerCase() === lower
+        );
     if (matchedByName) {
       return {
         categoryId: matchedByName.id,
@@ -253,7 +300,9 @@ function resolveOrEnsureCategoryLink(
       };
     }
 
-    const usedCodes = new Set(workingCategories.map(c => c.code.trim().toUpperCase()));
+    const usedCodes = cache
+      ? cache.usedCodes
+      : new Set(workingCategories.map(c => c.code.trim().toUpperCase()));
     const desiredCode = rawCategoryCode?.trim().toUpperCase();
     const finalCode =
       desiredCode && !usedCodes.has(desiredCode)
@@ -273,6 +322,14 @@ function resolveOrEnsureCategoryLink(
       updatedAt: nowIso,
     };
     workingCategories.push(createdCat);
+    if (cache) {
+      cache.byId.set(createdCat.id, createdCat);
+      cache.byId.set(createdCat.id.toUpperCase(), createdCat);
+      cache.byCode.set(finalCode, createdCat);
+      cache.byName.set(finalCode.toLowerCase(), createdCat);
+      cache.byName.set(lower, createdCat);
+      cache.usedCodes.add(finalCode);
+    }
 
     return {
       categoryId: createdCat.id,
@@ -293,20 +350,23 @@ function computeNetMovementsForItem(
   const byWarehouse: Record<string, number> = {};
   let totalNet = 0;
 
-  transactions.forEach(trx => {
-    if (!trx || trx.status === 'DA_HUY') return;
+  for (let t = 0; t < transactions.length; t++) {
+    const trx = transactions[t];
+    if (!trx || trx.status === 'DA_HUY') continue;
     const whId = trx.warehouseId || 'WH-01';
-    (trx.items || []).forEach(line => {
+    const lines = trx.items || [];
+    for (let l = 0; l < lines.length; l++) {
+      const line = lines[l];
       const match =
         (itemId && line.itemId === itemId) ||
         (normCode && line.itemCode && line.itemCode.trim().toUpperCase() === normCode);
-      if (!match) return;
+      if (!match) continue;
       const qty = Number(line.quantity) || 0;
       const delta = trx.type === 'NHAP_KHO' ? qty : -qty;
       byWarehouse[whId] = (byWarehouse[whId] || 0) + delta;
       totalNet += delta;
-    });
-  });
+    }
+  }
 
   return { totalNet, byWarehouse };
 }
@@ -316,15 +376,24 @@ function recalculateAllItemsStocks(
   warehousesList: Warehouse[],
   transactionsList: Transaction[]
 ): InventoryItem[] {
-  return itemsList.map(it => {
-    const stocks = calculateItemWarehouseStocks(it, warehousesList, transactionsList);
-    const total = Object.values(stocks).reduce((sum, q) => sum + (Number(q) || 0), 0);
-    return {
+  if (itemsList.length === 0) return [];
+  const allStocks = calculateAllItemsWarehouseStocks(itemsList, warehousesList, transactionsList);
+  const result = new Array<InventoryItem>(itemsList.length);
+  for (let i = 0; i < itemsList.length; i++) {
+    const it = itemsList[i];
+    const stocks = allStocks[i] || {};
+    let total = 0;
+    const vals = Object.values(stocks);
+    for (let v = 0; v < vals.length; v++) {
+      total += Number(vals[v]) || 0;
+    }
+    result[i] = {
       ...it,
       warehouseStocks: stocks,
       currentStock: Math.max(0, total),
     };
-  });
+  }
+  return result;
 }
 
 function extractLegacyDeletedArrays(reg: DeletedRegistry) {
@@ -561,6 +630,69 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const clearRealtimeMessage = useCallback(() => setLastRealtimeUpdateMessage(null), []);
 
+  const pendingSnapshotRef = useRef<{
+    warehouses: Warehouse[];
+    materialCategories: MaterialCategory[];
+    items: InventoryItem[];
+    transactions: Transaction[];
+    users: User[];
+    deletedRegistry: DeletedRegistry;
+    deletedItemIds: string[];
+    deletedTransactionIds: string[];
+    deletedUserIds: string[];
+    deletedWarehouseIds: string[];
+    deletedCategoryIds: string[];
+  } | null>(null);
+  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushPendingLocalStorage = useCallback(() => {
+    if (persistTimerRef.current) {
+      clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
+    const snapshot = pendingSnapshotRef.current;
+    if (!snapshot) return;
+    pendingSnapshotRef.current = null;
+    try {
+      localStorage.setItem(STORAGE_KEYS.WAREHOUSES, JSON.stringify(snapshot.warehouses));
+      localStorage.setItem(
+        STORAGE_KEYS.CATEGORIES,
+        JSON.stringify(snapshot.materialCategories)
+      );
+      localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(snapshot.items));
+      localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(snapshot.transactions));
+      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(snapshot.users));
+      localStorage.setItem(
+        STORAGE_KEYS.DELETED_REGISTRY,
+        JSON.stringify(snapshot.deletedRegistry)
+      );
+      localStorage.setItem(STORAGE_KEYS.DELETED_ITEMS, JSON.stringify(snapshot.deletedItemIds));
+      localStorage.setItem(
+        STORAGE_KEYS.DELETED_TRANSACTIONS,
+        JSON.stringify(snapshot.deletedTransactionIds)
+      );
+      localStorage.setItem(STORAGE_KEYS.DELETED_USERS, JSON.stringify(snapshot.deletedUserIds));
+      localStorage.setItem(
+        STORAGE_KEYS.DELETED_WAREHOUSES,
+        JSON.stringify(snapshot.deletedWarehouseIds)
+      );
+      localStorage.setItem(
+        STORAGE_KEYS.DELETED_CATEGORIES,
+        JSON.stringify(snapshot.deletedCategoryIds)
+      );
+    } catch {
+      // ignore quota errors
+    }
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener('beforeunload', flushPendingLocalStorage);
+    return () => {
+      window.removeEventListener('beforeunload', flushPendingLocalStorage);
+      flushPendingLocalStorage();
+    };
+  }, [flushPendingLocalStorage]);
+
   const persistSnapshotToLocalStorage = useCallback(
     (snapshot: {
       warehouses: Warehouse[];
@@ -575,38 +707,15 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       deletedWarehouseIds: string[];
       deletedCategoryIds: string[];
     }) => {
-      try {
-        localStorage.setItem(STORAGE_KEYS.WAREHOUSES, JSON.stringify(snapshot.warehouses));
-        localStorage.setItem(
-          STORAGE_KEYS.CATEGORIES,
-          JSON.stringify(snapshot.materialCategories)
-        );
-        localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(snapshot.items));
-        localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(snapshot.transactions));
-        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(snapshot.users));
-        localStorage.setItem(
-          STORAGE_KEYS.DELETED_REGISTRY,
-          JSON.stringify(snapshot.deletedRegistry)
-        );
-        localStorage.setItem(STORAGE_KEYS.DELETED_ITEMS, JSON.stringify(snapshot.deletedItemIds));
-        localStorage.setItem(
-          STORAGE_KEYS.DELETED_TRANSACTIONS,
-          JSON.stringify(snapshot.deletedTransactionIds)
-        );
-        localStorage.setItem(STORAGE_KEYS.DELETED_USERS, JSON.stringify(snapshot.deletedUserIds));
-        localStorage.setItem(
-          STORAGE_KEYS.DELETED_WAREHOUSES,
-          JSON.stringify(snapshot.deletedWarehouseIds)
-        );
-        localStorage.setItem(
-          STORAGE_KEYS.DELETED_CATEGORIES,
-          JSON.stringify(snapshot.deletedCategoryIds)
-        );
-      } catch {
-        // ignore quota errors
+      pendingSnapshotRef.current = snapshot;
+      if (persistTimerRef.current) {
+        clearTimeout(persistTimerRef.current);
       }
+      persistTimerRef.current = setTimeout(() => {
+        flushPendingLocalStorage();
+      }, 350);
     },
-    []
+    [flushPendingLocalStorage]
   );
 
   /**
@@ -970,16 +1079,22 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return () => unsubscribe();
   }, [currentUser]);
 
-  // Trigger manual or background fetch from BOTH central server AND Supabase (bridging stores)
+  const lastServerTimestampRef = useRef<string>('');
+  lastServerTimestampRef.current = lastServerTimestamp;
+
+  // Explicit manual sync (forces full payload download & shows syncing indicator)
   const triggerManualSync = useCallback(async () => {
     setSyncStatus('syncing');
     try {
       let anySuccess = false;
 
-      const centralRes = await centralSyncService.fetchLatestData(lastServerTimestamp);
+      const centralRes = await centralSyncService.fetchLatestData(
+        lastServerTimestampRef.current,
+        true
+      );
       if (centralRes.success) {
         anySuccess = true;
-        setSyncProvider(centralRes.provider);
+        setSyncProvider(prev => (prev === centralRes.provider ? prev : centralRes.provider));
         if (centralRes.payload) {
           applyRemotePayloadAdditive(centralRes.payload);
         }
@@ -1003,28 +1118,67 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch {
       setSyncStatus('offline');
     }
-  }, [lastServerTimestamp, applyRemotePayloadAdditive]);
+  }, [applyRemotePayloadAdditive]);
+
+  // Silent background polling (uses sinceVersion so unchanged 5,000+ row payloads are neither downloaded nor re-rendered)
+  const pollBackgroundSync = useCallback(async () => {
+    try {
+      let anySuccess = false;
+
+      const centralRes = await centralSyncService.fetchLatestData(
+        lastServerTimestampRef.current,
+        false
+      );
+      if (centralRes.success) {
+        anySuccess = true;
+        setSyncProvider(prev => (prev === centralRes.provider ? prev : centralRes.provider));
+        if (!centralRes.notModified && centralRes.payload) {
+          applyRemotePayloadAdditive(centralRes.payload);
+        }
+      }
+
+      if (supabaseRealtimeService.isConfigured()) {
+        const directPayload = await supabaseRealtimeService.fetchLatest();
+        if (directPayload) {
+          anySuccess = true;
+          if (directPayload.lastUpdated !== lastServerTimestampRef.current) {
+            applyRemotePayloadAdditive(directPayload);
+          }
+          setSyncProvider(prev => (prev === 'supabase' ? prev : 'supabase'));
+        }
+      }
+
+      if (anySuccess) {
+        setSyncStatus(prev => (prev === 'synced' ? prev : 'synced'));
+      } else {
+        const nextErr: SyncStatus = centralRes.error ? 'error' : 'offline';
+        setSyncStatus(prev => (prev === nextErr ? prev : nextErr));
+      }
+    } catch {
+      setSyncStatus(prev => (prev === 'offline' ? prev : 'offline'));
+    }
+  }, [applyRemotePayloadAdditive]);
 
   // Automatic 3-second polling as resilient fallback alongside SSE + WebSocket
   useEffect(() => {
     if (!autoSyncEnabled) return;
 
-    triggerManualSync();
+    pollBackgroundSync();
 
     const intervalId = setInterval(() => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
         return;
       }
-      triggerManualSync();
+      pollBackgroundSync();
     }, 3000);
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        triggerManualSync();
+        pollBackgroundSync();
       }
     };
     const handleWindowFocus = () => {
-      triggerManualSync();
+      pollBackgroundSync();
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -1035,48 +1189,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('focus', handleWindowFocus);
     };
-  }, [autoSyncEnabled, triggerManualSync]);
-
-  // Persist local state to localStorage ONLY (never blind-push stale state on mount!)
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.ITEMS, JSON.stringify(items));
-    } catch {
-      // ignore
-    }
-  }, [items]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(transactions));
-    } catch {
-      // ignore
-    }
-  }, [transactions]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
-    } catch {
-      // ignore
-    }
-  }, [users]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.WAREHOUSES, JSON.stringify(warehouses));
-    } catch {
-      // ignore
-    }
-  }, [warehouses]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.CATEGORIES, JSON.stringify(materialCategories));
-    } catch {
-      // ignore
-    }
-  }, [materialCategories]);
+  }, [autoSyncEnabled, pollBackgroundSync]);
 
   // Simulate Google AI generating new inventory numbers & broadcast instantly
   const simulateGoogleAIUpdate = useCallback(async (): Promise<{ success: boolean; message: string }> => {
@@ -1450,7 +1563,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const nowIso = nextMonotonicIso(
       cur.deletedRegistry[makeTombstoneKey('USER', trimmedUsername)],
       cur.deletedRegistry[makeTombstoneKey('USER', 'usr-admin')],
-      ...Object.values(cur.deletedRegistry)
+      Object.values(cur.deletedRegistry)
     );
     const newUser: User = {
       ...userData,
@@ -1578,8 +1691,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const nowIso = nextMonotonicIso(
       targetUser.updatedAt,
       targetUser.lastActiveAt,
-      ...cur.users.flatMap(u => [u.updatedAt, u.lastActiveAt]),
-      ...Object.values(cur.deletedRegistry)
+      cur.users.map(u => u.updatedAt),
+      cur.users.map(u => u.lastActiveAt),
+      Object.values(cur.deletedRegistry)
     );
     const nextReg = { ...cur.deletedRegistry };
     nextReg[makeTombstoneKey('USER', id)] = nowIso;
@@ -1800,7 +1914,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const nowIso = nextMonotonicIso(
       cur.deletedRegistry[makeTombstoneKey('CAT', trimmedCode)],
       autoSlug ? cur.deletedRegistry[makeTombstoneKey('CAT', `CAT-AUTO-${autoSlug}`)] : undefined,
-      ...cur.materialCategories.map(c => c.updatedAt)
+      cur.materialCategories.map(c => c.updatedAt)
     );
 
     const newCategory: MaterialCategory = {
@@ -1905,8 +2019,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     const nowIso = nextMonotonicIso(
       targetCat.updatedAt,
-      ...cur.items.flatMap(i => [i.updatedAt, i.metadataUpdatedAt]),
-      ...Object.values(cur.deletedRegistry)
+      cur.items.map(i => i.updatedAt),
+      cur.items.map(i => i.metadataUpdatedAt),
+      Object.values(cur.deletedRegistry)
     );
 
     const updatedCategory: MaterialCategory = {
@@ -1993,8 +2108,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     const nowIso = nextMonotonicIso(
       targetCat.updatedAt,
-      ...cur.items.flatMap(i => [i.updatedAt, i.metadataUpdatedAt]),
-      ...Object.values(cur.deletedRegistry)
+      cur.items.map(i => i.updatedAt),
+      cur.items.map(i => i.metadataUpdatedAt),
+      Object.values(cur.deletedRegistry)
     );
 
     const nextReg = { ...cur.deletedRegistry };
@@ -2069,6 +2185,80 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     );
 
     return { success: true };
+  };
+
+  const linkItemsToCategoryBatch = (
+    categoryId: string,
+    selectedItemIds: string[]
+  ): { linkedCount: number; unlinkedCount: number } => {
+    const cur = stateRef.current;
+    const targetCat = cur.materialCategories.find(c => c.id === categoryId);
+    if (!targetCat) {
+      return { linkedCount: 0, unlinkedCount: 0 };
+    }
+
+    const selectedSet = new Set(selectedItemIds);
+    const catCodeUpper = targetCat.code.trim().toUpperCase();
+    const catNameLower = targetCat.name.trim().toLowerCase();
+    const nowIso = nextMonotonicIso(
+      targetCat.updatedAt,
+      cur.items.map(i => i.updatedAt),
+      cur.items.map(i => i.metadataUpdatedAt),
+      Object.values(cur.deletedRegistry)
+    );
+
+    let linkedCount = 0;
+    let unlinkedCount = 0;
+
+    const updatedItems = cur.items.map(item => {
+      const wasLinked =
+        item.categoryId === targetCat.id ||
+        (!item.categoryId &&
+          item.categoryCode &&
+          item.categoryCode.trim().toUpperCase() === catCodeUpper) ||
+        (!item.categoryId && (item.category || '').trim().toLowerCase() === catNameLower);
+      const shouldBeLinked = selectedSet.has(item.id);
+
+      if (!wasLinked && shouldBeLinked) {
+        linkedCount += 1;
+        return {
+          ...item,
+          categoryId: targetCat.id,
+          categoryCode: targetCat.code,
+          category: targetCat.name,
+          metadataUpdatedAt: nowIso,
+          updatedAt: nowIso,
+        };
+      }
+      if (wasLinked && !shouldBeLinked) {
+        unlinkedCount += 1;
+        return {
+          ...item,
+          categoryId: undefined,
+          categoryCode: undefined,
+          category: 'Chưa phân loại',
+          metadataUpdatedAt: nowIso,
+          updatedAt: nowIso,
+        };
+      }
+      return item;
+    });
+
+    if (linkedCount > 0 || unlinkedCount > 0) {
+      setItems(updatedItems);
+      pushCloudSyncImmediately(
+        updatedItems,
+        cur.transactions,
+        cur.warehouses,
+        cur.users,
+        cur.deletedRegistry,
+        'link-category-items-batch',
+        undefined,
+        cur.materialCategories
+      );
+    }
+
+    return { linkedCount, unlinkedCount };
   };
 
   // Derived lists
@@ -2392,7 +2582,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const nowIso = nextMonotonicIso(
       targetExisting?.updatedAt,
       targetExisting?.metadataUpdatedAt,
-      ...cur.transactions.map(t => t.updatedAt)
+      cur.transactions.map(t => t.updatedAt)
     );
 
     const workingCategories = [...cur.materialCategories];
@@ -2524,7 +2714,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const nowIso = nextMonotonicIso(
       targetItem?.updatedAt,
       targetItem?.metadataUpdatedAt,
-      ...cur.transactions.map(t => t.updatedAt)
+      cur.transactions.map(t => t.updatedAt)
     );
 
     const nextReg = { ...cur.deletedRegistry };
@@ -2554,8 +2744,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const targetItems = cur.items.filter(i => idSet.has(i.id));
     const newItems = cur.items.filter(i => !idSet.has(i.id));
     const nowIso = nextMonotonicIso(
-      ...targetItems.flatMap(i => [i.updatedAt, i.metadataUpdatedAt]),
-      ...cur.transactions.map(t => t.updatedAt)
+      targetItems.map(i => i.updatedAt),
+      targetItems.map(i => i.metadataUpdatedAt),
+      cur.transactions.map(t => t.updatedAt)
     );
 
     const nextReg = { ...cur.deletedRegistry };
@@ -2584,7 +2775,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return { success: true, count: ids.length };
   };
 
-  // Batch Import Items / Materials Catalog (Fixed pure state computation + immediate cloud broadcast!)
+  // Batch Import Items / Materials Catalog — O(N + M + T_lines) indexed implementation for 5,000-50,000+ rows
   const importItemsBatch = (
     itemsList: Omit<InventoryItem, 'id' | 'updatedAt'>[],
     updateExisting: boolean = true
@@ -2595,14 +2786,72 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const errors: string[] = [];
 
     const workingCategories = [...cur.materialCategories];
+    const catCache = buildCategoryLookupCache(workingCategories);
     const workingItems = [...cur.items];
-    let workingTransactions = [...cur.transactions];
+    let workingTransactions = cur.transactions;
     const nextReg = { ...cur.deletedRegistry };
     const nowIso = nextMonotonicIso(
-      ...cur.items.flatMap(i => [i.updatedAt, i.metadataUpdatedAt]),
-      ...cur.transactions.map(t => t.updatedAt),
-      ...Object.values(cur.deletedRegistry)
+      cur.items.map(i => i.updatedAt),
+      cur.items.map(i => i.metadataUpdatedAt),
+      cur.transactions.map(t => t.updatedAt),
+      Object.values(cur.deletedRegistry)
     );
+
+    // Pre-compute warehouse stocks for all existing items in ONE O(N + T_lines) pass
+    const precomputedWhStocks = calculateAllItemsWarehouseStocks(
+      workingItems,
+      cur.warehouses,
+      workingTransactions
+    );
+
+    // Pre-compute net movements by itemId and uppercase itemCode in ONE O(T_lines) pass
+    const netByItemId = new Map<string, Record<string, number>>();
+    const netByItemCode = new Map<string, Record<string, number>>();
+    for (let t = 0; t < workingTransactions.length; t++) {
+      const trx = workingTransactions[t];
+      if (!trx || trx.status === 'DA_HUY') continue;
+      const whId = trx.warehouseId || 'WH-01';
+      const isReceipt = trx.type === 'NHAP_KHO';
+      const lines = trx.items || [];
+      for (let l = 0; l < lines.length; l++) {
+        const line = lines[l];
+        if (!line) continue;
+        const qty = Number(line.quantity) || 0;
+        const delta = isReceipt ? qty : -qty;
+        if (line.itemId) {
+          let mapObj = netByItemId.get(line.itemId);
+          if (!mapObj) {
+            mapObj = {};
+            netByItemId.set(line.itemId, mapObj);
+          }
+          mapObj[whId] = (mapObj[whId] || 0) + delta;
+        }
+        const normLineCode = line.itemCode ? line.itemCode.trim().toUpperCase() : '';
+        if (normLineCode) {
+          let mapObj = netByItemCode.get(normLineCode);
+          if (!mapObj) {
+            mapObj = {};
+            netByItemCode.set(normLineCode, mapObj);
+          }
+          mapObj[whId] = (mapObj[whId] || 0) + delta;
+        }
+      }
+    }
+
+    // Index existing items by uppercase SKU code in O(N)
+    const existingCodeToIdx = new Map<string, number>();
+    for (let i = 0; i < workingItems.length; i++) {
+      const c = workingItems[i].code.trim().toUpperCase();
+      if (c && !existingCodeToIdx.has(c)) {
+        existingCodeToIdx.set(c, i);
+      }
+    }
+
+    const addedItems: InventoryItem[] = [];
+    const addedCodeToIdx = new Map<string, number>();
+    const renamedById = new Map<string, { name?: string; unit?: string }>();
+    const renamedByCode = new Map<string, { name?: string; unit?: string }>();
+    const batchTs = Date.now();
 
     for (let i = 0; i < itemsList.length; i++) {
       const row = itemsList[i];
@@ -2613,11 +2862,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
       const cleanCode = row.code.trim().toUpperCase();
       const targetWhId = row.warehouseId || cur.warehouses[0]?.id || 'WH-01';
-      const existingIdx = workingItems.findIndex(
-        it => it.code.trim().toUpperCase() === cleanCode
-      );
+      const existingIdx = existingCodeToIdx.get(cleanCode);
 
-      // Clear any previous deletion tombstones for this SKU so imported items always appear across all users
       delete nextReg[makeTombstoneKey('ITEM', cleanCode)];
 
       const catLink = resolveOrEnsureCategoryLink(
@@ -2626,10 +2872,11 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         row.category,
         workingCategories,
         nextReg,
-        nowIso
+        nowIso,
+        catCache
       );
 
-      if (existingIdx !== -1) {
+      if (existingIdx !== undefined) {
         if (updateExisting) {
           const oldItem = workingItems[existingIdx];
           delete nextReg[makeTombstoneKey('ITEM', oldItem.id)];
@@ -2640,31 +2887,30 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           let nextOpeningStock = oldItem.openingStock;
 
           if (row.currentStock !== undefined && row.currentStock !== oldItem.currentStock) {
-            const currentWhStocks = calculateItemWarehouseStocks(
-              oldItem,
-              cur.warehouses,
-              workingTransactions
-            );
-            const otherWhTotal = Object.entries(currentWhStocks).reduce(
-              (sum, [wId, q]) => (wId === targetWhId ? sum : sum + (Number(q) || 0)),
-              0
-            );
+            const currentWhStocks = precomputedWhStocks[existingIdx] || {};
+            let otherWhTotal = 0;
+            const entries = Object.entries(currentWhStocks);
+            for (let e = 0; e < entries.length; e++) {
+              const [wId, q] = entries[e];
+              if (wId !== targetWhId) otherWhTotal += Number(q) || 0;
+            }
             const desiredInTargetWh = Math.max(0, Number(row.currentStock) - otherWhTotal);
-            const net = computeNetMovementsForItem(oldItem.id, cleanCode, workingTransactions);
+            const netByWh = netByItemId.get(oldItem.id) || netByItemCode.get(cleanCode) || {};
 
             nextOpeningWh = {};
-            cur.warehouses.forEach(w => {
-              if (w.id === targetWhId) {
-                nextOpeningWh![w.id] = desiredInTargetWh - (net.byWarehouse[w.id] || 0);
+            for (let w = 0; w < cur.warehouses.length; w++) {
+              const whId = cur.warehouses[w].id;
+              if (whId === targetWhId) {
+                nextOpeningWh[whId] = desiredInTargetWh - (netByWh[whId] || 0);
               } else if (
                 oldItem.openingWarehouseStocks &&
-                oldItem.openingWarehouseStocks[w.id] !== undefined
+                oldItem.openingWarehouseStocks[whId] !== undefined
               ) {
-                nextOpeningWh![w.id] = oldItem.openingWarehouseStocks[w.id];
+                nextOpeningWh[whId] = oldItem.openingWarehouseStocks[whId];
               } else {
-                nextOpeningWh![w.id] = (currentWhStocks[w.id] || 0) - (net.byWarehouse[w.id] || 0);
+                nextOpeningWh[whId] = (currentWhStocks[whId] || 0) - (netByWh[whId] || 0);
               }
-            });
+            }
             nextOpeningStock = Object.values(nextOpeningWh).reduce((s, v) => s + v, 0);
           }
 
@@ -2681,54 +2927,90 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           };
           updatedCount++;
 
-          if (row.name || row.unit) {
-            workingTransactions = workingTransactions.map(trx => {
-              let hasMod = false;
-              const updatedLines = trx.items.map(line => {
-                const isMatch =
-                  line.itemId === oldItem.id ||
-                  line.itemCode.trim().toUpperCase() === cleanCode;
-                if (isMatch) {
-                  hasMod = true;
-                  return {
-                    ...line,
-                    ...(row.name ? { itemName: row.name } : {}),
-                    ...(row.unit ? { unit: row.unit } : {}),
-                  };
-                }
-                return line;
-              });
-              return hasMod ? { ...trx, items: updatedLines, updatedAt: nowIso } : trx;
-            });
+          if (
+            (row.name && row.name !== oldItem.name) ||
+            (row.unit && row.unit !== oldItem.unit)
+          ) {
+            const metaPatch = {
+              ...(row.name ? { itemName: row.name } : {}),
+              ...(row.unit ? { unit: row.unit } : {}),
+            };
+            renamedById.set(oldItem.id, { name: metaPatch.itemName, unit: metaPatch.unit });
+            renamedByCode.set(cleanCode, { name: metaPatch.itemName, unit: metaPatch.unit });
           }
         }
       } else {
-        const newId = `ITEM-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
-        delete nextReg[makeTombstoneKey('ITEM', newId)];
-        const net = computeNetMovementsForItem(newId, cleanCode, workingTransactions);
+        const dupAddedIdx = addedCodeToIdx.get(cleanCode);
+        const netByWh = netByItemCode.get(cleanCode) || {};
         const desiredStock = Math.max(0, Number(row.currentStock) || 0);
-        const openingForWh = desiredStock - (net.byWarehouse[targetWhId] || 0);
+        const openingForWh = desiredStock - (netByWh[targetWhId] || 0);
 
-        const newItem: InventoryItem = {
-          ...row,
-          ...catLink,
-          id: newId,
-          code: cleanCode,
-          warehouseId: targetWhId,
-          openingStock: openingForWh,
-          openingWarehouseStocks: { [targetWhId]: openingForWh },
-          currentStock: desiredStock,
-          updatedAt: nowIso,
-          metadataUpdatedAt: nowIso,
-        };
-        workingItems.unshift(newItem);
-        addedCount++;
+        if (dupAddedIdx !== undefined) {
+          if (updateExisting) {
+            const prevAdded = addedItems[dupAddedIdx];
+            addedItems[dupAddedIdx] = {
+              ...prevAdded,
+              ...row,
+              ...catLink,
+              code: cleanCode,
+              warehouseId: targetWhId,
+              openingStock: openingForWh,
+              openingWarehouseStocks: { [targetWhId]: openingForWh },
+              currentStock: desiredStock,
+              updatedAt: nowIso,
+              metadataUpdatedAt: nowIso,
+            };
+          }
+        } else {
+          const newId = `ITEM-${batchTs}-${i}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
+          delete nextReg[makeTombstoneKey('ITEM', newId)];
+
+          const newItem: InventoryItem = {
+            ...row,
+            ...catLink,
+            id: newId,
+            code: cleanCode,
+            warehouseId: targetWhId,
+            openingStock: openingForWh,
+            openingWarehouseStocks: { [targetWhId]: openingForWh },
+            currentStock: desiredStock,
+            updatedAt: nowIso,
+            metadataUpdatedAt: nowIso,
+          };
+          addedCodeToIdx.set(cleanCode, addedItems.length);
+          addedItems.push(newItem);
+          addedCount++;
+        }
       }
     }
 
     if (addedCount > 0 || updatedCount > 0) {
+      // Single O(T_lines) pass to sync renamed itemName / unit into transaction lines if any changed
+      if (renamedById.size > 0 || renamedByCode.size > 0) {
+        workingTransactions = workingTransactions.map(trx => {
+          let hasMod = false;
+          const updatedLines = trx.items.map(line => {
+            const patch =
+              (line.itemId ? renamedById.get(line.itemId) : undefined) ||
+              (line.itemCode ? renamedByCode.get(line.itemCode.trim().toUpperCase()) : undefined);
+            if (patch) {
+              hasMod = true;
+              return {
+                ...line,
+                ...(patch.name ? { itemName: patch.name } : {}),
+                ...(patch.unit ? { unit: patch.unit } : {}),
+              };
+            }
+            return line;
+          });
+          return hasMod ? { ...trx, items: updatedLines, updatedAt: nowIso } : trx;
+        });
+      }
+
+      const combinedItems =
+        addedItems.length > 0 ? [...addedItems, ...workingItems] : workingItems;
       const finalItems = recalculateAllItemsStocks(
-        workingItems,
+        combinedItems,
         cur.warehouses,
         workingTransactions
       );
@@ -2736,7 +3018,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
       setMaterialCategories(workingCategories);
       setItems(finalItems);
-      setTransactions(workingTransactions);
+      if (workingTransactions !== cur.transactions) {
+        setTransactions(workingTransactions);
+      }
       setDeletedRegistry(nextReg);
       setDeletedItemIds(legacy.deletedItemIds);
       setDeletedCategoryIds(legacy.deletedCategoryIds);
@@ -2813,9 +3097,10 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
 
     const nowIso = nextMonotonicIso(
-      ...cur.items.flatMap(i => [i.updatedAt, i.metadataUpdatedAt]),
-      ...cur.transactions.map(t => t.updatedAt),
-      ...Object.values(cur.deletedRegistry)
+      cur.items.map(i => i.updatedAt),
+      cur.items.map(i => i.metadataUpdatedAt),
+      cur.transactions.map(t => t.updatedAt),
+      Object.values(cur.deletedRegistry)
     );
     const workingCategories = [...cur.materialCategories];
     let workingItems = [...cur.items];
@@ -2966,8 +3251,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     const nowIso = nextMonotonicIso(
       existing.updatedAt,
-      ...cur.items.flatMap(i => [i.updatedAt, i.metadataUpdatedAt]),
-      ...Object.values(cur.deletedRegistry)
+      cur.items.map(i => i.updatedAt),
+      cur.items.map(i => i.metadataUpdatedAt),
+      Object.values(cur.deletedRegistry)
     );
     const targetWarehouseId = updates.warehouseId || existing.warehouseId;
     const targetType = updates.type || existing.type;
@@ -3143,7 +3429,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     const nowIso = nextMonotonicIso(
       targetTrx.updatedAt,
-      ...cur.items.flatMap(i => [i.updatedAt, i.metadataUpdatedAt])
+      cur.items.map(i => i.updatedAt),
+      cur.items.map(i => i.metadataUpdatedAt)
     );
     const newTransactionsList = cur.transactions.filter(t => t.id !== id);
 
@@ -3183,43 +3470,100 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return { success: true };
   };
 
-  // Batch Import Transactions
+  // Batch Import Transactions — O(N + M + T_lines) indexed implementation for 5,000+ vouchers/rows
   const importTransactionsBatch = (
     importedList: (Omit<Transaction, 'id' | 'code'> & { code?: string })[]
   ): { success: boolean; importedCount: number; errors: string[] } => {
     const cur = stateRef.current;
     const errors: string[] = [];
     const workingCategories = [...cur.materialCategories];
-    let workingItems = [...cur.items];
+    const catCache = buildCategoryLookupCache(workingCategories);
+
+    // Compute baseline stocks ONCE before processing the batch
+    const baseItems = recalculateAllItemsStocks([...cur.items], cur.warehouses, cur.transactions);
+    const originalLen = baseItems.length;
+    const workingItems: InventoryItem[] = [...baseItems];
+    const liveStockByIdx: number[] = workingItems.map(it => Number(it.currentStock) || 0);
+
+    const idToIdx = new Map<string, number>();
+    const codeToIdx = new Map<string, number>();
+    for (let i = 0; i < workingItems.length; i++) {
+      const it = workingItems[i];
+      if (it.id) idToIdx.set(it.id, i);
+      const normCode = (it.code || '').trim().toUpperCase();
+      if (normCode && !codeToIdx.has(normCode)) {
+        codeToIdx.set(normCode, i);
+      }
+    }
+
+    const findItemIdx = (itemId?: string, itemCode?: string): number => {
+      if (itemId) {
+        const byId = idToIdx.get(itemId);
+        if (byId !== undefined) return byId;
+      }
+      if (itemCode) {
+        const byCode = codeToIdx.get(itemCode.trim().toUpperCase());
+        if (byCode !== undefined) return byCode;
+      }
+      return -1;
+    };
+
+    // O(1) sequence counters for PN / PX codes
+    const year = new Date().getFullYear();
+    const pnPattern = new RegExp(`^PN-${year}-(\\d+)$`, 'i');
+    const pxPattern = new RegExp(`^PX-${year}-(\\d+)$`, 'i');
+    let nextPnSeq = 0;
+    let nextPxSeq = 0;
+    const usedCodes = new Set<string>();
+    for (let t = 0; t < cur.transactions.length; t++) {
+      const c = (cur.transactions[t].code || '').trim().toUpperCase();
+      if (!c) continue;
+      usedCodes.add(c);
+      const mPn = c.match(pnPattern);
+      if (mPn) {
+        const n = parseInt(mPn[1], 10);
+        if (n > nextPnSeq) nextPnSeq = n;
+      } else {
+        const mPx = c.match(pxPattern);
+        if (mPx) {
+          const n = parseInt(mPx[1], 10);
+          if (n > nextPxSeq) nextPxSeq = n;
+        }
+      }
+    }
+
     const newTransactionsToAdd: Transaction[] = [];
     const nextReg = { ...cur.deletedRegistry };
     const nowIso = nextMonotonicIso(
-      ...cur.transactions.map(t => t.updatedAt),
-      ...cur.items.flatMap(i => [i.updatedAt, i.metadataUpdatedAt]),
-      ...Object.values(cur.deletedRegistry)
+      cur.transactions.map(t => t.updatedAt),
+      cur.items.map(i => i.updatedAt),
+      cur.items.map(i => i.metadataUpdatedAt),
+      Object.values(cur.deletedRegistry)
     );
+    const batchTs = Date.now();
 
     for (let i = 0; i < importedList.length; i++) {
       const data = importedList[i];
-      const currentCombinedTrx = [...newTransactionsToAdd, ...cur.transactions];
-      workingItems = recalculateAllItemsStocks(workingItems, cur.warehouses, currentCombinedTrx);
 
       if (data.type === 'XUAT_KHO') {
         let stockError = '';
-        for (const line of data.items) {
-          const currentItem = workingItems.find(
-            it =>
-              (line.itemId && it.id === line.itemId) ||
-              (line.itemCode && it.code && it.code.trim().toUpperCase() === line.itemCode.trim().toUpperCase())
-          );
-          if (!currentItem) {
+        // Track cumulative demand across lines within this single voucher too
+        const voucherDemandByIdx = new Map<number, number>();
+        for (let l = 0; l < data.items.length; l++) {
+          const line = data.items[l];
+          const idx = findItemIdx(line.itemId, line.itemCode);
+          if (idx === -1) {
             stockError = `Phiếu ${i + 1} (${data.partnerName}): Không tìm thấy vật tư mã "${line.itemCode || line.itemName}".`;
             break;
           }
-          if (currentItem.currentStock < line.quantity) {
-            stockError = `Phiếu ${i + 1} (${data.partnerName}): Số lượng xuất của "${currentItem.name}" (${line.quantity} ${currentItem.unit}) vượt quá tồn kho khả dụng (${currentItem.currentStock} ${currentItem.unit})!`;
+          const currentItem = workingItems[idx];
+          const avail = liveStockByIdx[idx];
+          const demanded = (voucherDemandByIdx.get(idx) || 0) + (Number(line.quantity) || 0);
+          if (avail < demanded) {
+            stockError = `Phiếu ${i + 1} (${data.partnerName}): Số lượng xuất của "${currentItem.name}" (${demanded} ${currentItem.unit}) vượt quá tồn kho khả dụng (${avail} ${currentItem.unit})!`;
             break;
           }
+          voucherDemandByIdx.set(idx, demanded);
         }
         if (stockError) {
           errors.push(stockError);
@@ -3229,17 +3573,25 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
       let finalCode = data.code && data.code.trim() ? data.code.trim().toUpperCase() : '';
       if (!finalCode) {
-        finalCode = generateUniqueTransactionCode(data.type, currentCombinedTrx);
+        if (data.type === 'NHAP_KHO') {
+          do {
+            nextPnSeq += 1;
+            finalCode = `PN-${year}-${String(nextPnSeq).padStart(4, '0')}`;
+          } while (usedCodes.has(finalCode));
+        } else {
+          do {
+            nextPxSeq += 1;
+            finalCode = `PX-${year}-${String(nextPxSeq).padStart(4, '0')}`;
+          } while (usedCodes.has(finalCode));
+        }
       }
+      usedCodes.add(finalCode);
 
       const resolvedLines: TransactionLineItem[] = [];
-      for (const line of data.items) {
-        const lineCopy: TransactionLineItem = { ...line };
-        const idx = workingItems.findIndex(
-          it =>
-            (lineCopy.itemId && it.id === lineCopy.itemId) ||
-            (lineCopy.itemCode && it.code && it.code.trim().toUpperCase() === lineCopy.itemCode.trim().toUpperCase())
-        );
+      for (let l = 0; l < data.items.length; l++) {
+        const lineCopy: TransactionLineItem = { ...data.items[l] };
+        const qty = Number(lineCopy.quantity) || 0;
+        const idx = findItemIdx(lineCopy.itemId, lineCopy.itemCode);
 
         if (idx !== -1) {
           const item = workingItems[idx];
@@ -3254,6 +3606,11 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               (data.type === 'NHAP_KHO' && data.partnerName ? data.partnerName : item.supplierDefault),
             updatedAt: nowIso,
           };
+          liveStockByIdx[idx] =
+            data.type === 'NHAP_KHO'
+              ? liveStockByIdx[idx] + qty
+              : Math.max(0, liveStockByIdx[idx] - qty);
+
           lineCopy.itemId = item.id;
           lineCopy.itemCode = item.code;
           lineCopy.itemName = item.name;
@@ -3262,8 +3619,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           lineCopy.categoryCode = item.categoryCode;
           lineCopy.category = item.category;
         } else if (data.type === 'NHAP_KHO') {
-          const newItemId = `ITEM-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
-          const cleanCode = (lineCopy.itemCode || `VT-${Date.now().toString().slice(-4)}`)
+          const newItemId = `ITEM-${batchTs}-${i}-${l}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+          const cleanCode = (lineCopy.itemCode || `VT-${batchTs.toString().slice(-4)}-${i}`)
             .trim()
             .toUpperCase();
 
@@ -3276,7 +3633,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             lineCopy.category || 'Vật tư nhập mới',
             workingCategories,
             nextReg,
-            nowIso
+            nowIso,
+            catCache
           );
 
           const newItem: InventoryItem = {
@@ -3289,11 +3647,11 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             warehouseId: data.warehouseId,
             openingStock: 0,
             openingWarehouseStocks: { [data.warehouseId]: 0 },
-            warehouseStocks: { [data.warehouseId]: Math.max(0, lineCopy.quantity) },
+            warehouseStocks: { [data.warehouseId]: Math.max(0, qty) },
             location: (lineCopy.location || 'Khu vực tiếp nhận').trim(),
             minStock: lineCopy.minStock !== undefined && lineCopy.minStock >= 0 ? lineCopy.minStock : 5,
             maxStock: lineCopy.maxStock !== undefined && lineCopy.maxStock > 0 ? lineCopy.maxStock : 200,
-            currentStock: Math.max(0, lineCopy.quantity),
+            currentStock: Math.max(0, qty),
             unitPrice: Math.max(0, lineCopy.unitPrice || 0),
             serialOrLot: (lineCopy.serialNumber || '').trim(),
             condition: lineCopy.condition || 'SAN_SANG',
@@ -3302,7 +3660,13 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             updatedAt: nowIso,
             metadataUpdatedAt: nowIso,
           };
-          workingItems = [newItem, ...workingItems];
+
+          const newIdx = workingItems.length;
+          workingItems.push(newItem);
+          liveStockByIdx.push(Math.max(0, qty));
+          idToIdx.set(newItemId, newIdx);
+          codeToIdx.set(cleanCode, newIdx);
+
           lineCopy.itemId = newItemId;
           lineCopy.itemCode = cleanCode;
           lineCopy.categoryId = catLink.categoryId;
@@ -3315,7 +3679,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
       const newTrx: Transaction = {
         ...data,
-        id: `TRX-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
+        id: `TRX-${batchTs}-${i}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
         code: finalCode,
         items: resolvedLines,
         updatedAt: nowIso,
@@ -3330,8 +3694,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, importedCount: 0, errors };
     }
 
+    // Place newly auto-created items at the top of catalog (matching previous UX order)
+    const orderedItems =
+      workingItems.length > originalLen
+        ? [...workingItems.slice(originalLen).reverse(), ...workingItems.slice(0, originalLen)]
+        : workingItems;
+
     const newTransactionsList = [...newTransactionsToAdd, ...cur.transactions];
-    const finalItems = recalculateAllItemsStocks(workingItems, cur.warehouses, newTransactionsList);
+    const finalItems = recalculateAllItemsStocks(orderedItems, cur.warehouses, newTransactionsList);
     const legacy = extractLegacyDeletedArrays(nextReg);
 
     setMaterialCategories(workingCategories);
@@ -3423,6 +3793,11 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   };
 
   const resetToDefaultData = () => {
+    if (persistTimerRef.current) {
+      clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
+    pendingSnapshotRef.current = null;
     const cleanSnapshot = {
       warehouses: INITIAL_WAREHOUSES,
       materialCategories: INITIAL_CATEGORIES,
@@ -3511,6 +3886,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         addMaterialCategory,
         updateMaterialCategory,
         deleteMaterialCategory,
+        linkItemsToCategoryBatch,
         filterCriteria,
         setFilterCriteria,
         updateFilter,

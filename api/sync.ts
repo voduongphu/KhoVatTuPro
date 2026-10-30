@@ -78,15 +78,18 @@ function buildMergedDeletedRegistry(
   const merged: DeletedRegistry = {};
   const applyReg = (reg?: DeletedRegistry) => {
     if (!reg || typeof reg !== 'object') return;
-    Object.entries(reg).forEach(([k, v]) => {
-      if (!k || !v) return;
+    const keys = Object.keys(reg);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      const v = reg[k];
+      if (!k || !v) continue;
       const incTime = parseSafeUtcTime(v);
-      if (incTime <= 0) return;
+      if (incTime <= 0) continue;
       const prevTime = parseSafeUtcTime(merged[k]);
       if (incTime > prevTime) {
         merged[k] = new Date(incTime).toISOString();
       }
-    });
+    }
   };
   applyReg(localReg);
   applyReg(remoteReg);
@@ -119,7 +122,8 @@ function buildMergedDeletedRegistry(
 
 function getLatestTombstoneMs(reg: DeletedRegistry, keys: string[]): number {
   let maxMs = 0;
-  for (const k of keys) {
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
     if (!k) continue;
     const t = parseSafeUtcTime(reg[k]);
     if (t > maxMs) maxMs = t;
@@ -137,83 +141,147 @@ function isEntityDeleted(reg: DeletedRegistry, keys: string[], entityTimeMs: num
 function clearTombstonesIfRevived(reg: DeletedRegistry, keys: string[], entityTimeMs: number) {
   const delMs = getLatestTombstoneMs(reg, keys);
   if (delMs > 0 && entityTimeMs >= delMs) {
-    for (const k of keys) {
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
       if (k && reg[k]) delete reg[k];
     }
   }
 }
 
-function computeWarehouseStocks(item: any, warehouses: any[], transactions: any[]): Record<string, number> {
-  const allWhIds = new Set<string>();
-  warehouses.forEach((w: any) => {
-    if (w && w.id) allWhIds.add(w.id);
-  });
-  if (item.warehouseId) allWhIds.add(item.warehouseId);
-  if (item.openingWarehouseStocks) {
-    Object.keys(item.openingWarehouseStocks).forEach(k => allWhIds.add(k));
+function computeAllWarehouseStocks(
+  items: any[],
+  warehouses: any[],
+  transactions: any[]
+): Record<string, number>[] {
+  const n = items.length;
+  if (n === 0) return [];
+
+  const configuredWhIds: string[] = [];
+  for (let i = 0; i < warehouses.length; i++) {
+    if (warehouses[i]?.id) configuredWhIds.push(warehouses[i].id);
   }
-  if (item.warehouseStocks) {
-    Object.keys(item.warehouseStocks).forEach(k => allWhIds.add(k));
+  const fallbackDefaultWhId = configuredWhIds[0] || 'WH-01';
+
+  const idToIndices = new Map<string, number | number[]>();
+  const codeToIndices = new Map<string, number | number[]>();
+
+  const addIndex = (map: Map<string, number | number[]>, key: string, idx: number) => {
+    const existing = map.get(key);
+    if (existing === undefined) map.set(key, idx);
+    else if (typeof existing === 'number') {
+      if (existing !== idx) map.set(key, [existing, idx]);
+    } else if (!existing.includes(idx)) {
+      existing.push(idx);
+    }
+  };
+
+  const accums: {
+    whNet: Record<string, number>;
+    unassignedNet: number;
+    totalNet: number;
+    wasAutoCreatedByReceipt: boolean;
+  }[] = new Array(n);
+
+  for (let i = 0; i < n; i++) {
+    const item = items[i];
+    accums[i] = { whNet: {}, unassignedNet: 0, totalNet: 0, wasAutoCreatedByReceipt: false };
+    if (item?.id) addIndex(idToIndices, String(item.id), i);
+    const normCode = String(item?.code || '').trim().toUpperCase();
+    if (normCode) addIndex(codeToIndices, normCode, i);
   }
 
-  const activeTrx = transactions.filter((t: any) => t && t.status !== 'DA_HUY');
-  const whMovements: Record<string, { inQty: number; outQty: number }> = {};
-  allWhIds.forEach(whId => {
-    whMovements[whId] = { inQty: 0, outQty: 0 };
-  });
+  const applyLineToIndex = (
+    idx: number,
+    rawWhId: string,
+    delta: number,
+    isAutoCreatedReceipt: boolean
+  ) => {
+    const acc = accums[idx];
+    if (isAutoCreatedReceipt) acc.wasAutoCreatedByReceipt = true;
+    acc.totalNet += delta;
+    if (rawWhId) acc.whNet[rawWhId] = (acc.whNet[rawWhId] || 0) + delta;
+    else acc.unassignedNet += delta;
+  };
 
-  let totalNetTransactions = 0;
-  let wasAutoCreatedByReceipt = false;
-  const normCode = String(item.code || '').trim().toUpperCase();
+  for (let t = 0; t < transactions.length; t++) {
+    const trx = transactions[t];
+    if (!trx || trx.status === 'DA_HUY') continue;
+    const isReceipt = trx.type === 'NHAP_KHO';
+    const isIssue = trx.type === 'XUAT_KHO';
+    if (!isReceipt && !isIssue) continue;
 
-  activeTrx.forEach((trx: any) => {
-    const whId = trx.warehouseId || item.warehouseId || warehouses[0]?.id || 'WH-01';
-    allWhIds.add(whId);
-    if (!whMovements[whId]) whMovements[whId] = { inQty: 0, outQty: 0 };
-    const matchingLines = (trx.items || []).filter(
-      (l: any) =>
-        (l.itemId && l.itemId === item.id) ||
-        (normCode && l.itemCode && String(l.itemCode).trim().toUpperCase() === normCode)
-    );
-    matchingLines.forEach((line: any) => {
+    const rawWhId = trx.warehouseId || '';
+    const lines = trx.items || [];
+    for (let l = 0; l < lines.length; l++) {
+      const line = lines[l];
+      if (!line) continue;
       const q = Number(line.quantity) || 0;
-      if (line.isNewItem && trx.type === 'NHAP_KHO') wasAutoCreatedByReceipt = true;
-      if (trx.type === 'NHAP_KHO') {
-        whMovements[whId].inQty += q;
-        totalNetTransactions += q;
-      } else if (trx.type === 'XUAT_KHO') {
-        whMovements[whId].outQty += q;
-        totalNetTransactions -= q;
+      const delta = isReceipt ? q : -q;
+      const isAutoReceipt = Boolean(line.isNewItem && isReceipt);
+
+      const mById = line.itemId ? idToIndices.get(String(line.itemId)) : undefined;
+      const normLineCode = line.itemCode ? String(line.itemCode).trim().toUpperCase() : '';
+      const mByCode = normLineCode ? codeToIndices.get(normLineCode) : undefined;
+
+      if (mById === undefined && mByCode === undefined) continue;
+
+      if (typeof mById === 'number' && (mByCode === undefined || mByCode === mById)) {
+        applyLineToIndex(mById, rawWhId, delta, isAutoReceipt);
+      } else if (mById === undefined && typeof mByCode === 'number') {
+        applyLineToIndex(mByCode, rawWhId, delta, isAutoReceipt);
+      } else {
+        const visited = new Set<number>();
+        if (typeof mById === 'number') visited.add(mById);
+        else if (mById) mById.forEach(idx => visited.add(idx));
+        if (typeof mByCode === 'number') visited.add(mByCode);
+        else if (mByCode) mByCode.forEach(idx => visited.add(idx));
+        visited.forEach(idx => applyLineToIndex(idx, rawWhId, delta, isAutoReceipt));
       }
-    });
-  });
-
-  const primaryWhId = item.warehouseId || warehouses[0]?.id || 'WH-01';
-  allWhIds.add(primaryWhId);
-
-  const result: Record<string, number> = {};
-  if (item.openingWarehouseStocks && Object.keys(item.openingWarehouseStocks).length > 0) {
-    allWhIds.forEach(whId => {
-      const opening = Number(item.openingWarehouseStocks?.[whId]) || 0;
-      const net = (whMovements[whId]?.inQty || 0) - (whMovements[whId]?.outQty || 0);
-      result[whId] = Math.max(0, opening + net);
-    });
-  } else {
-    const inferredOpening =
-      item.openingStock !== undefined
-        ? Number(item.openingStock) || 0
-        : wasAutoCreatedByReceipt
-        ? 0
-        : Math.max(0, (Number(item.currentStock) || 0) - totalNetTransactions);
-    allWhIds.forEach(whId => {
-      const net = (whMovements[whId]?.inQty || 0) - (whMovements[whId]?.outQty || 0);
-      result[whId] = whId === primaryWhId ? Math.max(0, inferredOpening + net) : Math.max(0, net);
-    });
+    }
   }
-  warehouses.forEach((w: any) => {
-    if (w && w.id && result[w.id] === undefined) result[w.id] = 0;
-  });
-  return result;
+
+  const results: Record<string, number>[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const item = items[i];
+    const acc = accums[i];
+    const primaryWhId = item.warehouseId || fallbackDefaultWhId;
+
+    const allWhIds = new Set<string>(configuredWhIds);
+    allWhIds.add(primaryWhId);
+    if (item.openingWarehouseStocks) {
+      Object.keys(item.openingWarehouseStocks).forEach(k => allWhIds.add(k));
+    }
+    if (item.warehouseStocks) {
+      Object.keys(item.warehouseStocks).forEach(k => allWhIds.add(k));
+    }
+    Object.keys(acc.whNet).forEach(k => allWhIds.add(k));
+
+    const result: Record<string, number> = {};
+    if (item.openingWarehouseStocks && Object.keys(item.openingWarehouseStocks).length > 0) {
+      allWhIds.forEach(whId => {
+        const opening = Number(item.openingWarehouseStocks?.[whId]) || 0;
+        const net = (acc.whNet[whId] || 0) + (whId === primaryWhId ? acc.unassignedNet : 0);
+        result[whId] = Math.max(0, opening + net);
+      });
+    } else {
+      const inferredOpening =
+        item.openingStock !== undefined
+          ? Number(item.openingStock) || 0
+          : acc.wasAutoCreatedByReceipt
+          ? 0
+          : Math.max(0, (Number(item.currentStock) || 0) - acc.totalNet);
+      allWhIds.forEach(whId => {
+        const net = (acc.whNet[whId] || 0) + (whId === primaryWhId ? acc.unassignedNet : 0);
+        result[whId] = whId === primaryWhId ? Math.max(0, inferredOpening + net) : Math.max(0, net);
+      });
+    }
+    for (let w = 0; w < configuredWhIds.length; w++) {
+      const whId = configuredWhIds[w];
+      if (result[whId] === undefined) result[whId] = 0;
+    }
+    results[i] = result;
+  }
+  return results;
 }
 
 function mergeStateAdditive(existing: any, incoming: any): any {
@@ -384,27 +452,41 @@ function mergeStateAdditive(existing: any, incoming: any): any {
       (parseSafeUtcTime(a.updatedAt) || parseSafeUtcTime(a.date)) -
       (parseSafeUtcTime(b.updatedAt) || parseSafeUtcTime(b.date))
   );
+
   const usedCodes = new Set<string>();
+  const currentYear = new Date().getFullYear();
+  const pnPrefix = `PN-${currentYear}-`;
+  const pxPrefix = `PX-${currentYear}-`;
+  let maxPnSeq = 0;
+  let maxPxSeq = 0;
+
+  const trackSeqFromCode = (upperCode: string) => {
+    if (upperCode.startsWith(pnPrefix)) {
+      const num = parseInt(upperCode.slice(pnPrefix.length), 10);
+      if (!Number.isNaN(num) && num > maxPnSeq) maxPnSeq = num;
+    } else if (upperCode.startsWith(pxPrefix)) {
+      const num = parseInt(upperCode.slice(pxPrefix.length), 10);
+      if (!Number.isNaN(num) && num > maxPxSeq) maxPxSeq = num;
+    }
+  };
+
+  for (let i = 0; i < rawTrxAsc.length; i++) {
+    const c = String(rawTrxAsc[i].code || '').trim().toUpperCase();
+    if (c) trackSeqFromCode(c);
+  }
+
   const nextCodeForType = (type: string): string => {
-    const prefix = type === 'NHAP_KHO' ? 'PN' : 'PX';
-    const year = new Date().getFullYear();
-    const pattern = new RegExp(`^${prefix}-${year}-(\\d+)$`, 'i');
-    let maxNum = 0;
-    usedCodes.forEach(c => {
-      const m = c.match(pattern);
-      if (m) {
-        const n = parseInt(m[1], 10);
-        if (n > maxNum) maxNum = n;
-      }
-    });
-    let candidateNum = maxNum + 1;
-    let candidate = `${prefix}-${year}-${String(candidateNum).padStart(4, '0')}`;
+    const isReceipt = type === 'NHAP_KHO';
+    const prefix = isReceipt ? pnPrefix : pxPrefix;
+    let candidateNum = isReceipt ? ++maxPnSeq : ++maxPxSeq;
+    let candidate = `${prefix}${String(candidateNum).padStart(4, '0')}`;
     while (usedCodes.has(candidate)) {
-      candidateNum++;
-      candidate = `${prefix}-${year}-${String(candidateNum).padStart(4, '0')}`;
+      candidateNum = isReceipt ? ++maxPnSeq : ++maxPxSeq;
+      candidate = `${prefix}${String(candidateNum).padStart(4, '0')}`;
     }
     return candidate;
   };
+
   const mergedTransactions = rawTrxAsc
     .map((t: any) => {
       const normCode = String(t.code || '').trim().toUpperCase();
@@ -414,6 +496,7 @@ function mergeStateAdditive(existing: any, incoming: any): any {
         return { ...t, code: reassigned };
       }
       usedCodes.add(normCode);
+      trackSeqFromCode(normCode);
       return { ...t, code: normCode };
     })
     .sort((a: any, b: any) => {
@@ -537,7 +620,23 @@ function mergeStateAdditive(existing: any, incoming: any): any {
   (incoming.materialCategories || []).forEach((c: any) => processCategory(c, true));
 
   const dedupByCode = new Map<string, any>();
-  const aliasIdMap = new Map<string, any>();
+  const catLookupByIdUpper = new Map<string, any>();
+  const catLookupByCodeUpper = new Map<string, any>();
+  const catLookupByNameOrCodeLower = new Map<string, any>();
+
+  const registerCategoryInIndexes = (cat: any) => {
+    catLookupByIdUpper.set(String(cat.id).toUpperCase(), cat);
+    const codeUpper = String(cat.code || '').trim().toUpperCase();
+    if (codeUpper) {
+      catLookupByCodeUpper.set(codeUpper, cat);
+      catLookupByNameOrCodeLower.set(codeUpper.toLowerCase(), cat);
+    }
+    const nameLower = String(cat.name || '').trim().toLowerCase();
+    if (nameLower) {
+      catLookupByNameOrCodeLower.set(nameLower, cat);
+    }
+  };
+
   Array.from(catById.values())
     .sort((a: any, b: any) => (parseSafeUtcTime(a.updatedAt) || 0) - (parseSafeUtcTime(b.updatedAt) || 0))
     .forEach((c: any) => {
@@ -545,21 +644,32 @@ function mergeStateAdditive(existing: any, incoming: any): any {
       const prev = dedupByCode.get(codeKey);
       if (!prev) {
         dedupByCode.set(codeKey, c);
-        aliasIdMap.set(c.id, c);
+        registerCategoryInIndexes(c);
       } else {
         const mergedCat = { ...prev, ...c, id: prev.id, code: codeKey };
         dedupByCode.set(codeKey, mergedCat);
-        aliasIdMap.set(prev.id, mergedCat);
-        aliasIdMap.set(c.id, mergedCat);
+        registerCategoryInIndexes(mergedCat);
+        catLookupByIdUpper.set(String(c.id).toUpperCase(), mergedCat);
       }
     });
 
   const mergedCategories: any[] = Array.from(dedupByCode.values());
   const usedCatCodes = new Set<string>(mergedCategories.map((c: any) => String(c.code || '').trim().toUpperCase()));
 
-  const mergedItems = Array.from(itemMap.values()).map((item: any) => {
-    const stocks = computeWarehouseStocks(item, mergedWarehouses, mergedTransactions);
-    const totalStock = Object.values(stocks).reduce((sum, qty) => sum + (Number(qty) || 0), 0);
+  const rawItemsList = Array.from(itemMap.values());
+  const allStocks = computeAllWarehouseStocks(
+    rawItemsList,
+    mergedWarehouses,
+    mergedTransactions
+  );
+
+  const mergedItems = rawItemsList.map((item: any, idx: number) => {
+    const stocks = allStocks[idx] || {};
+    let totalStock = 0;
+    const stockVals = Object.values(stocks);
+    for (let s = 0; s < stockVals.length; s++) {
+      totalStock += Number(stockVals[s]) || 0;
+    }
 
     const rawCatId = String(item.categoryId || '').trim();
     const rawCatCode = String(item.categoryCode || '').trim().toUpperCase();
@@ -575,10 +685,7 @@ function mergeStateAdditive(existing: any, incoming: any): any {
       (!rawCatId && !rawCatCode && rawCatName.toLowerCase() === 'chưa phân loại');
 
     if (!isUncategorized && rawCatId) {
-      const byId =
-        mergedCategories.find(
-          (c: any) => c.id === rawCatId || String(c.id).toUpperCase() === rawCatId.toUpperCase()
-        ) || aliasIdMap.get(rawCatId);
+      const byId = catLookupByIdUpper.get(rawCatId.toUpperCase());
       if (byId) {
         const catUpdatedMs = parseSafeUtcTime(byId.updatedAt) || 0;
         if (
@@ -594,21 +701,14 @@ function mergeStateAdditive(existing: any, incoming: any): any {
     }
 
     if (!isUncategorized && !linkedCat && rawCatCode) {
-      linkedCat = mergedCategories.find(
-        (c: any) => String(c.code || '').trim().toUpperCase() === rawCatCode
-      );
+      linkedCat = catLookupByCodeUpper.get(rawCatCode);
       if (!linkedCat && isEntityDeleted(registry, [makeTombstoneKey('CAT', rawCatCode)], itemMetaMs)) {
         isUncategorized = true;
       }
     }
 
     if (!isUncategorized && !linkedCat && rawCatName) {
-      const lowerName = rawCatName.toLowerCase();
-      linkedCat = mergedCategories.find(
-        (c: any) =>
-          String(c.name || '').trim().toLowerCase() === lowerName ||
-          String(c.code || '').trim().toLowerCase() === lowerName
-      );
+      linkedCat = catLookupByNameOrCodeLower.get(rawCatName.toLowerCase());
     }
 
     if (!isUncategorized && !linkedCat && rawCatName && rawCatName.toLowerCase() !== 'chưa phân loại') {
@@ -636,7 +736,7 @@ function mergeStateAdditive(existing: any, incoming: any): any {
           updatedAt: fallbackIso,
         };
         mergedCategories.push(linkedCat);
-        aliasIdMap.set(autoId, linkedCat);
+        registerCategoryInIndexes(linkedCat);
       }
     }
 
@@ -859,6 +959,23 @@ export default async function handler(req: any, res: any) {
     else if (hasKV) state = await fetchFromVercelKV();
     else if (hasSupabase) state = await fetchFromSupabase();
     if (!state) state = localMemoryState;
+
+    const sinceVersion = Number(req.query?.sinceVersion);
+    if (
+      state &&
+      !Number.isNaN(sinceVersion) &&
+      sinceVersion > 0 &&
+      Number(state.version) > 0 &&
+      sinceVersion >= Number(state.version)
+    ) {
+      return res.status(200).json({
+        success: true,
+        notModified: true,
+        provider,
+        version: state.version,
+        lastUpdated: state.lastUpdated,
+      });
+    }
 
     return res.status(200).json({
       success: true,

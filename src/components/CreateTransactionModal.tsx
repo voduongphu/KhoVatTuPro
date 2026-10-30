@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   X,
   Plus,
@@ -6,22 +6,18 @@ import {
   AlertTriangle,
   PackagePlus,
   PackageMinus,
-  CheckCircle2,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
 import {
   InventoryItem,
-  IssueSubtype,
-  ReceiptSubtype,
   TransactionLineItem,
   TransactionType,
 } from '../types/inventory';
 import {
   formatCurrency,
   formatNumber,
-  getItemTypeLabel,
-  getSubtypeLabel,
 } from '../utils/formatters';
+import { SearchableItemSelect } from './SearchableItemSelect';
 
 interface CreateTransactionModalProps {
   initialType: TransactionType;
@@ -38,6 +34,22 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
 }) => {
   const { warehouses, materialCategories, items, createTransaction, currentUser } = useInventory();
   const defaultCat = materialCategories[0];
+
+  const itemsById = useMemo(() => new Map(items.map(i => [i.id, i])), [items]);
+  const categoryById = useMemo(
+    () => new Map(materialCategories.map(c => [c.id, c])),
+    [materialCategories]
+  );
+
+  const getAvailableWarehouseStock = (it: InventoryItem, whId: string): number => {
+    if (whId && it.warehouseStocks && it.warehouseStocks[whId] !== undefined) {
+      return Number(it.warehouseStocks[whId]) || 0;
+    }
+    if (whId && it.warehouseId === whId) {
+      return Number(it.currentStock) || 0;
+    }
+    return whId ? 0 : Number(it.currentStock) || 0;
+  };
 
   const [type, setType] = useState<TransactionType>(initialType);
   const [subtype, setSubtype] = useState<string>(
@@ -163,7 +175,7 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
       return;
     }
 
-    const item = items.find(i => i.id === selectedItemId);
+    const item = itemsById.get(selectedItemId);
     if (!item) return;
 
     setLineItems(prev => {
@@ -599,9 +611,12 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {lineItems.map((line, idx) => {
-                    const currentItem = items.find(i => i.id === line.itemId);
+                    const currentItem = line.itemId ? itemsById.get(line.itemId) : undefined;
+                    const availableStock = currentItem
+                      ? getAvailableWarehouseStock(currentItem, warehouseId)
+                      : 0;
                     const isExceedingStock =
-                      type === 'XUAT_KHO' && currentItem && line.quantity > currentItem.currentStock;
+                      type === 'XUAT_KHO' && Boolean(currentItem) && line.quantity > availableStock;
 
                     return (
                       <tr
@@ -669,7 +684,7 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                                   value={line.categoryId || '__UNCATEGORIZED__'}
                                   onChange={e => {
                                     const val = e.target.value;
-                                    const matched = materialCategories.find(c => c.id === val);
+                                    const matched = categoryById.get(val);
                                     setLineItems(prev => {
                                       const updated = [...prev];
                                       updated[idx] = {
@@ -703,24 +718,18 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                             </div>
                           ) : (
                             <div className="space-y-1">
-                              <select
+                              <SearchableItemSelect
+                                items={items}
+                                itemsById={itemsById}
                                 value={line.itemId}
-                                onChange={e => handleSelectItem(idx, e.target.value)}
-                                className="w-full px-2.5 py-2 text-xs border border-slate-200 rounded-lg focus:border-indigo-500 outline-none bg-white font-medium"
-                                required
-                              >
-                                <option value="">-- Chọn mặt hàng có sẵn --</option>
-                                {type === 'NHAP_KHO' && (
-                                  <option value="__NEW_ITEM__">
-                                    + Nhập vật tư mới (Tự động cập nhật danh mục)
-                                  </option>
-                                )}
-                                {items.map(it => (
-                                  <option key={it.id} value={it.id}>
-                                    [{it.code}] {it.name} (Tồn: {it.currentStock} {it.unit})
-                                  </option>
-                                ))}
-                              </select>
+                                onChange={val => handleSelectItem(idx, val)}
+                                warehouseId={warehouseId}
+                                allowNewItem={type === 'NHAP_KHO'}
+                                newItemValue="__NEW_ITEM__"
+                                newItemLabel="+ Nhập vật tư mới (Tự động cập nhật danh mục)"
+                                placeholder="-- Tìm mã SKU hoặc tên vật tư --"
+                                showStockInWarehouse={true}
+                              />
                               {type === 'NHAP_KHO' && (
                                 <button
                                   type="button"
@@ -755,7 +764,7 @@ export const CreateTransactionModal: React.FC<CreateTransactionModalProps> = ({
                           {line.isNewItem ? (
                             <span className="text-[11px] text-emerald-600 font-semibold">Mới (0)</span>
                           ) : currentItem ? (
-                            `${formatNumber(currentItem.currentStock)} ${currentItem.unit}`
+                            `${formatNumber(availableStock)} ${currentItem.unit}`
                           ) : (
                             '-'
                           )}

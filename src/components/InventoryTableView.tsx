@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Plus,
   Download,
@@ -8,28 +8,26 @@ import {
   AlertTriangle,
   Clock,
   ArrowDownLeft,
-  Warehouse as WarehouseIcon,
   CheckSquare,
-  Square,
-  X,
   FileSpreadsheet,
   FolderTree,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
-import { InventoryItem } from '../types/inventory';
+import { InventoryItem, MaterialCategory, Warehouse } from '../types/inventory';
 import {
   exportToCSV,
   formatCurrency,
   formatDate,
   formatNumber,
   getConditionLabel,
+  getFastItemWarehouseStocks,
   getItemTypeLabel,
   getStockStatus,
   getStockStatusLabel,
-  calculateItemWarehouseStocks,
 } from '../utils/formatters';
 import { MultiFilterBar } from './MultiFilterBar';
 import { ConfirmDeleteModal } from './ConfirmDeleteModal';
+import { PaginationBar } from './PaginationBar';
 
 interface InventoryTableViewProps {
   onSelectStockCard: (itemId: string) => void;
@@ -53,7 +51,7 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
     items,
     materialCategories,
     warehouses,
-    transactions,
+    filterCriteria,
     deleteItem,
     deleteItemsBatch,
     currentUser,
@@ -67,10 +65,51 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
   const [itemToDelete, setItemToDelete] = useState<InventoryItem | null>(null);
   const [isBulkDeleteOpen, setIsBulkDeleteOpen] = useState(false);
 
+  // Pagination state for smooth 5,000+ rows rendering
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [pageSize, setPageSize] = useState<number>(100);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [filterCriteria]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredItems.length / pageSize));
+  const safePage = Math.min(Math.max(1, currentPage), totalPages);
+
+  const paginatedItems = useMemo(() => {
+    const start = (safePage - 1) * pageSize;
+    return filteredItems.slice(start, start + pageSize);
+  }, [filteredItems, safePage, pageSize]);
+
+  // O(1) Lookup Maps
+  const warehouseById = useMemo(() => {
+    const map = new Map<string, Warehouse>();
+    for (let i = 0; i < warehouses.length; i++) {
+      map.set(warehouses[i].id, warehouses[i]);
+    }
+    return map;
+  }, [warehouses]);
+
+  const categoryIndexes = useMemo(() => {
+    const byId = new Map<string, MaterialCategory>();
+    const byCode = new Map<string, MaterialCategory>();
+    const byName = new Map<string, MaterialCategory>();
+    for (let i = 0; i < materialCategories.length; i++) {
+      const c = materialCategories[i];
+      byId.set(c.id, c);
+      if (c.code) byCode.set(c.code.trim().toUpperCase(), c);
+      if (c.name) byName.set(c.name.trim().toLowerCase(), c);
+    }
+    return { byId, byCode, byName };
+  }, [materialCategories]);
+
+  const selectedSet = useMemo(() => new Set(selectedItemIds), [selectedItemIds]);
+
   // Checkbox helpers
-  const isAllSelected =
-    filteredItems.length > 0 &&
-    filteredItems.every(i => selectedItemIds.includes(i.id));
+  const isAllSelected = useMemo(
+    () => filteredItems.length > 0 && filteredItems.every(i => selectedSet.has(i.id)),
+    [filteredItems, selectedSet]
+  );
 
   const toggleSelectAll = () => {
     if (isAllSelected) {
@@ -102,22 +141,19 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
   };
 
   // Total value of currently filtered items
-  const filteredTotalValue = filteredItems.reduce(
-    (acc, i) => acc + i.currentStock * i.unitPrice,
-    0
+  const filteredTotalValue = useMemo(
+    () => filteredItems.reduce((acc, i) => acc + i.currentStock * i.unitPrice, 0),
+    [filteredItems]
   );
 
   const resolveItemCategoryDisplay = (item: InventoryItem) => {
     const matched =
-      (item.categoryId && materialCategories.find(c => c.id === item.categoryId)) ||
-      (item.categoryCode &&
-        materialCategories.find(
-          c => c.code.trim().toUpperCase() === item.categoryCode!.trim().toUpperCase()
-        )) ||
+      (item.categoryId ? categoryIndexes.byId.get(item.categoryId) : undefined) ||
+      (item.categoryCode
+        ? categoryIndexes.byCode.get(item.categoryCode.trim().toUpperCase())
+        : undefined) ||
       (item.category
-        ? materialCategories.find(
-            c => c.name.trim().toLowerCase() === (item.category || '').trim().toLowerCase()
-          )
+        ? categoryIndexes.byName.get(item.category.trim().toLowerCase())
         : undefined);
     return {
       code: matched?.code || item.categoryCode || '',
@@ -148,7 +184,7 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
     ];
 
     const rows = filteredItems.map(item => {
-      const wh = warehouses.find(w => w.id === item.warehouseId);
+      const wh = item.warehouseId ? warehouseById.get(item.warehouseId) : undefined;
       const catInfo = resolveItemCategoryDisplay(item);
       return [
         item.code,
@@ -175,6 +211,9 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
     exportToCSV(`Danh_Muc_Ton_Kho_${new Date().toISOString().substring(0, 10)}`, headers, rows);
   };
 
+  const nowMs = Date.now();
+  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+
   return (
     <div className="space-y-4">
       {/* Top Banner with Stats & Primary Actions */}
@@ -185,7 +224,11 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
           </h2>
           <div className="text-xs text-slate-500 mt-0.5 flex items-center gap-2">
             <span>
-              Hiển thị <strong className="text-slate-800 tabular-nums">{filteredItems.length}</strong> / {items.length} mặt hàng
+              Kết quả lọc:{' '}
+              <strong className="text-slate-800 tabular-nums">
+                {formatNumber(filteredItems.length)}
+              </strong>{' '}
+              / {formatNumber(items.length)} mặt hàng
             </span>
             <span aria-hidden="true">&bull;</span>
             <span>
@@ -251,7 +294,8 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
           <div className="flex items-center gap-2 text-indigo-900 font-medium">
             <CheckSquare className="w-4 h-4 text-indigo-600" />
             <span>
-              Đã chọn <strong className="font-bold">{selectedItemIds.length}</strong> / {filteredItems.length} mặt hàng
+              Đã chọn <strong className="font-bold">{formatNumber(selectedItemIds.length)}</strong> /{' '}
+              {formatNumber(filteredItems.length)} mặt hàng
             </span>
             <button
               onClick={() => setSelectedItemIds([])}
@@ -269,7 +313,7 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-semibold rounded-lg shadow-xs transition-colors"
               >
                 <Trash2 className="w-3.5 h-3.5" />
-                <span>Xóa {selectedItemIds.length} mục đã chọn</span>
+                <span>Xóa {formatNumber(selectedItemIds.length)} mục đã chọn</span>
               </button>
             )}
           </div>
@@ -291,308 +335,303 @@ export const InventoryTableView: React.FC<InventoryTableViewProps> = ({
             </p>
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="bg-slate-50/80 border-b border-slate-200 text-slate-500 font-semibold uppercase tracking-wider text-[11px]">
-                  {/* Select All Checkbox */}
-                  <th className="py-3 px-3 w-10 text-center">
-                    <input
-                      type="checkbox"
-                      checked={isAllSelected}
-                      onChange={toggleSelectAll}
-                      title={isAllSelected ? 'Bỏ chọn tất cả' : 'Chọn tất cả mặt hàng đang hiển thị'}
-                      className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
-                    />
-                  </th>
-                  <th className="py-3 px-3">Mã SKU</th>
-                  <th className="py-3 px-4 min-w-[200px]">Tên vật tư / thiết bị</th>
-                  <th className="py-3 px-3 min-w-[130px]">Số Serial / Lô</th>
-                  <th className="py-3 px-3">Phân loại</th>
-                  <th className="py-3 px-3">Kho &amp; Vị trí</th>
-                  <th className="py-3 px-3 text-right">Tồn kho hiện tại</th>
-                  <th className="py-3 px-3 text-right">Định mức (Min-Max)</th>
-                  <th className="py-3 px-3 text-right">Đơn giá vốn</th>
-                  <th className="py-3 px-4 text-right">Tổng thành tiền</th>
-                  <th className="py-3 px-3 text-center">Tình trạng</th>
-                  <th className="py-3 px-4 text-center">Thao tác</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {filteredItems.map(item => {
-                  const wh = warehouses.find(w => w.id === item.warehouseId);
-                  const status = getStockStatus(item);
-                  const isLow = status === 'CANH_BAO_THAP' || status === 'HET_HANG';
-                  const isOver = status === 'VUOT_DINH_MUC';
-                  const totalVal = item.currentStock * item.unitPrice;
-                  const isSelected = selectedItemIds.includes(item.id);
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-50/80 border-b border-slate-200 text-slate-500 font-semibold uppercase tracking-wider text-[11px]">
+                    {/* Select All Checkbox */}
+                    <th className="py-3 px-3 w-10 text-center">
+                      <input
+                        type="checkbox"
+                        checked={isAllSelected}
+                        onChange={toggleSelectAll}
+                        title={isAllSelected ? 'Bỏ chọn tất cả' : 'Chọn tất cả mặt hàng đang lọc'}
+                        className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+                      />
+                    </th>
+                    <th className="py-3 px-3">Mã SKU</th>
+                    <th className="py-3 px-4 min-w-[200px]">Tên vật tư / thiết bị</th>
+                    <th className="py-3 px-3 min-w-[130px]">Số Serial / Lô</th>
+                    <th className="py-3 px-3">Phân loại</th>
+                    <th className="py-3 px-3">Kho &amp; Vị trí</th>
+                    <th className="py-3 px-3 text-right">Tồn kho hiện tại</th>
+                    <th className="py-3 px-3 text-right">Định mức (Min-Max)</th>
+                    <th className="py-3 px-3 text-right">Đơn giá vốn</th>
+                    <th className="py-3 px-4 text-right">Tổng thành tiền</th>
+                    <th className="py-3 px-3 text-center">Tình trạng</th>
+                    <th className="py-3 px-4 text-center">Thao tác</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {paginatedItems.map(item => {
+                    const wh = item.warehouseId ? warehouseById.get(item.warehouseId) : undefined;
+                    const status = getStockStatus(item);
+                    const isLow = status === 'CANH_BAO_THAP' || status === 'HET_HANG';
+                    const isOver = status === 'VUOT_DINH_MUC';
+                    const totalVal = item.currentStock * item.unitPrice;
+                    const isSelected = selectedSet.has(item.id);
+                    const catInfo = resolveItemCategoryDisplay(item);
+                    const stocks = getFastItemWarehouseStocks(item, warehouses);
+                    const whWithStock = warehouses.filter(w => (stocks[w.id] || 0) > 0);
+                    const tooltip =
+                      whWithStock.length > 0
+                        ? whWithStock
+                            .map(w => `${w.name}: ${formatNumber(stocks[w.id])} ${item.unit}`)
+                            .join('\n')
+                        : wh?.name || 'Kho hệ thống';
 
-                  // Check inspection date
-                  const isInspectionExpired =
-                    item.inspectionDueDate && new Date(item.inspectionDueDate) < new Date();
-                  const isInspectionDueSoon =
-                    item.inspectionDueDate &&
-                    !isInspectionExpired &&
-                    new Date(item.inspectionDueDate).getTime() - new Date().getTime() <
-                      30 * 24 * 60 * 60 * 1000;
+                    const dueMs = item.inspectionDueDate ? Date.parse(item.inspectionDueDate) : NaN;
+                    const isInspectionExpired = !Number.isNaN(dueMs) && dueMs < nowMs;
+                    const isInspectionDueSoon =
+                      !Number.isNaN(dueMs) && !isInspectionExpired && dueMs - nowMs < thirtyDaysMs;
 
-                  return (
-                    <tr
-                      key={item.id}
-                      className={`hover:bg-slate-50/80 transition-colors ${
-                        isSelected
-                          ? 'bg-indigo-50/40'
-                          : status === 'HET_HANG'
-                          ? 'bg-rose-50/20'
-                          : ''
-                      }`}
-                    >
-                      {/* Item Checkbox */}
-                      <td className="py-3.5 px-3 text-center">
-                        <input
-                          type="checkbox"
-                          checked={isSelected}
-                          onChange={() => toggleSelectItem(item.id)}
-                          className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
-                        />
-                      </td>
+                    return (
+                      <tr
+                        key={item.id}
+                        className={`hover:bg-slate-50/80 transition-colors ${
+                          isSelected
+                            ? 'bg-indigo-50/40'
+                            : status === 'HET_HANG'
+                            ? 'bg-rose-50/20'
+                            : ''
+                        }`}
+                      >
+                        {/* Item Checkbox */}
+                        <td className="py-3.5 px-3 text-center">
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleSelectItem(item.id)}
+                            className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+                          />
+                        </td>
 
-                      {/* Code */}
-                      <td className="py-3.5 px-3 font-mono font-semibold text-slate-900 whitespace-nowrap">
-                        {item.code}
-                      </td>
+                        {/* Code */}
+                        <td className="py-3.5 px-3 font-mono font-semibold text-slate-900 whitespace-nowrap">
+                          {item.code}
+                        </td>
 
-                      {/* Name, Category Link & Specs */}
-                      <td className="py-3.5 px-4">
-                        <div className="font-semibold text-slate-900 line-clamp-1" title={item.name}>
-                          {item.name}
-                        </div>
-                        <div className="text-[11px] text-slate-500 mt-0.5 flex items-center gap-1.5 flex-wrap">
-                          {(() => {
-                            const catInfo = resolveItemCategoryDisplay(item);
-                            return (
-                              <span>
-                                {catInfo.code ? (
-                                  <span className="font-mono font-semibold text-indigo-700 mr-1">
-                                    [{catInfo.code}]
-                                  </span>
-                                ) : null}
-                                <span className="text-slate-600">{catInfo.name}</span>
-                              </span>
-                            );
-                          })()}
-                          {item.spec && (
-                            <>
-                              <span aria-hidden="true">&bull;</span>
-                              <span className="text-slate-400 truncate max-w-[150px]">{item.spec}</span>
-                            </>
-                          )}
-                        </div>
-                      </td>
-
-                      {/* Serial / Lot Number Column */}
-                      <td className="py-3.5 px-3 font-mono text-slate-700 whitespace-nowrap">
-                        {item.serialOrLot ? (
-                          <span
-                            className="inline-block bg-slate-100 text-slate-800 px-2 py-0.5 rounded font-mono text-[11px] font-semibold border border-slate-200"
-                            title={`Số serial / số lô: ${item.serialOrLot}`}
-                          >
-                            {item.serialOrLot}
-                          </span>
-                        ) : (
-                          <span className="text-slate-300 italic text-[11px]">—</span>
-                        )}
-                      </td>
-
-                      {/* Type */}
-                      <td className="py-3.5 px-3 text-slate-600 whitespace-nowrap">
-                        <span className="px-2 py-0.5 rounded text-[11px] font-medium bg-slate-100 text-slate-700">
-                          {getItemTypeLabel(item.type)}
-                        </span>
-                      </td>
-
-                      {/* Warehouse & Shelf */}
-                      <td className="py-3.5 px-3 whitespace-nowrap max-w-[180px]">
-                        {(() => {
-                          const stocks = calculateItemWarehouseStocks(item, warehouses, transactions);
-                          const whWithStock = warehouses.filter(w => (stocks[w.id] || 0) > 0);
-                          const tooltip =
-                            whWithStock.length > 0
-                              ? whWithStock
-                                  .map(w => `${w.name}: ${formatNumber(stocks[w.id])} ${item.unit}`)
-                                  .join('\n')
-                              : wh?.name || 'Kho hệ thống';
-
-                          return (
-                            <>
-                              <div
-                                className="text-slate-800 font-semibold truncate flex items-center gap-1.5"
-                                title={tooltip}
-                              >
-                                {whWithStock.length > 1 ? (
-                                  <span className="bg-indigo-50 text-indigo-800 px-1.5 py-0.5 rounded text-[11px] font-bold border border-indigo-100">
-                                    Đa kho ({whWithStock.length})
-                                  </span>
-                                ) : whWithStock.length === 1 ? (
-                                  <span className="truncate">{whWithStock[0].name}</span>
-                                ) : (
-                                  <span className="truncate text-slate-500">
-                                    {wh?.name || 'Chưa phân kho'}
-                                  </span>
-                                )}
-                              </div>
-                              <div className="text-[11px] text-slate-500 font-medium mt-0.5">
-                                Kệ: <span className="text-slate-800 font-semibold">{item.location || 'Chưa xếp kệ'}</span>
-                              </div>
-                            </>
-                          );
-                        })()}
-                      </td>
-
-                      {/* Current Stock */}
-                      <td className="py-3.5 px-3 text-right whitespace-nowrap">
-                        <div className="flex items-center justify-end gap-1.5">
-                          <span
-                            className={`text-sm font-bold tabular-nums ${
-                              item.currentStock === 0
-                                ? 'text-rose-600'
-                                : item.currentStock < item.minStock
-                                ? 'text-amber-600'
-                                : 'text-slate-900'
-                            }`}
-                          >
-                            {formatNumber(item.currentStock)}
-                          </span>
-                          <span className="text-[11px] text-slate-500">{item.unit}</span>
-                        </div>
-                        {isLow && (
-                          <span className="text-[10px] text-rose-600 font-medium block">
-                            {status === 'HET_HANG' ? 'Hết hàng' : 'Dưới định mức'}
-                          </span>
-                        )}
-                        {isOver && (
-                          <span className="text-[10px] text-amber-600 font-medium block">
-                            Vượt max ({item.maxStock})
-                          </span>
-                        )}
-                      </td>
-
-                      {/* Min-Max threshold */}
-                      <td className="py-3.5 px-3 text-right tabular-nums text-slate-500 whitespace-nowrap">
-                        <span>{formatNumber(item.minStock)}</span>
-                        <span className="text-slate-300 mx-1">/</span>
-                        <span>{formatNumber(item.maxStock)}</span>
-                      </td>
-
-                      {/* Unit Price */}
-                      <td className="py-3.5 px-3 text-right tabular-nums text-slate-600 whitespace-nowrap">
-                        {formatCurrency(item.unitPrice)}
-                      </td>
-
-                      {/* Total Value */}
-                      <td className="py-3.5 px-4 text-right tabular-nums font-semibold text-slate-900 whitespace-nowrap">
-                        {formatCurrency(totalVal)}
-                      </td>
-
-                      {/* Status & Condition */}
-                      <td className="py-3.5 px-3 text-center whitespace-nowrap">
-                        {item.type === 'THIET_BI' || item.type === 'CONG_CU' ? (
-                          <div className="space-y-1">
-                            <span
-                              className={`inline-block px-2 py-0.5 rounded text-[11px] font-medium ${
-                                item.condition === 'SAN_SANG'
-                                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                                  : item.condition === 'DANG_MUON'
-                                  ? 'bg-blue-50 text-blue-700 border border-blue-200'
-                                  : item.condition === 'BAO_DUONG'
-                                  ? 'bg-amber-50 text-amber-700 border border-amber-200'
-                                  : 'bg-rose-50 text-rose-700 border border-rose-200'
-                              }`}
-                            >
-                              {getConditionLabel(item.condition)}
+                        {/* Name, Category Link & Specs */}
+                        <td className="py-3.5 px-4">
+                          <div className="font-semibold text-slate-900 line-clamp-1" title={item.name}>
+                            {item.name}
+                          </div>
+                          <div className="text-[11px] text-slate-500 mt-0.5 flex items-center gap-1.5 flex-wrap">
+                            <span>
+                              {catInfo.code ? (
+                                <span className="font-mono font-semibold text-indigo-700 mr-1">
+                                  [{catInfo.code}]
+                                </span>
+                              ) : null}
+                              <span className="text-slate-600">{catInfo.name}</span>
                             </span>
-
-                            {item.inspectionDueDate && (
-                              <div
-                                className={`text-[10px] flex items-center justify-center gap-1 ${
-                                  isInspectionExpired
-                                    ? 'text-rose-600 font-bold'
-                                    : isInspectionDueSoon
-                                    ? 'text-amber-600 font-semibold'
-                                    : 'text-slate-400'
-                                }`}
-                                title={`Hạn kiểm định: ${formatDate(item.inspectionDueDate)}`}
-                              >
-                                <Clock className="w-3 h-3" />
-                                <span>{formatDate(item.inspectionDueDate)}</span>
-                              </div>
+                            {item.spec && (
+                              <>
+                                <span aria-hidden="true">&bull;</span>
+                                <span className="text-slate-400 truncate max-w-[150px]">{item.spec}</span>
+                              </>
                             )}
                           </div>
-                        ) : (
-                          <span
-                            className={`inline-block px-2 py-0.5 rounded text-[11px] font-medium ${
-                              status === 'BINH_THUONG'
-                                ? 'bg-slate-100 text-slate-700'
-                                : status === 'CANH_BAO_THAP'
-                                ? 'bg-amber-50 text-amber-700 border border-amber-200'
-                                : status === 'HET_HANG'
-                                ? 'bg-rose-50 text-rose-700 border border-rose-200 font-semibold'
-                                : 'bg-purple-50 text-purple-700 border border-purple-200'
-                            }`}
-                          >
-                            {getStockStatusLabel(status)}
-                          </span>
-                        )}
-                      </td>
+                        </td>
 
-                      {/* Actions */}
-                      <td className="py-3.5 px-4 text-center whitespace-nowrap">
-                        <div className="flex items-center justify-center gap-1">
-                          <button
-                            onClick={() => onSelectStockCard(item.id)}
-                            className="p-1.5 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded transition-colors"
-                            title="Xem thẻ kho chi tiết"
-                          >
-                            <Eye className="w-4 h-4" />
-                          </button>
-
-                          {canManage && (
-                            <>
-                              <button
-                                onClick={() => onQuickGoodsIn(item)}
-                                className="p-1.5 text-slate-500 hover:text-emerald-600 hover:bg-emerald-50 rounded transition-colors"
-                                title="Lập phiếu nhập thêm cho vật tư này"
-                              >
-                                <ArrowDownLeft className="w-4 h-4" />
-                              </button>
-
-                              <button
-                                onClick={() => onEditItem(item)}
-                                className="p-1.5 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors"
-                                title="Chỉnh sửa thông tin"
-                              >
-                                <Edit2 className="w-4 h-4" />
-                              </button>
-                            </>
-                          )}
-
-                          {isAdmin && (
-                            <button
-                              onClick={() => setItemToDelete(item)}
-                              className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors"
-                              title="Xóa vật tư (Quản trị viên)"
+                        {/* Serial / Lot Number Column */}
+                        <td className="py-3.5 px-3 font-mono text-slate-700 whitespace-nowrap">
+                          {item.serialOrLot ? (
+                            <span
+                              className="inline-block bg-slate-100 text-slate-800 px-2 py-0.5 rounded font-mono text-[11px] font-semibold border border-slate-200"
+                              title={`Số serial / số lô: ${item.serialOrLot}`}
                             >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
+                              {item.serialOrLot}
+                            </span>
+                          ) : (
+                            <span className="text-slate-300 italic text-[11px]">—</span>
                           )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                        </td>
+
+                        {/* Type */}
+                        <td className="py-3.5 px-3 text-slate-600 whitespace-nowrap">
+                          <span className="px-2 py-0.5 rounded text-[11px] font-medium bg-slate-100 text-slate-700">
+                            {getItemTypeLabel(item.type)}
+                          </span>
+                        </td>
+
+                        {/* Warehouse & Shelf */}
+                        <td className="py-3.5 px-3 whitespace-nowrap max-w-[180px]">
+                          <div
+                            className="text-slate-800 font-semibold truncate flex items-center gap-1.5"
+                            title={tooltip}
+                          >
+                            {whWithStock.length > 1 ? (
+                              <span className="bg-indigo-50 text-indigo-800 px-1.5 py-0.5 rounded text-[11px] font-bold border border-indigo-100">
+                                Đa kho ({whWithStock.length})
+                              </span>
+                            ) : whWithStock.length === 1 ? (
+                              <span className="truncate">{whWithStock[0].name}</span>
+                            ) : (
+                              <span className="truncate text-slate-500">
+                                {wh?.name || 'Chưa phân kho'}
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-slate-500 font-medium mt-0.5">
+                            Kệ: <span className="text-slate-800 font-semibold">{item.location || 'Chưa xếp kệ'}</span>
+                          </div>
+                        </td>
+
+                        {/* Current Stock */}
+                        <td className="py-3.5 px-3 text-right whitespace-nowrap">
+                          <div className="flex items-center justify-end gap-1.5">
+                            <span
+                              className={`text-sm font-bold tabular-nums ${
+                                item.currentStock === 0
+                                  ? 'text-rose-600'
+                                  : item.currentStock < item.minStock
+                                  ? 'text-amber-600'
+                                  : 'text-slate-900'
+                              }`}
+                            >
+                              {formatNumber(item.currentStock)}
+                            </span>
+                            <span className="text-[11px] text-slate-500">{item.unit}</span>
+                          </div>
+                          {isLow && (
+                            <span className="text-[10px] text-rose-600 font-medium block">
+                              {status === 'HET_HANG' ? 'Hết hàng' : 'Dưới định mức'}
+                            </span>
+                          )}
+                          {isOver && (
+                            <span className="text-[10px] text-amber-600 font-medium block">
+                              Vượt max ({item.maxStock})
+                            </span>
+                          )}
+                        </td>
+
+                        {/* Min-Max threshold */}
+                        <td className="py-3.5 px-3 text-right tabular-nums text-slate-500 whitespace-nowrap">
+                          <span>{formatNumber(item.minStock)}</span>
+                          <span className="text-slate-300 mx-1">/</span>
+                          <span>{formatNumber(item.maxStock)}</span>
+                        </td>
+
+                        {/* Unit Price */}
+                        <td className="py-3.5 px-3 text-right tabular-nums text-slate-600 whitespace-nowrap">
+                          {formatCurrency(item.unitPrice)}
+                        </td>
+
+                        {/* Total Value */}
+                        <td className="py-3.5 px-4 text-right tabular-nums font-semibold text-slate-900 whitespace-nowrap">
+                          {formatCurrency(totalVal)}
+                        </td>
+
+                        {/* Status & Condition */}
+                        <td className="py-3.5 px-3 text-center whitespace-nowrap">
+                          {item.type === 'THIET_BI' || item.type === 'CONG_CU' ? (
+                            <div className="space-y-1">
+                              <span
+                                className={`inline-block px-2 py-0.5 rounded text-[11px] font-medium ${
+                                  item.condition === 'SAN_SANG'
+                                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                    : item.condition === 'DANG_MUON'
+                                    ? 'bg-blue-50 text-blue-700 border border-blue-200'
+                                    : item.condition === 'BAO_DUONG'
+                                    ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                                    : 'bg-rose-50 text-rose-700 border border-rose-200'
+                                }`}
+                              >
+                                {getConditionLabel(item.condition)}
+                              </span>
+
+                              {item.inspectionDueDate && (
+                                <div
+                                  className={`text-[10px] flex items-center justify-center gap-1 ${
+                                    isInspectionExpired
+                                      ? 'text-rose-600 font-bold'
+                                      : isInspectionDueSoon
+                                      ? 'text-amber-600 font-semibold'
+                                      : 'text-slate-400'
+                                  }`}
+                                  title={`Hạn kiểm định: ${formatDate(item.inspectionDueDate)}`}
+                                >
+                                  <Clock className="w-3 h-3" />
+                                  <span>{formatDate(item.inspectionDueDate)}</span>
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <span
+                              className={`inline-block px-2 py-0.5 rounded text-[11px] font-medium ${
+                                status === 'BINH_THUONG'
+                                  ? 'bg-slate-100 text-slate-700'
+                                  : status === 'CANH_BAO_THAP'
+                                  ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                                  : status === 'HET_HANG'
+                                  ? 'bg-rose-50 text-rose-700 border border-rose-200 font-semibold'
+                                  : 'bg-purple-50 text-purple-700 border border-purple-200'
+                              }`}
+                            >
+                              {getStockStatusLabel(status)}
+                            </span>
+                          )}
+                        </td>
+
+                        {/* Actions */}
+                        <td className="py-3.5 px-4 text-center whitespace-nowrap">
+                          <div className="flex items-center justify-center gap-1">
+                            <button
+                              onClick={() => onSelectStockCard(item.id)}
+                              className="p-1.5 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded transition-colors"
+                              title="Xem thẻ kho chi tiết"
+                            >
+                              <Eye className="w-4 h-4" />
+                            </button>
+
+                            {canManage && (
+                              <>
+                                <button
+                                  onClick={() => onQuickGoodsIn(item)}
+                                  className="p-1.5 text-slate-500 hover:text-emerald-600 hover:bg-emerald-50 rounded transition-colors"
+                                  title="Lập phiếu nhập thêm cho vật tư này"
+                                >
+                                  <ArrowDownLeft className="w-4 h-4" />
+                                </button>
+
+                                <button
+                                  onClick={() => onEditItem(item)}
+                                  className="p-1.5 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors"
+                                  title="Chỉnh sửa thông tin"
+                                >
+                                  <Edit2 className="w-4 h-4" />
+                                </button>
+                              </>
+                            )}
+
+                            {isAdmin && (
+                              <button
+                                onClick={() => setItemToDelete(item)}
+                                className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors"
+                                title="Xóa vật tư (Quản trị viên)"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <PaginationBar
+              currentPage={safePage}
+              totalItems={filteredItems.length}
+              pageSize={pageSize}
+              onPageChange={setCurrentPage}
+              onPageSizeChange={setPageSize}
+              itemLabel="mặt hàng"
+            />
+          </>
         )}
       </div>
 

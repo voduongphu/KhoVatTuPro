@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import * as XLSX from 'xlsx';
 import {
   X,
@@ -7,19 +7,13 @@ import {
   Download,
   AlertTriangle,
   CheckCircle2,
-  PackagePlus,
-  PackageMinus,
   Check,
   AlertCircle,
   HelpCircle,
-  ArrowRight,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
 import {
   InventoryItem,
-  IssueSubtype,
-  ReceiptSubtype,
-  Transaction,
   TransactionLineItem,
   TransactionSubtype,
   TransactionType,
@@ -30,6 +24,7 @@ import {
   getSubtypeLabel,
   getTransactionTypeLabel,
 } from '../utils/formatters';
+import { PaginationBar } from './PaginationBar';
 
 interface ExcelImportModalProps {
   onClose: () => void;
@@ -206,6 +201,8 @@ function resolveTransactionSubtype(type: TransactionType, rawSubtype: any): Tran
   }
 }
 
+const MAX_PREVIEW_LINES_PER_VOUCHER = 25;
+
 export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onSuccess }) => {
   const { warehouses, items, importTransactionsBatch, currentUser } = useInventory();
 
@@ -214,6 +211,10 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
   const [parsedTransactions, setParsedTransactions] = useState<ParsedGroupedTransaction[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [activeTab, setActiveTab] = useState<'preview' | 'help'>('preview');
+  const [parseError, setParseError] = useState('');
+  const [previewPage, setPreviewPage] = useState(1);
+  const [previewPageSize, setPreviewPageSize] = useState(30);
+  const [expandedVoucherIds, setExpandedVoucherIds] = useState<Record<string, boolean>>({});
   const [importSummary, setImportSummary] = useState<{
     success: boolean;
     importedCount: number;
@@ -373,76 +374,38 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
     XLSX.writeFile(workbook, 'Mau_Import_Phieu_Nhap_Xuat_Kho_PTSC.xlsx');
   };
 
-  // Helper function to extract cell value with tolerant matching
-  const getCleanVal = (row: any, ...candidates: string[]) => {
-    // 1. Exact normalized match
-    for (const cand of candidates) {
-      const candNorm = removeVietnameseTones(cand).toLowerCase().trim();
-      for (const key of Object.keys(row)) {
-        const keyNorm = removeVietnameseTones(key).toLowerCase().trim();
-        if (keyNorm === candNorm) {
-          const val = row[key];
-          if (val !== undefined && val !== null && String(val).trim() !== '') {
-            return val;
+  // Build once-per-row normalized header lookup instead of calling removeVietnameseTones hundreds of times per row
+  const createRowReader = (row: Record<string, any>) => {
+    const entries: Array<[string, any]> = [];
+    const exactMap = new Map<string, any>();
+    for (const key of Object.keys(row)) {
+      const val = row[key];
+      if (val === undefined || val === null || String(val).trim() === '') continue;
+      const keyNorm = removeVietnameseTones(key).toLowerCase().trim();
+      entries.push([keyNorm, val]);
+      if (!exactMap.has(keyNorm)) {
+        exactMap.set(keyNorm, val);
+      }
+    }
+    return (...normCandidates: string[]) => {
+      for (let i = 0; i < normCandidates.length; i++) {
+        const cand = normCandidates[i];
+        if (exactMap.has(cand)) return exactMap.get(cand);
+      }
+      for (let i = 0; i < normCandidates.length; i++) {
+        const cand = normCandidates[i];
+        for (let j = 0; j < entries.length; j++) {
+          const k = entries[j][0];
+          if (k.includes(cand) || cand.includes(k)) {
+            return entries[j][1];
           }
         }
       }
-    }
-
-    // 2. Contains match
-    for (const cand of candidates) {
-      const candNorm = removeVietnameseTones(cand).toLowerCase().trim();
-      for (const key of Object.keys(row)) {
-        const keyNorm = removeVietnameseTones(key).toLowerCase().trim();
-        if (keyNorm.includes(candNorm) || candNorm.includes(keyNorm)) {
-          const val = row[key];
-          if (val !== undefined && val !== null && String(val).trim() !== '') {
-            return val;
-          }
-        }
-      }
-    }
-
-    return undefined;
+      return undefined;
+    };
   };
 
-  // Check if row is empty or a total/summary row
-  const isSummaryOrEmptyRow = (row: any): boolean => {
-    const stt = String(row['STT'] || row['stt'] || '').trim().toUpperCase();
-    if (stt.includes('TONG') || stt.includes('CONG') || stt.includes('TOTAL')) {
-      return true;
-    }
-
-    const itemCode = getCleanVal(
-      row,
-      'Mã SKU Vật Tư',
-      'Mã Vật Tư',
-      'Mã SKU',
-      'Mã VT',
-      'SKU',
-      'Code',
-      'itemCode'
-    );
-    const itemName = getCleanVal(
-      row,
-      'Tên Vật Tư Thiết Bị',
-      'Tên Vật Tư / Thiết Bị',
-      'Tên Vật Tư',
-      'Tên Hàng',
-      'Tên Thiết Bị',
-      'Tên'
-    );
-    const qty = getCleanVal(row, 'Số Lượng Vật Tư', 'Số Lượng', 'Qty', 'SL');
-
-    if (!itemCode && !itemName && !qty) return true;
-    if (String(itemName || '').toUpperCase().includes('TỔNG CỘNG') || String(itemName || '').toUpperCase().includes('TOTAL')) {
-      return true;
-    }
-
-    return false;
-  };
-
-  // Parse Uploaded File
+  // Parse Uploaded File in O(M)
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -450,19 +413,21 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
     setFileName(file.name);
     setIsProcessing(true);
     setImportSummary(null);
+    setParseError('');
+    setPreviewPage(1);
+    setExpandedVoucherIds({});
 
     const reader = new FileReader();
     reader.onload = evt => {
       try {
-        const bstr = evt.target?.result;
-        const wb = XLSX.read(bstr, { type: 'binary', cellDates: true });
+        const buffer = evt.target?.result;
+        const wb = XLSX.read(buffer, { type: 'array', cellDates: true });
 
-        // Iterate through all sheets that contain data or choose the first sheet
-        let rawData: any[] = [];
+        let rawData: Record<string, any>[] = [];
         for (const sheetName of wb.SheetNames) {
           if (sheetName.toLowerCase().includes('huong_dan')) continue;
           const sheet = wb.Sheets[sheetName];
-          const rows: any[] = XLSX.utils.sheet_to_json(sheet);
+          const rows: Record<string, any>[] = XLSX.utils.sheet_to_json(sheet);
           if (rows && rows.length > 0) {
             rawData = rawData.concat(rows);
           }
@@ -474,174 +439,125 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
         }
 
         if (!rawData || rawData.length === 0) {
-          alert('File Excel không có dữ liệu hợp lệ hoặc các sheet đều trống.');
+          setParseError('File Excel không có dữ liệu hợp lệ hoặc các sheet đều trống.');
           setIsProcessing(false);
           return;
         }
 
-        // Group rows into transactions by Voucher Code OR (Date + Type + Warehouse + Partner + Project)
-        const groupedMap = new Map<string, ParsedGroupedTransaction>();
+        // Pre-index catalog items by uppercase SKU and normalized Name in O(N) once!
+        const itemByCodeUpper = new Map<string, InventoryItem>();
+        const itemByNormName = new Map<string, InventoryItem>();
+        for (let i = 0; i < items.length; i++) {
+          const it = items[i];
+          const cUpper = it.code.trim().toUpperCase();
+          if (cUpper) itemByCodeUpper.set(cUpper, it);
+          const nNorm = removeVietnameseTones(it.name).toLowerCase();
+          if (nNorm && !itemByNormName.has(nNorm)) {
+            itemByNormName.set(nNorm, it);
+          }
+        }
 
-        // Temp stock tracking to validate multiple issue rows within the same imported batch
+        // Pre-index warehouses in O(W) once
+        const whExactMap = new Map<string, (typeof warehouses)[number]>();
+        const whNormList = warehouses.map(w => {
+          const idN = removeVietnameseTones(w.id).toLowerCase();
+          const codeN = removeVietnameseTones(w.code).toLowerCase();
+          const nameN = removeVietnameseTones(w.name).toLowerCase();
+          whExactMap.set(idN, w);
+          whExactMap.set(codeN, w);
+          whExactMap.set(nameN, w);
+          return { wh: w, nameN };
+        });
+
+        const CAND_VOUCHER = ['so phieu', 'ma phieu', 'so chung tu', 'so ct', 'ma ct', 'voucher code', 'voucher', 'code'];
+        const CAND_TYPE = ['loai phieu (nhap_kho/xuat_kho)', 'loai phieu', 'loai nghiep vu', 'loai chung tu', 'loai', 'type'];
+        const CAND_SUBTYPE = ['hinh thuc nghiep vu', 'hinh thuc', 'nghiep vu', 'phan loai', 'ly do', 'subtype'];
+        const CAND_DATE = ['ngay lap', 'ngay lap phieu', 'ngay (yyyy-mm-dd)', 'ngay', 'thoi gian', 'date'];
+        const CAND_WH = ['ma kho', 'kho hang', 'ten kho', 'kho luu tru', 'kho luu', 'kho', 'warehouse'];
+        const CAND_PARTNER = [
+          'doi tac / nha cung cap / nguoi nhan',
+          'doi tac / nha cung cap',
+          'nguoi nhan / don vi nhan',
+          'doi tac / don vi nhan',
+          'doi tac',
+          'nha cung cap',
+          'nguoi nhan',
+          'don vi nhan',
+          'partner',
+        ];
+        const CAND_PROJECT = ['du an / phong ban', 'du an', 'phong ban', 'cong trinh', 'muc dich', 'project'];
+        const CAND_ITEM_CODE = ['ma sku vat tu', 'ma vat tu', 'ma sku', 'ma vt', 'sku', 'ma hang', 'itemcode', 'code'];
+        const CAND_ITEM_NAME = ['ten vat tu thiet bi', 'ten vat tu / thiet bi', 'ten vat tu', 'ten hang', 'ten thiet bi', 'ten', 'item name'];
+        const CAND_UNIT = ['don vi tinh', 'dvt', 'don vi', 'unit'];
+        const CAND_QTY = ['so luong vat tu', 'so luong', 'sl', 'qty'];
+        const CAND_PRICE = ['don gia (vnd)', 'don gia', 'gia von', 'gia', 'price'];
+        const CAND_SERIAL = ['so serial / lo', 'so lo / serial', 'so serial', 'so lo', 'serial', 'lot'];
+        const CAND_NOTE = ['ghi chu', 'luu y', 'dien giai', 'note'];
+
+        const groupedMap = new Map<string, ParsedGroupedTransaction>();
         const cumulativeInQty = new Map<string, number>();
         const cumulativeOutQty = new Map<string, number>();
+        const nowSuffix = Date.now().toString().slice(-4);
 
-        rawData.forEach((row, idx) => {
-          // Bỏ qua dòng trống hoặc dòng tổng cộng từ file xuất ra
-          if (isSummaryOrEmptyRow(row)) return;
+        for (let idx = 0; idx < rawData.length; idx++) {
+          const row = rawData[idx];
+          const stt = String(row['STT'] || row['stt'] || '').trim().toUpperCase();
+          if (stt.includes('TONG') || stt.includes('CONG') || stt.includes('TOTAL')) {
+            continue;
+          }
 
-          const rawVoucherCode = String(
-            getCleanVal(
-              row,
-              'Số Phiếu',
-              'Mã Phiếu',
-              'Số chứng từ',
-              'Số CT',
-              'Mã CT',
-              'Voucher Code',
-              'Voucher',
-              'Code'
-            ) || ''
-          ).trim();
+          const getVal = createRowReader(row);
+          const rawItemCodeVal = getVal(...CAND_ITEM_CODE);
+          const rawItemName = getVal(...CAND_ITEM_NAME);
+          const rawQtyVal = getVal(...CAND_QTY);
 
-          const rawType = getCleanVal(
-            row,
-            'Loại Phiếu (NHAP_KHO/XUAT_KHO)',
-            'Loại Phiếu',
-            'Loại Nghiệp Vụ',
-            'Loại chứng từ',
-            'Loại',
-            'Type'
-          );
+          if (!rawItemCodeVal && !rawItemName && !rawQtyVal) continue;
+          const upperName = String(rawItemName || '').toUpperCase();
+          if (upperName.includes('TỔNG CỘNG') || upperName.includes('TOTAL')) {
+            continue;
+          }
 
+          const rawVoucherCode = String(getVal(...CAND_VOUCHER) || '').trim();
+          const rawType = getVal(...CAND_TYPE);
           const type: TransactionType = resolveTransactionType(rawType, rawVoucherCode);
+          const subtype: TransactionSubtype = resolveTransactionSubtype(type, getVal(...CAND_SUBTYPE));
+          const dateStr = parseExcelDate(getVal(...CAND_DATE));
 
-          const rawSubtype = getCleanVal(
-            row,
-            'Hình Thức Nghiệp Vụ',
-            'Hình Thức',
-            'Nghiệp Vụ',
-            'Phân loại',
-            'Lý do',
-            'Subtype'
-          );
-          const subtype: TransactionSubtype = resolveTransactionSubtype(type, rawSubtype);
-
-          const rawDate = getCleanVal(
-            row,
-            'Ngày Lập',
-            'Ngày Lập Phiếu',
-            'Ngày (YYYY-MM-DD)',
-            'Ngày',
-            'Thời gian',
-            'Date'
-          );
-          const dateStr = parseExcelDate(rawDate);
-
-          const rawWh = String(
-            getCleanVal(
-              row,
-              'Mã Kho',
-              'Kho Hàng',
-              'Tên Kho',
-              'Kho Lưu Trữ',
-              'Kho Lưu',
-              'Kho',
-              'Warehouse'
-            ) || ''
-          ).trim();
-
-          // Tìm kho tương ứng theo id, code hoặc name
+          const rawWh = String(getVal(...CAND_WH) || '').trim();
           let matchedWh = warehouses[0];
           if (rawWh) {
             const rawWhNorm = removeVietnameseTones(rawWh).toLowerCase();
-            const foundWh = warehouses.find(w => {
-              const idNorm = removeVietnameseTones(w.id).toLowerCase();
-              const codeNorm = removeVietnameseTones(w.code).toLowerCase();
-              const nameNorm = removeVietnameseTones(w.name).toLowerCase();
-              return (
-                idNorm === rawWhNorm ||
-                codeNorm === rawWhNorm ||
-                nameNorm === rawWhNorm ||
-                nameNorm.includes(rawWhNorm)
-              );
-            });
+            let foundWh = whExactMap.get(rawWhNorm);
+            if (!foundWh) {
+              for (let wIdx = 0; wIdx < whNormList.length; wIdx++) {
+                if (whNormList[wIdx].nameN.includes(rawWhNorm)) {
+                  foundWh = whNormList[wIdx].wh;
+                  break;
+                }
+              }
+            }
             if (foundWh) matchedWh = foundWh;
           }
 
           const partner = String(
-            getCleanVal(
-              row,
-              'Đối Tác / Nhà Cung Cấp / Người Nhận',
-              'Đối Tác / Nhà Cung Cấp',
-              'Người Nhận / Đơn Vị Nhận',
-              'Đối Tác / Đơn Vị Nhận',
-              'Đối Tác',
-              'Nhà Cung Cấp',
-              'Người Nhận',
-              'Đơn Vị Nhận',
-              'Partner'
-            ) || (type === 'NHAP_KHO' ? 'Nhà cung cấp vật tư' : 'Đơn vị nhận thi công')
+            getVal(...CAND_PARTNER) ||
+              (type === 'NHAP_KHO' ? 'Nhà cung cấp vật tư' : 'Đơn vị nhận thi công')
           ).trim();
 
-          const project = String(
-            getCleanVal(
-              row,
-              'Dự Án / Phòng Ban',
-              'Dự Án',
-              'Phòng Ban',
-              'Công trình',
-              'Mục đích',
-              'Project'
-            ) || 'Dự án công trình'
-          ).trim();
+          const project = String(getVal(...CAND_PROJECT) || 'Dự án công trình').trim();
+          const rawItemCode = String(rawItemCodeVal || '').trim();
+          const rawUnit = getVal(...CAND_UNIT) || 'Cái';
+          const qty = parseCleanNumber(rawQtyVal);
+          const unitPrice = parseCleanNumber(getVal(...CAND_PRICE));
+          const serial = String(getVal(...CAND_SERIAL) || '').trim();
+          const note = String(getVal(...CAND_NOTE) || '').trim();
 
-          const rawItemCode = String(
-            getCleanVal(
-              row,
-              'Mã SKU Vật Tư',
-              'Mã Vật Tư',
-              'Mã SKU',
-              'Mã VT',
-              'SKU',
-              'Mã Hàng',
-              'Code'
-            ) || ''
-          ).trim();
-
-          const rawItemName = getCleanVal(
-            row,
-            'Tên Vật Tư Thiết Bị',
-            'Tên Vật Tư / Thiết Bị',
-            'Tên Vật Tư',
-            'Tên Hàng',
-            'Tên Thiết Bị',
-            'Tên',
-            'Item Name'
-          );
-
-          const rawUnit = getCleanVal(row, 'Đơn Vị Tính', 'ĐVT', 'Đơn vị', 'Unit') || 'Cái';
-          const qty = parseCleanNumber(getCleanVal(row, 'Số Lượng Vật Tư', 'Số Lượng', 'SL', 'Qty'));
-          const rawPrice = getCleanVal(row, 'Đơn Giá (VNĐ)', 'Đơn Giá', 'Giá vốn', 'Giá', 'Price');
-          const unitPrice = parseCleanNumber(rawPrice);
-
-          const serial = String(
-            getCleanVal(row, 'Số Serial / Lô', 'Số Lô / Serial', 'Số serial', 'Số lô', 'Serial', 'Lot') || ''
-          ).trim();
-
-          const note = String(getCleanVal(row, 'Ghi Chú', 'Ghi chú', 'Lưu ý', 'Diễn giải', 'Note') || '').trim();
-
-          // Match item in catalog by SKU or Name
+          // O(1) match item in catalog by SKU or normalized Name
           const itemCodeClean = rawItemCode.toUpperCase();
-          let matchedItem = items.find(
-            i => i.code.trim().toUpperCase() === itemCodeClean
-          );
-
+          let matchedItem = itemCodeClean ? itemByCodeUpper.get(itemCodeClean) : undefined;
           if (!matchedItem && rawItemName) {
             const nameNorm = removeVietnameseTones(String(rawItemName)).toLowerCase();
-            matchedItem = items.find(
-              i => removeVietnameseTones(i.name).toLowerCase() === nameNorm
-            );
+            matchedItem = itemByNormName.get(nameNorm);
           }
 
           const isNewItem = !matchedItem && type === 'NHAP_KHO';
@@ -655,11 +571,12 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
             errors.push(`Dòng ${idx + 2}: Số lượng phải lớn hơn 0 (hiện tại: ${qty}).`);
           }
 
-          // Kiểm tra tồn kho đối với phiếu xuất kho
           const itemKey = matchedItem ? matchedItem.code.toUpperCase() : itemCodeClean;
           if (type === 'XUAT_KHO') {
             if (!matchedItem) {
-              errors.push(`Dòng ${idx + 2}: Vật tư mã "${rawItemCode || rawItemName}" chưa tồn tại trong danh mục để xuất kho.`);
+              errors.push(
+                `Dòng ${idx + 2}: Vật tư mã "${rawItemCode || rawItemName}" chưa tồn tại trong danh mục để xuất kho.`
+              );
             } else {
               const inSoFar = cumulativeInQty.get(itemKey) || 0;
               const outSoFar = cumulativeOutQty.get(itemKey) || 0;
@@ -673,22 +590,19 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
                 cumulativeOutQty.set(itemKey, outSoFar + qty);
               }
             }
-          } else {
-            // Phiếu nhập kho: ghi nhận cộng dồn
+          } else if (itemKey) {
             const inSoFar = cumulativeInQty.get(itemKey) || 0;
             cumulativeInQty.set(itemKey, inSoFar + qty);
           }
 
           const finalUnitPrice =
-            unitPrice > 0
-              ? unitPrice
-              : matchedItem
-              ? matchedItem.unitPrice
-              : 0;
+            unitPrice > 0 ? unitPrice : matchedItem ? matchedItem.unitPrice : 0;
 
           const lineItem: TransactionLineItem = {
             itemId: matchedItem ? matchedItem.id : '',
-            itemCode: matchedItem ? matchedItem.code : itemCodeClean || `VT-${Date.now().toString().slice(-4)}`,
+            itemCode: matchedItem
+              ? matchedItem.code
+              : itemCodeClean || `VT-${nowSuffix}-${idx + 1}`,
             itemName: rawItemName
               ? String(rawItemName).trim()
               : matchedItem
@@ -703,15 +617,12 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
             isNewItem,
           };
 
-          // Grouping logic:
-          // Nếu có Mã / Số phiếu riêng biệt thì gộp theo Mã phiếu
-          // Nếu không có thì gộp theo Ngày + Loại + Kho + Đối tác + Dự án
           const groupKey = rawVoucherCode
             ? `VOUCHER_${rawVoucherCode.toUpperCase()}`
             : `${dateStr.substring(0, 10)}_${type}_${matchedWh.id}_${partner}_${project}`;
 
-          if (groupedMap.has(groupKey)) {
-            const existing = groupedMap.get(groupKey)!;
+          const existing = groupedMap.get(groupKey);
+          if (existing) {
             existing.items.push(lineItem);
             existing.totalAmount += lineItem.amount;
             if (errors.length > 0) {
@@ -720,7 +631,7 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
             }
           } else {
             groupedMap.set(groupKey, {
-              id: `GROUP-${Date.now()}-${idx}`,
+              id: `GROUP-${nowSuffix}-${idx}`,
               code: rawVoucherCode || undefined,
               type,
               subtype,
@@ -736,24 +647,32 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
               errors,
             });
           }
-        });
+        }
 
-        setParsedTransactions(Array.from(groupedMap.values()));
+        const groupedList = Array.from(groupedMap.values());
+        if (groupedList.length === 0) {
+          setParseError('Không tìm thấy dòng chứng từ hợp lệ nào trong file Excel đã chọn.');
+        }
+        setParsedTransactions(groupedList);
       } catch (err: any) {
-        alert('Lỗi khi đọc file Excel: ' + (err.message || 'Định dạng file không phù hợp. Vui lòng kiểm tra lại cấu trúc bảng.'));
+        setParseError(
+          'Lỗi khi đọc file Excel: ' +
+            (err.message || 'Định dạng file không phù hợp. Vui lòng kiểm tra lại cấu trúc bảng.')
+        );
       } finally {
         setIsProcessing(false);
       }
     };
 
-    reader.readAsBinaryString(file);
+    reader.readAsArrayBuffer(file);
   };
 
   // Confirm Import
   const handleConfirmImport = () => {
+    setParseError('');
     const validTransactions = parsedTransactions.filter(t => t.isValid);
     if (validTransactions.length === 0) {
-      alert('Không có phiếu nào hợp lệ để import. Vui lòng kiểm tra danh sách lỗi bên dưới.');
+      setParseError('Không có phiếu nào hợp lệ để import. Vui lòng kiểm tra danh sách lỗi bên dưới.');
       return;
     }
 
@@ -783,9 +702,25 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
     }
   };
 
-  const validCount = parsedTransactions.filter(t => t.isValid).length;
-  const invalidCount = parsedTransactions.filter(t => !t.isValid).length;
-  const totalLines = parsedTransactions.reduce((acc, t) => acc + t.items.length, 0);
+  const { validCount, invalidCount, totalLines } = useMemo(() => {
+    let valid = 0;
+    let invalid = 0;
+    let lines = 0;
+    for (let i = 0; i < parsedTransactions.length; i++) {
+      const t = parsedTransactions[i];
+      if (t.isValid) valid++;
+      else invalid++;
+      lines += t.items.length;
+    }
+    return { validCount: valid, invalidCount: invalid, totalLines: lines };
+  }, [parsedTransactions]);
+
+  const totalPreviewPages = Math.max(1, Math.ceil(parsedTransactions.length / previewPageSize));
+  const safePreviewPage = Math.min(previewPage, totalPreviewPages);
+  const paginatedTransactions = useMemo(() => {
+    const start = (safePreviewPage - 1) * previewPageSize;
+    return parsedTransactions.slice(start, start + previewPageSize);
+  }, [parsedTransactions, safePreviewPage, previewPageSize]);
 
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
@@ -894,6 +829,23 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
                 </p>
               </div>
 
+              {/* Inline Parse / Validation Error Banner */}
+              {parseError && (
+                <div className="p-3.5 rounded-xl border border-rose-200 bg-rose-50 text-rose-800 flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                    <span className="font-medium">{parseError}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setParseError('')}
+                    className="text-rose-400 hover:text-rose-700 p-0.5"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
               {/* Import Result Notification if finished */}
               {importSummary && (
                 <div
@@ -911,17 +863,22 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
                     )}
                     <span>
                       {importSummary.success
-                        ? `Import thành công ${importSummary.importedCount} phiếu vào kho!`
+                        ? `Import thành công ${formatNumber(importSummary.importedCount)} phiếu vào kho!`
                         : 'Import có lỗi xảy ra.'}
                     </span>
                   </div>
                   {importSummary.errors.length > 0 && (
-                    <div className="mt-2 space-y-1 text-xs">
-                      {importSummary.errors.map((err, i) => (
+                    <div className="mt-2 space-y-1 text-xs max-h-36 overflow-y-auto">
+                      {importSummary.errors.slice(0, 50).map((err, i) => (
                         <div key={i} className="text-rose-700">
                           &bull; {err}
                         </div>
                       ))}
+                      {importSummary.errors.length > 50 && (
+                        <div className="text-rose-600 font-semibold">
+                          ... và {formatNumber(importSummary.errors.length - 50)} lỗi khác.
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -933,17 +890,18 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
                   <div className="flex items-center justify-between flex-wrap gap-2">
                     <div>
                       <h3 className="font-bold text-slate-900 text-sm">
-                        Xem Trước Dữ Liệu ({parsedTransactions.length} chứng từ &bull; {totalLines} dòng mặt hàng)
+                        Xem Trước Dữ Liệu ({formatNumber(parsedTransactions.length)} chứng từ &bull;{' '}
+                        {formatNumber(totalLines)} dòng mặt hàng)
                       </h3>
                       <div className="flex items-center gap-3 text-slate-500 mt-0.5">
                         <span className="text-emerald-700 font-semibold flex items-center gap-1">
                           <Check className="w-3.5 h-3.5" />
-                          <span>{validCount} phiếu hợp lệ</span>
+                          <span>{formatNumber(validCount)} phiếu hợp lệ</span>
                         </span>
                         {invalidCount > 0 && (
                           <span className="text-rose-600 font-semibold flex items-center gap-1">
                             <AlertTriangle className="w-3.5 h-3.5" />
-                            <span>{invalidCount} phiếu có lỗi</span>
+                            <span>{formatNumber(invalidCount)} phiếu có lỗi</span>
                           </span>
                         )}
                       </div>
@@ -956,116 +914,168 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({ onClose, onS
                       className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold rounded-lg shadow-xs flex items-center gap-1.5 transition-colors cursor-pointer"
                     >
                       <CheckCircle2 className="w-4 h-4" />
-                      <span>Xác nhận Lưu Sổ ({validCount} phiếu hợp lệ)</span>
+                      <span>Xác nhận Lưu Sổ ({formatNumber(validCount)} phiếu hợp lệ)</span>
                     </button>
                   </div>
 
-                  {/* Transactions list */}
+                  {/* Paginated Transactions list */}
                   <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
-                    {parsedTransactions.map(trx => (
-                      <div
-                        key={trx.id}
-                        className={`p-3.5 rounded-xl border transition-all ${
-                          trx.isValid
-                            ? 'bg-white border-slate-200'
-                            : 'bg-rose-50/50 border-rose-200'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <span
-                              className={`px-2 py-0.5 rounded font-bold text-[11px] ${
-                                trx.type === 'NHAP_KHO'
-                                  ? 'bg-emerald-100 text-emerald-800'
-                                  : 'bg-amber-100 text-amber-800'
-                              }`}
-                            >
-                              {getTransactionTypeLabel(trx.type)}
-                            </span>
-                            <span className="px-2 py-0.5 rounded text-[11px] font-medium bg-slate-100 text-slate-700">
-                              {getSubtypeLabel(trx.subtype)}
-                            </span>
-                            {trx.code && (
-                              <span className="font-mono font-bold text-slate-900 bg-slate-100 px-2 py-0.5 rounded">
-                                {trx.code}
+                    {paginatedTransactions.map(trx => {
+                      const isExpanded = Boolean(expandedVoucherIds[trx.id]);
+                      const visibleLines = isExpanded
+                        ? trx.items.slice(0, 200)
+                        : trx.items.slice(0, MAX_PREVIEW_LINES_PER_VOUCHER);
+                      const hiddenCount = trx.items.length - visibleLines.length;
+
+                      return (
+                        <div
+                          key={trx.id}
+                          className={`p-3.5 rounded-xl border transition-all ${
+                            trx.isValid
+                              ? 'bg-white border-slate-200'
+                              : 'bg-rose-50/50 border-rose-200'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span
+                                className={`px-2 py-0.5 rounded font-bold text-[11px] ${
+                                  trx.type === 'NHAP_KHO'
+                                    ? 'bg-emerald-100 text-emerald-800'
+                                    : 'bg-amber-100 text-amber-800'
+                                }`}
+                              >
+                                {getTransactionTypeLabel(trx.type)}
                               </span>
-                            )}
-                            <span className="font-semibold text-slate-800">{trx.partnerName}</span>
-                            <span className="text-slate-400">&bull;</span>
-                            <span className="text-slate-600">{trx.departmentOrProject}</span>
+                              <span className="px-2 py-0.5 rounded text-[11px] font-medium bg-slate-100 text-slate-700">
+                                {getSubtypeLabel(trx.subtype)}
+                              </span>
+                              {trx.code && (
+                                <span className="font-mono font-bold text-slate-900 bg-slate-100 px-2 py-0.5 rounded">
+                                  {trx.code}
+                                </span>
+                              )}
+                              <span className="font-semibold text-slate-800">{trx.partnerName}</span>
+                              <span className="text-slate-400">&bull;</span>
+                              <span className="text-slate-600">{trx.departmentOrProject}</span>
+                            </div>
+
+                            <div className="flex items-center gap-3">
+                              <span className="text-slate-500 font-medium">
+                                Kho: <strong className="text-slate-800">{trx.warehouseName}</strong>
+                              </span>
+                              <span className="font-bold text-slate-900 tabular-nums">
+                                {formatCurrency(trx.totalAmount)}
+                              </span>
+                            </div>
                           </div>
 
-                          <div className="flex items-center gap-3">
-                            <span className="text-slate-500 font-medium">
-                              Kho: <strong className="text-slate-800">{trx.warehouseName}</strong>
-                            </span>
-                            <span className="font-bold text-slate-900 tabular-nums">
-                              {formatCurrency(trx.totalAmount)}
-                            </span>
-                          </div>
-                        </div>
-
-                        {/* Errors if any */}
-                        {trx.errors.length > 0 && (
-                          <div className="mb-2 p-2.5 bg-rose-100/70 rounded-lg text-[11px] text-rose-800 space-y-1">
-                            {trx.errors.map((e, ei) => (
-                              <div key={ei} className="flex items-center gap-1.5 font-medium">
-                                <AlertCircle className="w-3.5 h-3.5 text-rose-600 shrink-0" />
-                                <span>{e}</span>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-
-                        {/* Line items mini table */}
-                        <div className="border border-slate-200 rounded-lg overflow-hidden bg-slate-50/50">
-                          <table className="w-full text-left border-collapse text-[11px]">
-                            <thead>
-                              <tr className="border-b border-slate-200 bg-slate-100/80 text-slate-600 font-semibold">
-                                <th className="py-1.5 px-3">Mã SKU</th>
-                                <th className="py-1.5 px-3">Tên vật tư thiết bị</th>
-                                <th className="py-1.5 px-2 text-right">Số lượng</th>
-                                <th className="py-1.5 px-3 text-right">Đơn giá</th>
-                                <th className="py-1.5 px-3 text-right">Thành tiền</th>
-                                <th className="py-1.5 px-3">Số Lô / Serial</th>
-                              </tr>
-                            </thead>
-                            <tbody className="divide-y divide-slate-100">
-                              {trx.items.map((line, li) => (
-                                <tr key={li} className="hover:bg-white/80">
-                                  <td className="py-1 px-3 font-mono font-medium text-slate-800">
-                                    <span className="flex items-center gap-1.5">
-                                      <span>{line.itemCode}</span>
-                                      {line.isNewItem && (
-                                        <span className="text-[9px] bg-emerald-100 text-emerald-800 font-bold px-1 rounded">
-                                          Mới
-                                        </span>
-                                      )}
-                                    </span>
-                                  </td>
-                                  <td className="py-1 px-3 text-slate-700 font-medium">
-                                    {line.itemName}
-                                  </td>
-                                  <td className="py-1 px-2 text-right font-bold tabular-nums text-slate-900">
-                                    {formatNumber(line.quantity)} {line.unit}
-                                  </td>
-                                  <td className="py-1 px-3 text-right tabular-nums text-slate-600">
-                                    {formatCurrency(line.unitPrice)}
-                                  </td>
-                                  <td className="py-1 px-3 text-right tabular-nums font-semibold text-slate-900">
-                                    {formatCurrency(line.amount)}
-                                  </td>
-                                  <td className="py-1 px-3 font-mono text-slate-500">
-                                    {line.serialNumber || '-'}
-                                  </td>
-                                </tr>
+                          {/* Errors if any */}
+                          {trx.errors.length > 0 && (
+                            <div className="mb-2 p-2.5 bg-rose-100/70 rounded-lg text-[11px] text-rose-800 space-y-1 max-h-28 overflow-y-auto">
+                              {trx.errors.slice(0, 20).map((e, ei) => (
+                                <div key={ei} className="flex items-center gap-1.5 font-medium">
+                                  <AlertCircle className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                                  <span>{e}</span>
+                                </div>
                               ))}
-                            </tbody>
-                          </table>
+                              {trx.errors.length > 20 && (
+                                <div className="text-rose-700 font-semibold">
+                                  ... và {formatNumber(trx.errors.length - 20)} lỗi khác trên phiếu này.
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Line items mini table */}
+                          <div className="border border-slate-200 rounded-lg overflow-hidden bg-slate-50/50">
+                            <table className="w-full text-left border-collapse text-[11px]">
+                              <thead>
+                                <tr className="border-b border-slate-200 bg-slate-100/80 text-slate-600 font-semibold">
+                                  <th className="py-1.5 px-3">Mã SKU</th>
+                                  <th className="py-1.5 px-3">Tên vật tư thiết bị</th>
+                                  <th className="py-1.5 px-2 text-right">Số lượng</th>
+                                  <th className="py-1.5 px-3 text-right">Đơn giá</th>
+                                  <th className="py-1.5 px-3 text-right">Thành tiền</th>
+                                  <th className="py-1.5 px-3">Số Lô / Serial</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-100">
+                                {visibleLines.map((line, li) => (
+                                  <tr key={li} className="hover:bg-white/80">
+                                    <td className="py-1 px-3 font-mono font-medium text-slate-800">
+                                      <span className="flex items-center gap-1.5">
+                                        <span>{line.itemCode}</span>
+                                        {line.isNewItem && (
+                                          <span className="text-[9px] bg-emerald-100 text-emerald-800 font-bold px-1 rounded">
+                                            Mới
+                                          </span>
+                                        )}
+                                      </span>
+                                    </td>
+                                    <td className="py-1 px-3 text-slate-700 font-medium">
+                                      {line.itemName}
+                                    </td>
+                                    <td className="py-1 px-2 text-right font-bold tabular-nums text-slate-900">
+                                      {formatNumber(line.quantity)} {line.unit}
+                                    </td>
+                                    <td className="py-1 px-3 text-right tabular-nums text-slate-600">
+                                      {formatCurrency(line.unitPrice)}
+                                    </td>
+                                    <td className="py-1 px-3 text-right tabular-nums font-semibold text-slate-900">
+                                      {formatCurrency(line.amount)}
+                                    </td>
+                                    <td className="py-1 px-3 font-mono text-slate-500">
+                                      {line.serialNumber || '-'}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                            {trx.items.length > MAX_PREVIEW_LINES_PER_VOUCHER && (
+                              <div className="px-3 py-1.5 bg-slate-100/70 border-t border-slate-200 flex items-center justify-between text-[11px] text-slate-600">
+                                <span>
+                                  Đang hiển thị {formatNumber(visibleLines.length)} /{' '}
+                                  {formatNumber(trx.items.length)} dòng vật tư trong phiếu
+                                  {hiddenCount > 0 ? ` (còn ${formatNumber(hiddenCount)} dòng)` : ''}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setExpandedVoucherIds(prev => ({
+                                      ...prev,
+                                      [trx.id]: !isExpanded,
+                                    }))
+                                  }
+                                  className="font-semibold text-indigo-700 hover:text-indigo-900"
+                                >
+                                  {isExpanded ? 'Thu gọn' : 'Xem thêm dòng'}
+                                </button>
+                              </div>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
+
+                  {parsedTransactions.length > previewPageSize && (
+                    <div className="border border-slate-200 rounded-xl overflow-hidden bg-white">
+                      <PaginationBar
+                        currentPage={safePreviewPage}
+                        totalItems={parsedTransactions.length}
+                        pageSize={previewPageSize}
+                        onPageChange={setPreviewPage}
+                        onPageSizeChange={size => {
+                          setPreviewPageSize(size);
+                          setPreviewPage(1);
+                        }}
+                        pageSizeOptions={[20, 30, 50, 100]}
+                        itemLabel="chứng từ"
+                        compact
+                      />
+                    </div>
+                  )}
                 </div>
               )}
             </>

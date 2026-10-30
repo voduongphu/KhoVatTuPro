@@ -76,15 +76,18 @@ function buildMergedDeletedRegistry(
 
   const applyReg = (reg?: DeletedRegistry) => {
     if (!reg || typeof reg !== 'object') return;
-    Object.entries(reg).forEach(([k, v]) => {
-      if (!k || !v) return;
+    const keys = Object.keys(reg);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      const v = reg[k];
+      if (!k || !v) continue;
       const incTime = parseSafeUtcTime(v);
-      if (incTime <= 0) return;
+      if (incTime <= 0) continue;
       const prevTime = parseSafeUtcTime(merged[k]);
       if (incTime > prevTime) {
         merged[k] = new Date(incTime).toISOString();
       }
-    });
+    }
   };
 
   applyReg(localReg);
@@ -119,7 +122,8 @@ function buildMergedDeletedRegistry(
 
 function getLatestTombstoneMs(reg: DeletedRegistry, keys: string[]): number {
   let maxMs = 0;
-  for (const k of keys) {
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
     if (!k) continue;
     const t = parseSafeUtcTime(reg[k]);
     if (t > maxMs) maxMs = t;
@@ -137,7 +141,8 @@ function isEntityDeleted(reg: DeletedRegistry, keys: string[], entityTimeMs: num
 function clearTombstonesIfRevived(reg: DeletedRegistry, keys: string[], entityTimeMs: number) {
   const delMs = getLatestTombstoneMs(reg, keys);
   if (delMs > 0 && entityTimeMs >= delMs) {
-    for (const k of keys) {
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
       if (k && reg[k]) {
         delete reg[k];
       }
@@ -145,94 +150,156 @@ function clearTombstonesIfRevived(reg: DeletedRegistry, keys: string[], entityTi
   }
 }
 
-function computeWarehouseStocksForServer(
-  item: any,
+/**
+ * O(N + T_lines) batch warehouse stock calculator for Express server sync reconciliation.
+ */
+function computeAllWarehouseStocksForServer(
+  items: any[],
   warehouses: any[],
   transactions: any[]
-): Record<string, number> {
-  const allWhIds = new Set<string>();
-  warehouses.forEach((w: any) => {
-    if (w && w.id) allWhIds.add(w.id);
-  });
-  if (item.warehouseId) allWhIds.add(item.warehouseId);
-  if (item.openingWarehouseStocks) {
-    Object.keys(item.openingWarehouseStocks).forEach(k => allWhIds.add(k));
+): Record<string, number>[] {
+  const n = items.length;
+  if (n === 0) return [];
+
+  const configuredWhIds: string[] = [];
+  for (let i = 0; i < warehouses.length; i++) {
+    if (warehouses[i]?.id) configuredWhIds.push(warehouses[i].id);
   }
-  if (item.warehouseStocks) {
-    Object.keys(item.warehouseStocks).forEach(k => allWhIds.add(k));
-  }
+  const fallbackDefaultWhId = configuredWhIds[0] || 'WH-01';
 
-  const activeTrx = transactions.filter((t: any) => t && t.status !== 'DA_HUY');
-  const whMovements: Record<string, { inQty: number; outQty: number }> = {};
-  allWhIds.forEach(whId => {
-    whMovements[whId] = { inQty: 0, outQty: 0 };
-  });
+  const idToIndices = new Map<string, number | number[]>();
+  const codeToIndices = new Map<string, number | number[]>();
 
-  let totalNetTransactions = 0;
-  let wasAutoCreatedByReceipt = false;
-  const normCode = String(item.code || '').trim().toUpperCase();
-
-  activeTrx.forEach((trx: any) => {
-    const whId = trx.warehouseId || item.warehouseId || warehouses[0]?.id || 'WH-01';
-    allWhIds.add(whId);
-    if (!whMovements[whId]) {
-      whMovements[whId] = { inQty: 0, outQty: 0 };
+  const addIndex = (map: Map<string, number | number[]>, key: string, idx: number) => {
+    const existing = map.get(key);
+    if (existing === undefined) {
+      map.set(key, idx);
+    } else if (typeof existing === 'number') {
+      if (existing !== idx) map.set(key, [existing, idx]);
+    } else if (!existing.includes(idx)) {
+      existing.push(idx);
     }
-    const matchingLines = (trx.items || []).filter(
-      (l: any) =>
-        (l.itemId && l.itemId === item.id) ||
-        (normCode && l.itemCode && String(l.itemCode).trim().toUpperCase() === normCode)
-    );
-    matchingLines.forEach((line: any) => {
+  };
+
+  const accums: {
+    whNet: Record<string, number>;
+    unassignedNet: number;
+    totalNet: number;
+    wasAutoCreatedByReceipt: boolean;
+  }[] = new Array(n);
+
+  for (let i = 0; i < n; i++) {
+    const item = items[i];
+    accums[i] = {
+      whNet: {},
+      unassignedNet: 0,
+      totalNet: 0,
+      wasAutoCreatedByReceipt: false,
+    };
+    if (item?.id) addIndex(idToIndices, String(item.id), i);
+    const normCode = String(item?.code || '').trim().toUpperCase();
+    if (normCode) addIndex(codeToIndices, normCode, i);
+  }
+
+  const applyLineToIndex = (
+    idx: number,
+    rawWhId: string,
+    delta: number,
+    isAutoCreatedReceipt: boolean
+  ) => {
+    const acc = accums[idx];
+    if (isAutoCreatedReceipt) acc.wasAutoCreatedByReceipt = true;
+    acc.totalNet += delta;
+    if (rawWhId) {
+      acc.whNet[rawWhId] = (acc.whNet[rawWhId] || 0) + delta;
+    } else {
+      acc.unassignedNet += delta;
+    }
+  };
+
+  for (let t = 0; t < transactions.length; t++) {
+    const trx = transactions[t];
+    if (!trx || trx.status === 'DA_HUY') continue;
+    const isReceipt = trx.type === 'NHAP_KHO';
+    const isIssue = trx.type === 'XUAT_KHO';
+    if (!isReceipt && !isIssue) continue;
+
+    const rawWhId = trx.warehouseId || '';
+    const lines = trx.items || [];
+    for (let l = 0; l < lines.length; l++) {
+      const line = lines[l];
+      if (!line) continue;
       const q = Number(line.quantity) || 0;
-      if (line.isNewItem && trx.type === 'NHAP_KHO') {
-        wasAutoCreatedByReceipt = true;
-      }
-      if (trx.type === 'NHAP_KHO') {
-        whMovements[whId].inQty += q;
-        totalNetTransactions += q;
-      } else if (trx.type === 'XUAT_KHO') {
-        whMovements[whId].outQty += q;
-        totalNetTransactions -= q;
-      }
-    });
-  });
+      const delta = isReceipt ? q : -q;
+      const isAutoReceipt = Boolean(line.isNewItem && isReceipt);
 
-  const primaryWhId = item.warehouseId || warehouses[0]?.id || 'WH-01';
-  allWhIds.add(primaryWhId);
+      const mById = line.itemId ? idToIndices.get(String(line.itemId)) : undefined;
+      const normLineCode = line.itemCode ? String(line.itemCode).trim().toUpperCase() : '';
+      const mByCode = normLineCode ? codeToIndices.get(normLineCode) : undefined;
 
-  const result: Record<string, number> = {};
-  if (item.openingWarehouseStocks && Object.keys(item.openingWarehouseStocks).length > 0) {
-    allWhIds.forEach(whId => {
-      const opening = Number(item.openingWarehouseStocks?.[whId]) || 0;
-      const net = (whMovements[whId]?.inQty || 0) - (whMovements[whId]?.outQty || 0);
-      result[whId] = Math.max(0, opening + net);
-    });
-  } else {
-    const inferredOpening =
-      item.openingStock !== undefined
-        ? Number(item.openingStock) || 0
-        : wasAutoCreatedByReceipt
-        ? 0
-        : Math.max(0, (Number(item.currentStock) || 0) - totalNetTransactions);
+      if (mById === undefined && mByCode === undefined) continue;
 
-    allWhIds.forEach(whId => {
-      const net = (whMovements[whId]?.inQty || 0) - (whMovements[whId]?.outQty || 0);
-      if (whId === primaryWhId) {
-        result[whId] = Math.max(0, inferredOpening + net);
+      if (typeof mById === 'number' && (mByCode === undefined || mByCode === mById)) {
+        applyLineToIndex(mById, rawWhId, delta, isAutoReceipt);
+      } else if (mById === undefined && typeof mByCode === 'number') {
+        applyLineToIndex(mByCode, rawWhId, delta, isAutoReceipt);
       } else {
-        result[whId] = Math.max(0, net);
+        const visited = new Set<number>();
+        if (typeof mById === 'number') visited.add(mById);
+        else if (mById) mById.forEach(idx => visited.add(idx));
+        if (typeof mByCode === 'number') visited.add(mByCode);
+        else if (mByCode) mByCode.forEach(idx => visited.add(idx));
+        visited.forEach(idx => applyLineToIndex(idx, rawWhId, delta, isAutoReceipt));
       }
-    });
+    }
   }
 
-  warehouses.forEach((w: any) => {
-    if (w && w.id && result[w.id] === undefined) {
-      result[w.id] = 0;
-    }
-  });
+  const results: Record<string, number>[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const item = items[i];
+    const acc = accums[i];
+    const primaryWhId = item.warehouseId || fallbackDefaultWhId;
 
-  return result;
+    const allWhIds = new Set<string>(configuredWhIds);
+    allWhIds.add(primaryWhId);
+    if (item.openingWarehouseStocks) {
+      Object.keys(item.openingWarehouseStocks).forEach(k => allWhIds.add(k));
+    }
+    if (item.warehouseStocks) {
+      Object.keys(item.warehouseStocks).forEach(k => allWhIds.add(k));
+    }
+    Object.keys(acc.whNet).forEach(k => allWhIds.add(k));
+
+    const result: Record<string, number> = {};
+    if (item.openingWarehouseStocks && Object.keys(item.openingWarehouseStocks).length > 0) {
+      allWhIds.forEach(whId => {
+        const opening = Number(item.openingWarehouseStocks?.[whId]) || 0;
+        const net = (acc.whNet[whId] || 0) + (whId === primaryWhId ? acc.unassignedNet : 0);
+        result[whId] = Math.max(0, opening + net);
+      });
+    } else {
+      const inferredOpening =
+        item.openingStock !== undefined
+          ? Number(item.openingStock) || 0
+          : acc.wasAutoCreatedByReceipt
+          ? 0
+          : Math.max(0, (Number(item.currentStock) || 0) - acc.totalNet);
+
+      allWhIds.forEach(whId => {
+        const net = (acc.whNet[whId] || 0) + (whId === primaryWhId ? acc.unassignedNet : 0);
+        result[whId] =
+          whId === primaryWhId ? Math.max(0, inferredOpening + net) : Math.max(0, net);
+      });
+    }
+
+    for (let w = 0; w < configuredWhIds.length; w++) {
+      const whId = configuredWhIds[w];
+      if (result[whId] === undefined) result[whId] = 0;
+    }
+    results[i] = result;
+  }
+
+  return results;
 }
 
 function mergeServerStateDeterministic(existing: any, incoming: any): any {
@@ -390,7 +457,7 @@ function mergeServerStateDeterministic(existing: any, incoming: any): any {
   (incoming.warehouses || []).forEach((w: any) => processWarehouse(w, true));
   const mergedWarehouses = Array.from(whMap.values());
 
-  // 3. Transactions + Code De-collision
+  // 3. Transactions + O(1) Code De-collision
   const trxMap = new Map<string, any>();
   const processTransaction = (t: any, isIncoming: boolean) => {
     if (!t || (!t.id && !t.code)) return;
@@ -433,23 +500,35 @@ function mergeServerStateDeterministic(existing: any, incoming: any): any {
   });
 
   const usedCodes = new Set<string>();
+  const currentYear = new Date().getFullYear();
+  const pnPrefix = `PN-${currentYear}-`;
+  const pxPrefix = `PX-${currentYear}-`;
+  let maxPnSeq = 0;
+  let maxPxSeq = 0;
+
+  const trackSeqFromCode = (upperCode: string) => {
+    if (upperCode.startsWith(pnPrefix)) {
+      const num = parseInt(upperCode.slice(pnPrefix.length), 10);
+      if (!Number.isNaN(num) && num > maxPnSeq) maxPnSeq = num;
+    } else if (upperCode.startsWith(pxPrefix)) {
+      const num = parseInt(upperCode.slice(pxPrefix.length), 10);
+      if (!Number.isNaN(num) && num > maxPxSeq) maxPxSeq = num;
+    }
+  };
+
+  for (let i = 0; i < rawTrxAsc.length; i++) {
+    const c = String(rawTrxAsc[i].code || '').trim().toUpperCase();
+    if (c) trackSeqFromCode(c);
+  }
+
   const nextCodeForType = (type: string): string => {
-    const prefix = type === 'NHAP_KHO' ? 'PN' : 'PX';
-    const year = new Date().getFullYear();
-    const pattern = new RegExp(`^${prefix}-${year}-(\\d+)$`, 'i');
-    let maxNum = 0;
-    usedCodes.forEach(c => {
-      const m = c.match(pattern);
-      if (m) {
-        const n = parseInt(m[1], 10);
-        if (n > maxNum) maxNum = n;
-      }
-    });
-    let candidateNum = maxNum + 1;
-    let candidate = `${prefix}-${year}-${String(candidateNum).padStart(4, '0')}`;
+    const isReceipt = type === 'NHAP_KHO';
+    const prefix = isReceipt ? pnPrefix : pxPrefix;
+    let candidateNum = isReceipt ? ++maxPnSeq : ++maxPxSeq;
+    let candidate = `${prefix}${String(candidateNum).padStart(4, '0')}`;
     while (usedCodes.has(candidate)) {
-      candidateNum++;
-      candidate = `${prefix}-${year}-${String(candidateNum).padStart(4, '0')}`;
+      candidateNum = isReceipt ? ++maxPnSeq : ++maxPxSeq;
+      candidate = `${prefix}${String(candidateNum).padStart(4, '0')}`;
     }
     return candidate;
   };
@@ -462,6 +541,7 @@ function mergeServerStateDeterministic(existing: any, incoming: any): any {
       return { ...t, code: reassigned };
     }
     usedCodes.add(normCode);
+    trackSeqFromCode(normCode);
     return { ...t, code: normCode };
   });
 
@@ -472,7 +552,7 @@ function mergeServerStateDeterministic(existing: any, incoming: any): any {
     return parseSafeUtcTime(b.updatedAt) - parseSafeUtcTime(a.updatedAt);
   });
 
-  // 4. Items + Auto-materialization + Exact Stock Calculation
+  // 4. Items + Auto-materialization
   const itemMap = new Map<string, any>();
   const getItemKey = (i: any) =>
     String(i.code && String(i.code).trim() ? i.code : i.id)
@@ -586,7 +666,7 @@ function mergeServerStateDeterministic(existing: any, incoming: any): any {
     });
   });
 
-  // 5. Material Categories + Item-Category Linking
+  // 5. Material Categories + O(1) Item-Category Linking + O(N + T) Stock Calculation
   const catById = new Map<string, any>();
   const processCategory = (cat: any, isIncoming: boolean) => {
     if (!cat || (!cat.id && !cat.code && !cat.name)) return;
@@ -633,7 +713,23 @@ function mergeServerStateDeterministic(existing: any, incoming: any): any {
   (incoming.materialCategories || []).forEach((c: any) => processCategory(c, true));
 
   const dedupByCode = new Map<string, any>();
-  const aliasIdMap = new Map<string, any>();
+  const catLookupByIdUpper = new Map<string, any>();
+  const catLookupByCodeUpper = new Map<string, any>();
+  const catLookupByNameOrCodeLower = new Map<string, any>();
+
+  const registerCategoryInIndexes = (cat: any) => {
+    catLookupByIdUpper.set(String(cat.id).toUpperCase(), cat);
+    const codeUpper = String(cat.code || '').trim().toUpperCase();
+    if (codeUpper) {
+      catLookupByCodeUpper.set(codeUpper, cat);
+      catLookupByNameOrCodeLower.set(codeUpper.toLowerCase(), cat);
+    }
+    const nameLower = String(cat.name || '').trim().toLowerCase();
+    if (nameLower) {
+      catLookupByNameOrCodeLower.set(nameLower, cat);
+    }
+  };
+
   Array.from(catById.values())
     .sort((a: any, b: any) => (parseSafeUtcTime(a.updatedAt) || 0) - (parseSafeUtcTime(b.updatedAt) || 0))
     .forEach((c: any) => {
@@ -641,21 +737,32 @@ function mergeServerStateDeterministic(existing: any, incoming: any): any {
       const prev = dedupByCode.get(codeKey);
       if (!prev) {
         dedupByCode.set(codeKey, c);
-        aliasIdMap.set(c.id, c);
+        registerCategoryInIndexes(c);
       } else {
         const mergedCat = { ...prev, ...c, id: prev.id, code: codeKey };
         dedupByCode.set(codeKey, mergedCat);
-        aliasIdMap.set(prev.id, mergedCat);
-        aliasIdMap.set(c.id, mergedCat);
+        registerCategoryInIndexes(mergedCat);
+        catLookupByIdUpper.set(String(c.id).toUpperCase(), mergedCat);
       }
     });
 
   const mergedCategories: any[] = Array.from(dedupByCode.values());
   const usedCatCodes = new Set<string>(mergedCategories.map((c: any) => String(c.code || '').trim().toUpperCase()));
 
-  const mergedItems = Array.from(itemMap.values()).map((item: any) => {
-    const stocks = computeWarehouseStocksForServer(item, mergedWarehouses, mergedTransactions);
-    const totalStock = Object.values(stocks).reduce((sum, qty) => sum + (Number(qty) || 0), 0);
+  const rawItemsList = Array.from(itemMap.values());
+  const allStocks = computeAllWarehouseStocksForServer(
+    rawItemsList,
+    mergedWarehouses,
+    mergedTransactions
+  );
+
+  const mergedItems = rawItemsList.map((item: any, idx: number) => {
+    const stocks = allStocks[idx] || {};
+    let totalStock = 0;
+    const stockVals = Object.values(stocks);
+    for (let s = 0; s < stockVals.length; s++) {
+      totalStock += Number(stockVals[s]) || 0;
+    }
 
     const rawCatId = String(item.categoryId || '').trim();
     const rawCatCode = String(item.categoryCode || '').trim().toUpperCase();
@@ -671,10 +778,7 @@ function mergeServerStateDeterministic(existing: any, incoming: any): any {
       (!rawCatId && !rawCatCode && rawCatName.toLowerCase() === 'chưa phân loại');
 
     if (!isUncategorized && rawCatId) {
-      const byId =
-        mergedCategories.find(
-          (c: any) => c.id === rawCatId || String(c.id).toUpperCase() === rawCatId.toUpperCase()
-        ) || aliasIdMap.get(rawCatId);
+      const byId = catLookupByIdUpper.get(rawCatId.toUpperCase());
       if (byId) {
         const catUpdatedMs = parseSafeUtcTime(byId.updatedAt) || 0;
         if (
@@ -690,21 +794,14 @@ function mergeServerStateDeterministic(existing: any, incoming: any): any {
     }
 
     if (!isUncategorized && !linkedCat && rawCatCode) {
-      linkedCat = mergedCategories.find(
-        (c: any) => String(c.code || '').trim().toUpperCase() === rawCatCode
-      );
+      linkedCat = catLookupByCodeUpper.get(rawCatCode);
       if (!linkedCat && isEntityDeleted(registry, [makeTombstoneKey('CAT', rawCatCode)], itemMetaMs)) {
         isUncategorized = true;
       }
     }
 
     if (!isUncategorized && !linkedCat && rawCatName) {
-      const lowerName = rawCatName.toLowerCase();
-      linkedCat = mergedCategories.find(
-        (c: any) =>
-          String(c.name || '').trim().toLowerCase() === lowerName ||
-          String(c.code || '').trim().toLowerCase() === lowerName
-      );
+      linkedCat = catLookupByNameOrCodeLower.get(rawCatName.toLowerCase());
     }
 
     if (!isUncategorized && !linkedCat && rawCatName && rawCatName.toLowerCase() !== 'chưa phân loại') {
@@ -732,7 +829,7 @@ function mergeServerStateDeterministic(existing: any, incoming: any): any {
           updatedAt: fallbackIso,
         };
         mergedCategories.push(linkedCat);
-        aliasIdMap.set(autoId, linkedCat);
+        registerCategoryInIndexes(linkedCat);
       }
     }
 
@@ -870,7 +967,7 @@ async function startServer() {
       memoryState = memoryState
         ? mergeServerStateDeterministic(memoryState, remoteBoot)
         : remoteBoot;
-      fs.writeFileSync(STATE_FILE, JSON.stringify(memoryState, null, 2), 'utf-8');
+      await fs.promises.writeFile(STATE_FILE, JSON.stringify(memoryState), 'utf-8');
     }
   } catch {
     // ignore boot sync error
@@ -925,7 +1022,6 @@ async function startServer() {
 
     sseClients.add(res);
 
-    // Immediately push authoritative server state upon connection
     if (memoryState) {
       res.write(`data: ${JSON.stringify({ type: 'SYNC_STATE', payload: memoryState })}\n\n`);
     } else {
@@ -937,8 +1033,8 @@ async function startServer() {
     });
   });
 
-  // GET authoritative state
-  app.get('/api/sync', async (_req, res) => {
+  // GET authoritative state (supports ?sinceVersion= to skip sending multi-MB payloads when unchanged)
+  app.get('/api/sync', async (req, res) => {
     try {
       if (!memoryState && fs.existsSync(STATE_FILE)) {
         memoryState = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
@@ -947,9 +1043,28 @@ async function startServer() {
       // keep memoryState
     }
 
+    const provider = memoryState?.supabaseConfig?.url ? 'supabase' : 'central-server';
+    const sinceVersion = Number(req.query.sinceVersion);
+    if (
+      memoryState &&
+      !Number.isNaN(sinceVersion) &&
+      sinceVersion > 0 &&
+      Number(memoryState.version) > 0 &&
+      sinceVersion >= Number(memoryState.version)
+    ) {
+      res.status(200).json({
+        success: true,
+        notModified: true,
+        provider,
+        version: memoryState.version,
+        lastUpdated: memoryState.lastUpdated,
+      });
+      return;
+    }
+
     res.status(200).json({
       success: true,
-      provider: memoryState?.supabaseConfig?.url ? 'supabase' : 'central-server',
+      provider,
       payload: memoryState,
     });
   });
@@ -996,28 +1111,29 @@ async function startServer() {
           memoryState = mergeServerStateDeterministic(memoryState, body.payload);
         }
 
+        const stateSnapshot = memoryState;
+
+        // Broadcast and respond immediately while persisting compact JSON asynchronously
+        broadcastStateToClients(stateSnapshot);
+
+        res.status(200).json({
+          success: true,
+          provider: stateSnapshot?.supabaseConfig?.url ? 'supabase' : 'central-server',
+          savedToCloud: true,
+          version: stateSnapshot.version,
+          lastUpdated: stateSnapshot.lastUpdated,
+          payload: stateSnapshot,
+        });
+
         try {
           const tmpFile = `${STATE_FILE}.tmp`;
-          fs.writeFileSync(tmpFile, JSON.stringify(memoryState, null, 2), 'utf-8');
-          fs.renameSync(tmpFile, STATE_FILE);
+          await fs.promises.writeFile(tmpFile, JSON.stringify(stateSnapshot), 'utf-8');
+          await fs.promises.rename(tmpFile, STATE_FILE);
         } catch (writeErr) {
           console.warn('[server] Could not persist .sync-state.json:', writeErr);
         }
 
-        // Mirror to external Supabase asynchronously if configured
-        saveRemoteSupabaseIfConfigured(memoryState).catch(() => {});
-
-        // Broadcast immediately to all other connected users/browsers!
-        broadcastStateToClients(memoryState);
-
-        res.status(200).json({
-          success: true,
-          provider: memoryState?.supabaseConfig?.url ? 'supabase' : 'central-server',
-          savedToCloud: true,
-          version: memoryState.version,
-          lastUpdated: memoryState.lastUpdated,
-          payload: memoryState,
-        });
+        saveRemoteSupabaseIfConfigured(stateSnapshot).catch(() => {});
       })
       .catch(err => {
         console.error('[server] Error handling POST /api/sync:', err);

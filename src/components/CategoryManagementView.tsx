@@ -18,6 +18,7 @@ import { useInventory } from '../context/InventoryContext';
 import { InventoryItem, MaterialCategory } from '../types/inventory';
 import { formatCurrency, formatNumber } from '../utils/formatters';
 import { generateCategoryCodeFromName } from '../utils/mergeSyncData';
+import { PaginationBar } from './PaginationBar';
 
 interface CategoryManagementViewProps {
   onNavigateToInventoryWithCategory?: (categoryName: string) => void;
@@ -34,7 +35,7 @@ export const CategoryManagementView: React.FC<CategoryManagementViewProps> = ({
     addMaterialCategory,
     updateMaterialCategory,
     deleteMaterialCategory,
-    updateItem,
+    linkItemsToCategoryBatch,
     resetFilterCriteria,
     updateFilter,
   } = useInventory();
@@ -62,6 +63,8 @@ export const CategoryManagementView: React.FC<CategoryManagementViewProps> = ({
   const [linkingCategory, setLinkingCategory] = useState<MaterialCategory | null>(null);
   const [linkItemSearch, setLinkItemSearch] = useState('');
   const [selectedLinkItemIds, setSelectedLinkItemIds] = useState<string[]>([]);
+  const [linkPage, setLinkPage] = useState(1);
+  const [linkPageSize, setLinkPageSize] = useState(100);
 
   const showToast = (text: string, type: 'success' | 'error' = 'success') => {
     setNotification({ text, type });
@@ -82,7 +85,7 @@ export const CategoryManagementView: React.FC<CategoryManagementViewProps> = ({
     return Boolean(rawCat && rawCat === cat.name.trim().toLowerCase());
   };
 
-  // Compute per-category statistics and uncategorized items
+  // Compute per-category statistics and uncategorized items in O(N + C)
   const { categoryStatsMap, uncategorizedStats } = useMemo(() => {
     const statsMap: Record<
       string,
@@ -94,6 +97,10 @@ export const CategoryManagementView: React.FC<CategoryManagementViewProps> = ({
       }
     > = {};
 
+    const catById = new Map<string, MaterialCategory>();
+    const catByCodeUpper = new Map<string, MaterialCategory>();
+    const catByNameLower = new Map<string, MaterialCategory>();
+
     materialCategories.forEach(cat => {
       statsMap[cat.id] = {
         linkedItems: [],
@@ -101,12 +108,29 @@ export const CategoryManagementView: React.FC<CategoryManagementViewProps> = ({
         totalStock: 0,
         totalValue: 0,
       };
+      catById.set(cat.id, cat);
+      if (cat.code) catByCodeUpper.set(cat.code.trim().toUpperCase(), cat);
+      if (cat.name) catByNameLower.set(cat.name.trim().toLowerCase(), cat);
     });
 
     const uncategorizedItems: InventoryItem[] = [];
+    let uncatStock = 0;
+    let uncatValue = 0;
 
-    items.forEach(item => {
-      const matchedCat = materialCategories.find(cat => isItemLinkedToCategory(item, cat));
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      let matchedCat: MaterialCategory | undefined;
+      if (item.categoryId && item.categoryId !== '__UNCATEGORIZED__') {
+        matchedCat = catById.get(item.categoryId);
+      } else if (!item.categoryId) {
+        if (item.categoryCode) {
+          matchedCat = catByCodeUpper.get(item.categoryCode.trim().toUpperCase());
+        }
+        if (!matchedCat && item.category) {
+          matchedCat = catByNameLower.get(item.category.trim().toLowerCase());
+        }
+      }
+
       if (matchedCat && statsMap[matchedCat.id]) {
         const entry = statsMap[matchedCat.id];
         entry.linkedItems.push(item);
@@ -115,14 +139,10 @@ export const CategoryManagementView: React.FC<CategoryManagementViewProps> = ({
         entry.totalValue += item.currentStock * item.unitPrice;
       } else {
         uncategorizedItems.push(item);
+        uncatStock += item.currentStock;
+        uncatValue += item.currentStock * item.unitPrice;
       }
-    });
-
-    const uncatStock = uncategorizedItems.reduce((sum, it) => sum + it.currentStock, 0);
-    const uncatValue = uncategorizedItems.reduce(
-      (sum, it) => sum + it.currentStock * it.unitPrice,
-      0
-    );
+    }
 
     return {
       categoryStatsMap: statsMap,
@@ -264,46 +284,36 @@ export const CategoryManagementView: React.FC<CategoryManagementViewProps> = ({
 
   // Handlers for Link Items modal
   const handleOpenLinkModal = (cat: MaterialCategory) => {
-    const currentlyLinkedIds = items
-      .filter(it => isItemLinkedToCategory(it, cat))
-      .map(it => it.id);
+    const precomputed = categoryStatsMap[cat.id]?.linkedItems;
+    const currentlyLinkedIds = precomputed
+      ? precomputed.map(it => it.id)
+      : items.filter(it => isItemLinkedToCategory(it, cat)).map(it => it.id);
     setLinkingCategory(cat);
     setSelectedLinkItemIds(currentlyLinkedIds);
     setLinkItemSearch('');
+    setLinkPage(1);
   };
 
+  const selectedLinkSet = useMemo(() => new Set(selectedLinkItemIds), [selectedLinkItemIds]);
+
   const toggleItemInLinkModal = (itemId: string) => {
-    setSelectedLinkItemIds(prev =>
-      prev.includes(itemId) ? prev.filter(id => id !== itemId) : [...prev, itemId]
-    );
+    setSelectedLinkItemIds(prev => {
+      const nextSet = new Set(prev);
+      if (nextSet.has(itemId)) {
+        nextSet.delete(itemId);
+      } else {
+        nextSet.add(itemId);
+      }
+      return Array.from(nextSet);
+    });
   };
 
   const handleSaveItemLinks = () => {
     if (!linkingCategory) return;
-    const selectedSet = new Set(selectedLinkItemIds);
-    let linkedCount = 0;
-    let unlinkedCount = 0;
-
-    items.forEach(item => {
-      const wasLinked = isItemLinkedToCategory(item, linkingCategory);
-      const shouldBeLinked = selectedSet.has(item.id);
-
-      if (!wasLinked && shouldBeLinked) {
-        updateItem(item.id, {
-          categoryId: linkingCategory.id,
-          categoryCode: linkingCategory.code,
-          category: linkingCategory.name,
-        });
-        linkedCount += 1;
-      } else if (wasLinked && !shouldBeLinked) {
-        updateItem(item.id, {
-          categoryId: '__UNCATEGORIZED__',
-          categoryCode: undefined,
-          category: 'Chưa phân loại',
-        });
-        unlinkedCount += 1;
-      }
-    });
+    const { linkedCount, unlinkedCount } = linkItemsToCategoryBatch(
+      linkingCategory.id,
+      selectedLinkItemIds
+    );
 
     showToast(
       `Đã cập nhật liên kết cho danh mục [${linkingCategory.code}]: gắn ${linkedCount} vật tư${
@@ -316,16 +326,46 @@ export const CategoryManagementView: React.FC<CategoryManagementViewProps> = ({
   const filteredModalItems = useMemo(() => {
     if (!linkingCategory) return [];
     const q = linkItemSearch.trim().toLowerCase();
-    return items.filter(it => {
-      if (!q) return true;
-      return (
+    if (!q) return items;
+    return items.filter(
+      it =>
         it.code.toLowerCase().includes(q) ||
         it.name.toLowerCase().includes(q) ||
         (it.category || '').toLowerCase().includes(q) ||
         (it.categoryCode || '').toLowerCase().includes(q)
-      );
-    });
+    );
   }, [items, linkingCategory, linkItemSearch]);
+
+  const linkTotalPages = Math.max(1, Math.ceil(filteredModalItems.length / linkPageSize));
+  const safeLinkPage = Math.min(linkPage, linkTotalPages);
+  const paginatedModalItems = useMemo(() => {
+    const start = (safeLinkPage - 1) * linkPageSize;
+    return filteredModalItems.slice(start, start + linkPageSize);
+  }, [filteredModalItems, safeLinkPage, linkPageSize]);
+
+  const allFilteredSelected = useMemo(() => {
+    if (filteredModalItems.length === 0) return false;
+    for (let i = 0; i < filteredModalItems.length; i++) {
+      if (!selectedLinkSet.has(filteredModalItems[i].id)) return false;
+    }
+    return true;
+  }, [filteredModalItems, selectedLinkSet]);
+
+  const handleToggleAllFiltered = () => {
+    setSelectedLinkItemIds(prev => {
+      const nextSet = new Set(prev);
+      if (allFilteredSelected) {
+        for (let i = 0; i < filteredModalItems.length; i++) {
+          nextSet.delete(filteredModalItems[i].id);
+        }
+      } else {
+        for (let i = 0; i < filteredModalItems.length; i++) {
+          nextSet.add(filteredModalItems[i].id);
+        }
+      }
+      return Array.from(nextSet);
+    });
+  };
 
   return (
     <div className="space-y-5">
@@ -887,25 +927,38 @@ export const CategoryManagementView: React.FC<CategoryManagementViewProps> = ({
                 <input
                   type="text"
                   value={linkItemSearch}
-                  onChange={e => setLinkItemSearch(e.target.value)}
+                  onChange={e => {
+                    setLinkItemSearch(e.target.value);
+                    setLinkPage(1);
+                  }}
                   placeholder="Tìm vật tư theo mã SKU, tên vật tư hoặc danh mục hiện tại..."
                   className="w-full pl-9 pr-8 py-2 text-xs bg-slate-50 focus:bg-white border border-slate-200 focus:border-indigo-500 rounded-lg outline-none"
                 />
               </div>
 
-              <div className="text-xs text-slate-500 shrink-0">
-                Tích chọn để gán vật tư vào <strong className="font-mono text-slate-800">{linkingCategory.code}</strong>
+              <div className="flex items-center gap-2 shrink-0">
+                {filteredModalItems.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleToggleAllFiltered}
+                    className="px-2.5 py-1.5 text-xs font-medium text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg transition-colors whitespace-nowrap"
+                  >
+                    {allFilteredSelected
+                      ? `Bỏ chọn (${formatNumber(filteredModalItems.length)})`
+                      : `Chọn tất cả (${formatNumber(filteredModalItems.length)})`}
+                  </button>
+                )}
               </div>
             </div>
 
             <div className="flex-1 overflow-y-auto divide-y divide-slate-100">
-              {filteredModalItems.length === 0 ? (
+              {paginatedModalItems.length === 0 ? (
                 <div className="p-8 text-center text-xs text-slate-400">
                   Không tìm thấy vật tư phù hợp.
                 </div>
               ) : (
-                filteredModalItems.map(item => {
-                  const checked = selectedLinkItemIds.includes(item.id);
+                paginatedModalItems.map(item => {
+                  const checked = selectedLinkSet.has(item.id);
                   const belongedHere = isItemLinkedToCategory(item, linkingCategory);
                   return (
                     <div
@@ -962,10 +1015,26 @@ export const CategoryManagementView: React.FC<CategoryManagementViewProps> = ({
               )}
             </div>
 
+            {filteredModalItems.length > linkPageSize && (
+              <PaginationBar
+                currentPage={safeLinkPage}
+                totalItems={filteredModalItems.length}
+                pageSize={linkPageSize}
+                onPageChange={setLinkPage}
+                onPageSizeChange={size => {
+                  setLinkPageSize(size);
+                  setLinkPage(1);
+                }}
+                pageSizeOptions={[50, 100, 200, 500]}
+                itemLabel="vật tư"
+                compact
+              />
+            )}
+
             <div className="p-4 border-t border-slate-200 bg-slate-50 flex items-center justify-between gap-3">
               <span className="text-xs text-slate-500">
-                Đã chọn <strong className="text-indigo-700 tabular-nums">{selectedLinkItemIds.length}</strong> /{' '}
-                <span className="tabular-nums">{items.length}</span> vật tư
+                Đã chọn <strong className="text-indigo-700 tabular-nums">{formatNumber(selectedLinkItemIds.length)}</strong> /{' '}
+                <span className="tabular-nums">{formatNumber(items.length)}</span> vật tư
               </span>
               <div className="flex items-center gap-2">
                 <button

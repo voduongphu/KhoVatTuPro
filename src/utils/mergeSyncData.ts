@@ -1,5 +1,5 @@
 import { InventoryItem, MaterialCategory, Transaction, User, Warehouse } from '../types/inventory';
-import { calculateItemWarehouseStocks } from './formatters';
+import { calculateAllItemsWarehouseStocks } from './formatters';
 
 export type DeletedRegistry = Record<string, string>;
 
@@ -38,7 +38,6 @@ export function parseSafeUtcTime(ts?: string | null): number {
   const trimmed = String(ts).trim();
   if (!trimmed) return 0;
 
-  // Các chuỗi dạng "2026-10-23 07:01" hoặc "2026-10-23 07:01:44" trước đây sinh ra từ toISOString().replace('T', ' ')
   if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(trimmed)) {
     const iso = trimmed.replace(' ', 'T') + (trimmed.length === 16 ? ':00.000Z' : 'Z');
     const parsed = Date.parse(iso);
@@ -49,16 +48,33 @@ export function parseSafeUtcTime(ts?: string | null): number {
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
+export type TimestampRefInput =
+  | string
+  | undefined
+  | null
+  | ReadonlyArray<string | undefined | null>;
+
 /**
- * Sinh chuỗi ISO UTC đơn điệu tăng dần (Monotonic Timestamp), đảm bảo thao tác Sửa / Xóa / Import mới
- * luôn thắng phiên bản cũ hoặc tombstone cũ ngay cả khi đồng hồ giữa các máy trạm lệch nhau.
+ * Sinh chuỗi ISO UTC đơn điệu tăng dần (Monotonic Timestamp), hỗ trợ truyền cả mảng lớn
+ * mà không dùng toán tử spread `...` gây tràn Call Stack khi có >5.000 - 50.000 bản ghi.
  */
-export function nextMonotonicIso(...refs: (string | undefined | null)[]): string {
+export function nextMonotonicIso(...refs: TimestampRefInput[]): string {
   let candidate = Date.now();
-  for (const r of refs) {
-    const ms = parseSafeUtcTime(r);
-    if (ms >= candidate) {
-      candidate = ms + 1;
+  for (let i = 0; i < refs.length; i++) {
+    const entry = refs[i];
+    if (!entry) continue;
+    if (Array.isArray(entry)) {
+      for (let j = 0; j < entry.length; j++) {
+        const ms = parseSafeUtcTime(entry[j]);
+        if (ms >= candidate) {
+          candidate = ms + 1;
+        }
+      }
+    } else if (typeof entry === 'string') {
+      const ms = parseSafeUtcTime(entry);
+      if (ms >= candidate) {
+        candidate = ms + 1;
+      }
     }
   }
   return new Date(candidate).toISOString();
@@ -74,10 +90,6 @@ export function makeTombstoneKey(
   return `${prefix}:${prefix === 'USER' ? cleaned.toLowerCase() : cleaned.toUpperCase()}`;
 }
 
-/**
- * Hợp nhất sổ cái xóa có gắn nhãn thời gian (Timestamped Tombstones)
- * và tương thích ngược với các mảng deleted*Ids cũ.
- */
 export function buildMergedDeletedRegistry(
   localReg: DeletedRegistry | undefined,
   remoteReg: DeletedRegistry | undefined,
@@ -93,23 +105,23 @@ export function buildMergedDeletedRegistry(
 
   const applyReg = (reg?: DeletedRegistry) => {
     if (!reg || typeof reg !== 'object') return;
-    Object.entries(reg).forEach(([k, v]) => {
-      if (!k || !v) return;
+    const keys = Object.keys(reg);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      const v = reg[k];
+      if (!k || !v) continue;
       const incTime = parseSafeUtcTime(v);
-      if (incTime <= 0) return;
+      if (incTime <= 0) continue;
       const prevTime = parseSafeUtcTime(merged[k]);
       if (incTime > prevTime) {
         merged[k] = new Date(incTime).toISOString();
       }
-    });
+    }
   };
 
   applyReg(localReg);
   applyReg(remoteReg);
 
-  // Tương thích ngược với các mảng ID xóa cũ không có timestamp:
-  // Chỉ gán mốc 1970-01-01T00:00:01Z để chặn dữ liệu mẫu mặc định (updatedAt = 0),
-  // KHÔNG BAO GIỜ chặn vật tư/phiếu thật được tạo mới hoặc import trong năm 2026+.
   if (legacyArrays) {
     (legacyArrays.deletedItemIds || []).forEach(id => {
       const k = makeTombstoneKey('ITEM', id);
@@ -139,7 +151,8 @@ export function buildMergedDeletedRegistry(
 
 function getLatestTombstoneMs(reg: DeletedRegistry, keys: string[]): number {
   let maxMs = 0;
-  for (const k of keys) {
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
     if (!k) continue;
     const t = parseSafeUtcTime(reg[k]);
     if (t > maxMs) maxMs = t;
@@ -157,7 +170,8 @@ function isEntityDeleted(reg: DeletedRegistry, keys: string[], entityTimeMs: num
 function clearTombstonesIfRevived(reg: DeletedRegistry, keys: string[], entityTimeMs: number) {
   const delMs = getLatestTombstoneMs(reg, keys);
   if (delMs > 0 && entityTimeMs >= delMs) {
-    for (const k of keys) {
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
       if (k && reg[k]) {
         delete reg[k];
       }
@@ -194,9 +208,7 @@ export interface ReconciledSyncState {
 }
 
 /**
- * Bộ hợp nhất trạng thái đa người dùng chuẩn xác (Deterministic CRDT-style State Reconciliation).
- * Đảm bảo mọi thao tác Thêm / Sửa / Xóa / Import Danh mục vật tư, Phiếu nhập, Phiếu xuất, Kho, Người dùng
- * từ nhiều tài khoản khác nhau đều hội tụ 100% không mất mát hay ghi đè lẫn nhau.
+ * Bộ hợp nhất trạng thái đa người dùng chuẩn xác (Deterministic CRDT-style State Reconciliation) - Độ phức tạp O(N + T).
  */
 export function reconcileSyncPayloads(
   baseState: SyncStateSnapshot,
@@ -296,8 +308,6 @@ export function reconcileSyncPayloads(
   (baseState.users || []).forEach(u => processUser(u, false));
   (incomingState.users || []).forEach(u => processUser(u, true));
 
-  // Chốt an toàn: Nếu danh sách người dùng đầu vào có Admin nhưng sau khi lọc bị rỗng Admin hoạt động,
-  // giữ lại 1 Admin cập nhật gần nhất để không bao giờ bị khóa trắng hệ thống.
   if (
     allInputUsers.length > 0 &&
     !Array.from(userMap.values()).some(u => u.role === 'ADMIN' && u.status !== 'LOCKED')
@@ -363,7 +373,7 @@ export function reconcileSyncPayloads(
   (incomingState.warehouses || []).forEach(w => processWarehouse(w, true));
   const mergedWarehouses = Array.from(whMap.values());
 
-  // 3. HỢP NHẤT PHIẾU NHẬP / PHIẾU XUẤT (TRANSACTIONS) THEO ID + CHỐNG ĐỤNG ĐỘ MÃ PHIẾU ĐỒNG THỜI
+  // 3. HỢP NHẤT PHIẾU NHẬP / PHIẾU XUẤT (TRANSACTIONS) TRONG O(T log T)
   const trxMap = new Map<string, Transaction>();
   const processTransaction = (t: Transaction, isIncoming: boolean) => {
     if (!t || (!t.id && !t.code)) return;
@@ -400,31 +410,43 @@ export function reconcileSyncPayloads(
   (baseState.transactions || []).forEach(t => processTransaction(t, false));
   (incomingState.transactions || []).forEach(t => processTransaction(t, true));
 
-  // Kiểm tra chống đụng độ số phiếu (VD: 2 thủ kho cùng lập phiếu tạo ra mã PN-2026-0004 với 2 ID khác nhau)
   const rawTrxAsc = Array.from(trxMap.values()).sort((a, b) => {
     const ta = parseSafeUtcTime(a.updatedAt) || parseSafeUtcTime(a.date);
     const tb = parseSafeUtcTime(b.updatedAt) || parseSafeUtcTime(b.date);
     return ta - tb;
   });
 
+  // O(1) sequential counter for code de-collision
   const usedCodes = new Set<string>();
+  const currentYear = new Date().getFullYear();
+  const pnPrefix = `PN-${currentYear}-`;
+  const pxPrefix = `PX-${currentYear}-`;
+  let maxPnSeq = 0;
+  let maxPxSeq = 0;
+
+  const trackSeqFromCode = (upperCode: string) => {
+    if (upperCode.startsWith(pnPrefix)) {
+      const num = parseInt(upperCode.slice(pnPrefix.length), 10);
+      if (!Number.isNaN(num) && num > maxPnSeq) maxPnSeq = num;
+    } else if (upperCode.startsWith(pxPrefix)) {
+      const num = parseInt(upperCode.slice(pxPrefix.length), 10);
+      if (!Number.isNaN(num) && num > maxPxSeq) maxPxSeq = num;
+    }
+  };
+
+  for (let i = 0; i < rawTrxAsc.length; i++) {
+    const c = (rawTrxAsc[i].code || '').trim().toUpperCase();
+    if (c) trackSeqFromCode(c);
+  }
+
   const nextCodeForType = (type: Transaction['type']): string => {
-    const prefix = type === 'NHAP_KHO' ? 'PN' : 'PX';
-    const year = new Date().getFullYear();
-    const pattern = new RegExp(`^${prefix}-${year}-(\\d+)$`, 'i');
-    let maxNum = 0;
-    usedCodes.forEach(c => {
-      const m = c.match(pattern);
-      if (m) {
-        const n = parseInt(m[1], 10);
-        if (n > maxNum) maxNum = n;
-      }
-    });
-    let candidateNum = maxNum + 1;
-    let candidate = `${prefix}-${year}-${String(candidateNum).padStart(4, '0')}`;
+    const isReceipt = type === 'NHAP_KHO';
+    const prefix = isReceipt ? pnPrefix : pxPrefix;
+    let candidateNum = isReceipt ? ++maxPnSeq : ++maxPxSeq;
+    let candidate = `${prefix}${String(candidateNum).padStart(4, '0')}`;
     while (usedCodes.has(candidate)) {
-      candidateNum++;
-      candidate = `${prefix}-${year}-${String(candidateNum).padStart(4, '0')}`;
+      candidateNum = isReceipt ? ++maxPnSeq : ++maxPxSeq;
+      candidate = `${prefix}${String(candidateNum).padStart(4, '0')}`;
     }
     return candidate;
   };
@@ -437,6 +459,7 @@ export function reconcileSyncPayloads(
       return { ...t, code: reassigned };
     }
     usedCodes.add(normCode);
+    trackSeqFromCode(normCode);
     return { ...t, code: normCode };
   });
 
@@ -489,7 +512,6 @@ export function reconcileSyncPayloads(
       const older = useNew ? existing : item;
       const newer = useNew ? item : existing;
 
-      // Bảo toàn tồn đầu kỳ (openingWarehouseStocks / openingStock) từ phiên bản danh mục mới nhất có khai báo
       let mergedOpeningWh = newer.openingWarehouseStocks;
       if (!mergedOpeningWh || Object.keys(mergedOpeningWh).length === 0) {
         mergedOpeningWh = older.openingWarehouseStocks;
@@ -519,8 +541,6 @@ export function reconcileSyncPayloads(
   (baseState.items || []).forEach(i => processItem(i, false));
   (incomingState.items || []).forEach(i => processItem(i, true));
 
-  // Tự động khôi phục/khởi tạo mặt hàng nếu có trong Phiếu Nhập Kho hợp lệ nhưng chưa có trong danh mục
-  // (Trừ trường hợp Admin chủ động xóa mặt hàng đó SAU thời điểm lập phiếu)
   mergedTransactions.forEach(trx => {
     if (trx.status === 'DA_HUY' || trx.type !== 'NHAP_KHO') return;
     const trxTime = parseSafeUtcTime(trx.updatedAt);
@@ -563,7 +583,7 @@ export function reconcileSyncPayloads(
     });
   });
 
-  // 5. HỢP NHẤT NHÓM DANH MỤC VẬT TƯ (MATERIAL CATEGORIES) & LIÊN KẾT VẬT TƯ <-> DANH MỤC
+  // 5. HỢP NHẤT NHÓM DANH MỤC VẬT TƯ & TÍNH TỒN KHO HÀNG LOẠT TRONG O(N + T)
   const catById = new Map<string, MaterialCategory>();
   const processCategory = (cat: MaterialCategory, isIncoming: boolean) => {
     if (!cat || (!cat.id && !cat.code && !cat.name)) return;
@@ -610,9 +630,24 @@ export function reconcileSyncPayloads(
   (baseState.materialCategories || []).forEach(c => processCategory(c, false));
   (incomingState.materialCategories || []).forEach(c => processCategory(c, true));
 
-  // Khử trùng lặp theo Mã danh mục (nếu 2 người dùng tạo trùng mã danh mục đồng thời)
   const dedupByCode = new Map<string, MaterialCategory>();
-  const aliasIdMap = new Map<string, MaterialCategory>();
+  const catLookupByIdUpper = new Map<string, MaterialCategory>();
+  const catLookupByCodeUpper = new Map<string, MaterialCategory>();
+  const catLookupByNameOrCodeLower = new Map<string, MaterialCategory>();
+
+  const registerCategoryInIndexes = (cat: MaterialCategory) => {
+    catLookupByIdUpper.set(cat.id.toUpperCase(), cat);
+    const codeUpper = cat.code.trim().toUpperCase();
+    if (codeUpper) {
+      catLookupByCodeUpper.set(codeUpper, cat);
+      catLookupByNameOrCodeLower.set(codeUpper.toLowerCase(), cat);
+    }
+    const nameLower = cat.name.trim().toLowerCase();
+    if (nameLower) {
+      catLookupByNameOrCodeLower.set(nameLower, cat);
+    }
+  };
+
   Array.from(catById.values())
     .sort((a, b) => (parseSafeUtcTime(a.updatedAt) || 0) - (parseSafeUtcTime(b.updatedAt) || 0))
     .forEach(c => {
@@ -620,7 +655,7 @@ export function reconcileSyncPayloads(
       const prev = dedupByCode.get(codeKey);
       if (!prev) {
         dedupByCode.set(codeKey, c);
-        aliasIdMap.set(c.id, c);
+        registerCategoryInIndexes(c);
       } else {
         const mergedCat: MaterialCategory = {
           ...prev,
@@ -629,18 +664,28 @@ export function reconcileSyncPayloads(
           code: codeKey,
         };
         dedupByCode.set(codeKey, mergedCat);
-        aliasIdMap.set(prev.id, mergedCat);
-        aliasIdMap.set(c.id, mergedCat);
+        registerCategoryInIndexes(mergedCat);
+        catLookupByIdUpper.set(c.id.toUpperCase(), mergedCat);
       }
     });
 
   const mergedCategories: MaterialCategory[] = Array.from(dedupByCode.values());
   const usedCatCodes = new Set<string>(mergedCategories.map(c => c.code.trim().toUpperCase()));
 
-  // Liên kết vật tư với danh mục tương ứng & tự động sinh mã danh mục cho dữ liệu cũ chưa có danh mục
-  const mergedItems = Array.from(itemMap.values()).map(item => {
-    const stocks = calculateItemWarehouseStocks(item, mergedWarehouses, mergedTransactions);
-    const totalStock = Object.values(stocks).reduce((sum, qty) => sum + (Number(qty) || 0), 0);
+  const rawItemsList = Array.from(itemMap.values());
+  const allStocks = calculateAllItemsWarehouseStocks(
+    rawItemsList,
+    mergedWarehouses,
+    mergedTransactions
+  );
+
+  const mergedItems = rawItemsList.map((item, idx) => {
+    const stocks = allStocks[idx] || {};
+    let totalStock = 0;
+    const stockVals = Object.values(stocks);
+    for (let s = 0; s < stockVals.length; s++) {
+      totalStock += Number(stockVals[s]) || 0;
+    }
 
     const rawCatId = (item.categoryId || '').trim();
     const rawCatCode = (item.categoryCode || '').trim().toUpperCase();
@@ -656,9 +701,7 @@ export function reconcileSyncPayloads(
       (!rawCatId && !rawCatCode && rawCatName.toLowerCase() === 'chưa phân loại');
 
     if (!isUncategorized && rawCatId) {
-      const byId =
-        mergedCategories.find(c => c.id === rawCatId || c.id.toUpperCase() === rawCatId.toUpperCase()) ||
-        aliasIdMap.get(rawCatId);
+      const byId = catLookupByIdUpper.get(rawCatId.toUpperCase());
       if (byId) {
         const catUpdatedMs = parseSafeUtcTime(byId.updatedAt) || 0;
         if (
@@ -674,19 +717,14 @@ export function reconcileSyncPayloads(
     }
 
     if (!isUncategorized && !linkedCat && rawCatCode) {
-      linkedCat = mergedCategories.find(c => c.code.trim().toUpperCase() === rawCatCode);
+      linkedCat = catLookupByCodeUpper.get(rawCatCode);
       if (!linkedCat && isEntityDeleted(registry, [makeTombstoneKey('CAT', rawCatCode)], itemMetaMs)) {
         isUncategorized = true;
       }
     }
 
     if (!isUncategorized && !linkedCat && rawCatName) {
-      const lowerName = rawCatName.toLowerCase();
-      linkedCat = mergedCategories.find(
-        c =>
-          c.name.trim().toLowerCase() === lowerName ||
-          c.code.trim().toLowerCase() === lowerName
-      );
+      linkedCat = catLookupByNameOrCodeLower.get(rawCatName.toLowerCase());
     }
 
     if (!isUncategorized && !linkedCat && rawCatName && rawCatName.toLowerCase() !== 'chưa phân loại') {
@@ -714,7 +752,7 @@ export function reconcileSyncPayloads(
           updatedAt: fallbackIso,
         };
         mergedCategories.push(linkedCat);
-        aliasIdMap.set(autoId, linkedCat);
+        registerCategoryInIndexes(linkedCat);
       }
     }
 
@@ -730,7 +768,6 @@ export function reconcileSyncPayloads(
 
   mergedCategories.sort((a, b) => a.code.localeCompare(b.code, 'vi'));
 
-  // Trích xuất lại các mảng deleted*Ids tương thích ngược từ registry hiện hành
   const deletedItemIds: string[] = [];
   const deletedTransactionIds: string[] = [];
   const deletedUserIds: string[] = [];
@@ -760,7 +797,6 @@ export function reconcileSyncPayloads(
   };
 }
 
-// Các hàm tiện ích giữ tương thích chữ ký cũ
 export function mergeUsersAdditive(
   localUsers: User[],
   remoteUsers: User[],

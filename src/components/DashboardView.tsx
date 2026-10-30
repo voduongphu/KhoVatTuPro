@@ -1,30 +1,26 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Boxes,
-  TrendingDown,
-  TrendingUp,
   AlertTriangle,
   Download,
   Warehouse as WarehouseIcon,
   PieChart,
-  Calendar,
   Layers,
-  ArrowUpRight,
-  ArrowDownLeft,
   TableProperties,
   BarChart3,
-  CheckCircle2,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
+import { MaterialCategory } from '../types/inventory';
 import * as XLSX from 'xlsx';
 import {
-  calculateItemWarehouseStocks,
   formatCurrency,
   formatNumber,
+  getFastItemWarehouseStocks,
   getItemTypeLabel,
   getStockStatus,
   getStockStatusLabel,
 } from '../utils/formatters';
+import { PaginationBar } from './PaginationBar';
 
 interface DashboardViewProps {
   onSelectStockCard: (itemId: string) => void;
@@ -33,105 +29,158 @@ interface DashboardViewProps {
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
   onSelectStockCard,
-  onOpenCreateTransaction,
 }) => {
   const { items, materialCategories, transactions, warehouses } = useInventory();
   const [selectedReportWarehouse, setSelectedReportWarehouse] = useState<string>('ALL');
   const [reportViewMode, setReportViewMode] = useState<'matrix' | 'nxt'>('matrix');
+  const [reportPage, setReportPage] = useState<number>(1);
+  const [reportPageSize, setReportPageSize] = useState<number>(50);
 
-  // KPI Calculations
-  const totalItemsCount = items.length;
-  const totalInventoryValue = items.reduce((acc, i) => acc + i.currentStock * i.unitPrice, 0);
+  useEffect(() => {
+    setReportPage(1);
+  }, [selectedReportWarehouse, reportViewMode]);
 
-  const lowStockItems = items.filter(i => {
-    const st = getStockStatus(i);
-    return st === 'CANH_BAO_THAP' || st === 'HET_HANG';
-  });
+  // Single-pass KPI Calculations in O(N + T)
+  const kpiStats = useMemo(() => {
+    let totalInventoryValue = 0;
+    let lowStockCount = 0;
+    let equipmentOnLoanCount = 0;
 
-  const equipmentOnLoan = items.filter(
-    i => (i.type === 'THIET_BI' || i.type === 'CONG_CU') && i.condition === 'DANG_MUON'
-  );
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      totalInventoryValue += it.currentStock * it.unitPrice;
+      const st = getStockStatus(it);
+      if (st === 'CANH_BAO_THAP' || st === 'HET_HANG') lowStockCount++;
+      if ((it.type === 'THIET_BI' || it.type === 'CONG_CU') && it.condition === 'DANG_MUON') {
+        equipmentOnLoanCount++;
+      }
+    }
 
-  const totalReceipts = transactions.filter(t => t.type === 'NHAP_KHO');
-  const totalIssues = transactions.filter(t => t.type === 'XUAT_KHO');
+    let receiptsCount = 0;
+    let issuesCount = 0;
+    let totalReceiptValue = 0;
+    let totalIssueValue = 0;
 
-  const totalReceiptValue = totalReceipts.reduce((acc, t) => acc + t.totalAmount, 0);
-  const totalIssueValue = totalIssues.reduce((acc, t) => acc + t.totalAmount, 0);
+    for (let t = 0; t < transactions.length; t++) {
+      const trx = transactions[t];
+      if (trx.type === 'NHAP_KHO') {
+        receiptsCount++;
+        totalReceiptValue += Number(trx.totalAmount) || 0;
+      } else if (trx.type === 'XUAT_KHO') {
+        issuesCount++;
+        totalIssueValue += Number(trx.totalAmount) || 0;
+      }
+    }
 
-  // Category breakdown linked with MaterialCategory
+    return {
+      totalItemsCount: items.length,
+      totalInventoryValue,
+      lowStockCount,
+      equipmentOnLoanCount,
+      receiptsCount,
+      issuesCount,
+      totalReceiptValue,
+      totalIssueValue,
+    };
+  }, [items, transactions]);
+
+  const { totalInventoryValue } = kpiStats;
+
+  // Category breakdown linked with MaterialCategory in O(N + C)
   const categoryBreakdown = useMemo(() => {
+    const catById = new Map<string, MaterialCategory>();
+    const catByCode = new Map<string, MaterialCategory>();
+    const catByName = new Map<string, MaterialCategory>();
+    for (let i = 0; i < materialCategories.length; i++) {
+      const c = materialCategories[i];
+      catById.set(c.id, c);
+      if (c.code) catByCode.set(c.code.trim().toUpperCase(), c);
+      if (c.name) catByName.set(c.name.trim().toLowerCase(), c);
+    }
+
     const map = new Map<string, { code?: string; name: string; count: number; value: number }>();
-    items.forEach(item => {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
       const matchedCat =
-        (item.categoryId && materialCategories.find(c => c.id === item.categoryId)) ||
-        (item.categoryCode &&
-          materialCategories.find(
-            c => c.code.trim().toUpperCase() === item.categoryCode!.trim().toUpperCase()
-          )) ||
-        (item.category
-          ? materialCategories.find(
-              c => c.name.trim().toLowerCase() === (item.category || '').trim().toLowerCase()
-            )
-          : undefined);
+        (item.categoryId ? catById.get(item.categoryId) : undefined) ||
+        (item.categoryCode ? catByCode.get(item.categoryCode.trim().toUpperCase()) : undefined) ||
+        (item.category ? catByName.get(item.category.trim().toLowerCase()) : undefined);
       const key = matchedCat ? matchedCat.id : `RAW:${item.category || 'Chưa phân loại'}`;
-      const existing = map.get(key) || {
-        code: matchedCat?.code || item.categoryCode,
-        name: matchedCat?.name || item.category || 'Chưa phân loại',
-        count: 0,
-        value: 0,
-      };
-      map.set(key, {
-        ...existing,
-        count: existing.count + 1,
-        value: existing.value + item.currentStock * item.unitPrice,
-      });
-    });
+      const existing = map.get(key);
+      const itemVal = item.currentStock * item.unitPrice;
+      if (existing) {
+        existing.count += 1;
+        existing.value += itemVal;
+      } else {
+        map.set(key, {
+          code: matchedCat?.code || item.categoryCode,
+          name: matchedCat?.name || item.category || 'Chưa phân loại',
+          count: 1,
+          value: itemVal,
+        });
+      }
+    }
 
-    const list = Array.from(map.values()).map(val => ({
-      category: val.name,
-      categoryCode: val.code,
-      count: val.count,
-      value: val.value,
-      percentage: totalInventoryValue > 0 ? (val.value / totalInventoryValue) * 100 : 0,
-    }));
-
-    return list.sort((a, b) => b.value - a.value);
+    return Array.from(map.values())
+      .map(val => ({
+        category: val.name,
+        categoryCode: val.code,
+        count: val.count,
+        value: val.value,
+        percentage: totalInventoryValue > 0 ? (val.value / totalInventoryValue) * 100 : 0,
+      }))
+      .sort((a, b) => b.value - a.value);
   }, [items, materialCategories, totalInventoryValue]);
 
-  // Warehouse breakdown with exact totalStock quantity and value per warehouse
+  // Warehouse breakdown in O(N * W) using pre-computed item.warehouseStocks
   const warehouseBreakdown = useMemo(() => {
-    return warehouses.map(wh => {
-      let whTotalStock = 0;
-      let whTotalValue = 0;
-      let whItemCount = 0;
+    const accum = new Map<string, { totalStock: number; totalValue: number; itemCount: number }>();
+    for (let w = 0; w < warehouses.length; w++) {
+      accum.set(warehouses[w].id, { totalStock: 0, totalValue: 0, itemCount: 0 });
+    }
 
-      items.forEach(item => {
-        const stocks = calculateItemWarehouseStocks(item, warehouses, transactions);
-        const qty = stocks[wh.id] || 0;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const stocks = getFastItemWarehouseStocks(item, warehouses);
+      for (let w = 0; w < warehouses.length; w++) {
+        const whId = warehouses[w].id;
+        const qty = stocks[whId] || 0;
         if (qty > 0) {
-          whTotalStock += qty;
-          whTotalValue += qty * item.unitPrice;
-          whItemCount += 1;
+          const entry = accum.get(whId)!;
+          entry.totalStock += qty;
+          entry.totalValue += qty * item.unitPrice;
+          entry.itemCount += 1;
         }
-      });
+      }
+    }
 
+    return warehouses.map(wh => {
+      const entry = accum.get(wh.id) || { totalStock: 0, totalValue: 0, itemCount: 0 };
       return {
         id: wh.id,
         name: wh.name,
         code: wh.code,
-        itemCount: whItemCount,
-        totalStock: whTotalStock,
-        totalValue: whTotalValue,
-        percentage: totalInventoryValue > 0 ? (whTotalValue / totalInventoryValue) * 100 : 0,
+        itemCount: entry.itemCount,
+        totalStock: entry.totalStock,
+        totalValue: entry.totalValue,
+        percentage: totalInventoryValue > 0 ? (entry.totalValue / totalInventoryValue) * 100 : 0,
       };
     });
-  }, [warehouses, items, transactions, totalInventoryValue]);
+  }, [warehouses, items, totalInventoryValue]);
 
-  // 1. Multi-Warehouse Stock Matrix (Bảng phân bổ số lượng tồn chia theo từng kho)
+  // 1. Multi-Warehouse Stock Matrix in O(N * W)
   const warehouseMatrixRows = useMemo(() => {
-    return items.map(item => {
-      const stocks = calculateItemWarehouseStocks(item, warehouses, transactions);
-      const totalStock = Object.values(stocks).reduce((a, b) => a + b, 0);
+    const rows = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const stocks = getFastItemWarehouseStocks(item, warehouses);
+      if (selectedReportWarehouse !== 'ALL' && (stocks[selectedReportWarehouse] || 0) <= 0) {
+        continue;
+      }
+      let totalStock = 0;
+      const vals = Object.values(stocks);
+      for (let v = 0; v < vals.length; v++) totalStock += Number(vals[v]) || 0;
+
       const totalValue = totalStock * item.unitPrice;
       const status = getStockStatus({
         currentStock: totalStock,
@@ -139,7 +188,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         maxStock: item.maxStock,
       });
 
-      return {
+      rows.push({
         id: item.id,
         code: item.code,
         name: item.name,
@@ -152,15 +201,83 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         unitPrice: item.unitPrice,
         totalValue,
         status,
-      };
-    }).filter(row => {
-      if (selectedReportWarehouse === 'ALL') return true;
-      return (row.stocks[selectedReportWarehouse] || 0) > 0;
-    });
-  }, [items, warehouses, transactions, selectedReportWarehouse]);
+      });
+    }
+    return rows;
+  }, [items, warehouses, selectedReportWarehouse]);
 
-  // 2. Comprehensive In-Out-Stock (NXT) Report Data - Strictly Scoped by Kho
+  const matrixTotals = useMemo(() => {
+    const byWh: Record<string, number> = {};
+    for (let w = 0; w < warehouses.length; w++) byWh[warehouses[w].id] = 0;
+    let grandTotalStock = 0;
+    let grandTotalValue = 0;
+    for (let i = 0; i < warehouseMatrixRows.length; i++) {
+      const r = warehouseMatrixRows[i];
+      grandTotalStock += r.totalStock;
+      grandTotalValue += r.totalValue;
+      for (let w = 0; w < warehouses.length; w++) {
+        const whId = warehouses[w].id;
+        byWh[whId] += r.stocks[whId] || 0;
+      }
+    }
+    return { byWh, grandTotalStock, grandTotalValue };
+  }, [warehouseMatrixRows, warehouses]);
+
+  // 2. Comprehensive In-Out-Stock (NXT) Report Data in O(N * W + T_lines) instead of O(W * N * T)
   const nxtReportRows = useMemo(() => {
+    const n = items.length;
+    if (n === 0 || warehouses.length === 0) return [];
+
+    const idToIdx = new Map<string, number>();
+    const codeToIdx = new Map<string, number>();
+    for (let i = 0; i < n; i++) {
+      if (items[i].id) idToIdx.set(items[i].id, i);
+      const normCode = (items[i].code || '').trim().toUpperCase();
+      if (normCode && !codeToIdx.has(normCode)) codeToIdx.set(normCode, i);
+    }
+
+    const inByItemWh = new Array<Record<string, number>>(n);
+    const outByItemWh = new Array<Record<string, number>>(n);
+    for (let i = 0; i < n; i++) {
+      inByItemWh[i] = {};
+      outByItemWh[i] = {};
+    }
+
+    for (let t = 0; t < transactions.length; t++) {
+      const trx = transactions[t];
+      if (!trx || trx.status === 'DA_HUY') continue;
+      const whId = trx.warehouseId;
+      if (!whId) continue;
+      if (selectedReportWarehouse !== 'ALL' && whId !== selectedReportWarehouse) continue;
+
+      const isReceipt = trx.type === 'NHAP_KHO';
+      const isIssue = trx.type === 'XUAT_KHO';
+      if (!isReceipt && !isIssue) continue;
+
+      const lines = trx.items || [];
+      for (let l = 0; l < lines.length; l++) {
+        const line = lines[l];
+        if (!line) continue;
+        let idx = line.itemId ? idToIdx.get(line.itemId) : undefined;
+        if (idx === undefined && line.itemCode) {
+          idx = codeToIdx.get(line.itemCode.trim().toUpperCase());
+        }
+        if (idx === undefined) continue;
+
+        const qty = Number(line.quantity) || 0;
+        if (isReceipt) {
+          inByItemWh[idx][whId] = (inByItemWh[idx][whId] || 0) + qty;
+        } else {
+          outByItemWh[idx][whId] = (outByItemWh[idx][whId] || 0) + qty;
+        }
+      }
+    }
+
+    const targetWarehouses =
+      selectedReportWarehouse === 'ALL'
+        ? warehouses
+        : warehouses.filter(w => w.id === selectedReportWarehouse);
+
     const rows: Array<{
       id: string;
       itemId: string;
@@ -177,45 +294,21 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       closingStock: number;
       unitPrice: number;
       closingValue: number;
-      status: any;
+      status: ReturnType<typeof getStockStatus>;
     }> = [];
 
-    const targetWarehouses =
-      selectedReportWarehouse === 'ALL'
-        ? warehouses
-        : warehouses.filter(w => w.id === selectedReportWarehouse);
-
-    targetWarehouses.forEach(wh => {
-      items.forEach(item => {
-        const stocks = calculateItemWarehouseStocks(item, warehouses, transactions);
+    for (let w = 0; w < targetWarehouses.length; w++) {
+      const wh = targetWarehouses[w];
+      for (let i = 0; i < n; i++) {
+        const item = items[i];
+        const stocks = getFastItemWarehouseStocks(item, warehouses);
         const closingStock = stocks[wh.id] || 0;
+        const totalIn = inByItemWh[i][wh.id] || 0;
+        const totalOut = outByItemWh[i][wh.id] || 0;
 
-        let totalIn = 0;
-        let totalOut = 0;
-
-        transactions.forEach(trx => {
-          if (trx.status === 'DA_HUY') return;
-          if (trx.warehouseId !== wh.id) return;
-
-          const matchingLines = trx.items.filter(
-            l =>
-              l.itemId === item.id ||
-              (l.itemCode &&
-                item.code &&
-                l.itemCode.trim().toUpperCase() === item.code.trim().toUpperCase())
-          );
-
-          matchingLines.forEach(line => {
-            if (trx.type === 'NHAP_KHO') totalIn += line.quantity;
-            if (trx.type === 'XUAT_KHO') totalOut += line.quantity;
-          });
-        });
-
-        // Only include in NXT report if this item has stock or activity in this warehouse
         if (closingStock > 0 || totalIn > 0 || totalOut > 0) {
           const openingStock = Math.max(0, closingStock - totalIn + totalOut);
           const closingValue = closingStock * item.unitPrice;
-
           rows.push({
             id: `${item.id}-${wh.id}`,
             itemId: item.id,
@@ -239,11 +332,50 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             }),
           });
         }
-      });
-    });
+      }
+    }
 
     return rows;
   }, [items, transactions, selectedReportWarehouse, warehouses]);
+
+  const nxtTotals = useMemo(() => {
+    let openingStock = 0;
+    let totalIn = 0;
+    let totalOut = 0;
+    let closingStock = 0;
+    let closingValue = 0;
+    for (let i = 0; i < nxtReportRows.length; i++) {
+      const r = nxtReportRows[i];
+      openingStock += r.openingStock;
+      totalIn += r.totalIn;
+      totalOut += r.totalOut;
+      closingStock += r.closingStock;
+      closingValue += r.closingValue;
+    }
+    return { openingStock, totalIn, totalOut, closingStock, closingValue };
+  }, [nxtReportRows]);
+
+  const activeTotalRowsCount =
+    reportViewMode === 'matrix' ? warehouseMatrixRows.length : nxtReportRows.length;
+  const totalReportPages = Math.max(1, Math.ceil(activeTotalRowsCount / reportPageSize));
+  const safeReportPage = Math.min(Math.max(1, reportPage), totalReportPages);
+  const pageOffset = (safeReportPage - 1) * reportPageSize;
+
+  const paginatedMatrixRows = useMemo(
+    () => warehouseMatrixRows.slice(pageOffset, pageOffset + reportPageSize),
+    [warehouseMatrixRows, pageOffset, reportPageSize]
+  );
+
+  const paginatedNxtRows = useMemo(
+    () => nxtReportRows.slice(pageOffset, pageOffset + reportPageSize),
+    [nxtReportRows, pageOffset, reportPageSize]
+  );
+
+  const visibleWarehouses = useMemo(
+    () =>
+      warehouses.filter(w => selectedReportWarehouse === 'ALL' || w.id === selectedReportWarehouse),
+    [warehouses, selectedReportWarehouse]
+  );
 
   // Export report to genuine Excel (.xlsx) file with full multi-warehouse stock breakdown
   const handleExportExcel = () => {
@@ -267,7 +399,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         'Vị Trí Kệ / Ngăn': row.location,
       };
 
-      // Thêm cột cho từng kho
       warehouses.forEach(wh => {
         rowObj[`Tồn tại: ${wh.name}`] = row.stocks[wh.id] || 0;
       });
@@ -280,7 +411,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       return rowObj;
     });
 
-    // Summary row for Matrix
     const summaryMatrixRow: Record<string, any> = {
       STT: 'TỔNG CỘNG',
       'Mã SKU': '',
@@ -291,20 +421,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       'Vị Trí Kệ / Ngăn': '',
     };
     warehouses.forEach(wh => {
-      summaryMatrixRow[`Tồn tại: ${wh.name}`] = warehouseMatrixRows.reduce(
-        (sum, r) => sum + (r.stocks[wh.id] || 0),
-        0
-      );
+      summaryMatrixRow[`Tồn tại: ${wh.name}`] = matrixTotals.byWh[wh.id] || 0;
     });
-    summaryMatrixRow['Tổng Tồn Kho (Các Kho)'] = warehouseMatrixRows.reduce(
-      (sum, r) => sum + r.totalStock,
-      0
-    );
+    summaryMatrixRow['Tổng Tồn Kho (Các Kho)'] = matrixTotals.grandTotalStock;
     summaryMatrixRow['Đơn Giá Vốn (VNĐ)'] = '';
-    summaryMatrixRow['Tổng Thành Tiền (VNĐ)'] = warehouseMatrixRows.reduce(
-      (sum, r) => sum + r.totalValue,
-      0
-    );
+    summaryMatrixRow['Tổng Thành Tiền (VNĐ)'] = matrixTotals.grandTotalValue;
     summaryMatrixRow['Tình Trạng Tồn'] = '';
     matrixSheetData.push(summaryMatrixRow);
 
@@ -338,12 +459,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         'ĐVT': '',
         'Kho Lưu Trữ': '',
         'Vị Trí Kệ / Ngăn': '',
-        'Tồn Đầu Kỳ': nxtReportRows.reduce((a, b) => a + b.openingStock, 0),
-        'Nhập Trong Kỳ': nxtReportRows.reduce((a, b) => a + b.totalIn, 0),
-        'Xuất Trong Kỳ': nxtReportRows.reduce((a, b) => a + b.totalOut, 0),
-        'Tồn Cuối Kỳ': nxtReportRows.reduce((a, b) => a + b.closingStock, 0),
+        'Tồn Đầu Kỳ': nxtTotals.openingStock,
+        'Nhập Trong Kỳ': nxtTotals.totalIn,
+        'Xuất Trong Kỳ': nxtTotals.totalOut,
+        'Tồn Cuối Kỳ': nxtTotals.closingStock,
         'Đơn Giá Vốn (VNĐ)': '' as any,
-        'Thành Tiền Tồn (VNĐ)': nxtReportRows.reduce((a, b) => a + b.closingValue, 0),
+        'Thành Tiền Tồn (VNĐ)': nxtTotals.closingValue,
         'Tình Trạng': '',
       });
       const nxtWorksheet = XLSX.utils.json_to_sheet(nxtSheetData);
@@ -367,10 +488,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <Boxes className="w-4 h-4 text-indigo-600" />
           </div>
           <div className="text-2xl font-bold text-slate-900 tabular-nums">
-            {formatCurrency(totalInventoryValue)}
+            {formatCurrency(kpiStats.totalInventoryValue)}
           </div>
           <div className="mt-2 text-xs text-slate-500 flex items-center gap-1.5">
-            <span className="font-semibold text-slate-700 tabular-nums">{totalItemsCount}</span>
+            <span className="font-semibold text-slate-700 tabular-nums">
+              {formatNumber(kpiStats.totalItemsCount)}
+            </span>
             <span>danh mục vật tư thiết bị</span>
           </div>
         </div>
@@ -382,7 +505,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <AlertTriangle className="w-4 h-4 text-rose-500" />
           </div>
           <div className="text-2xl font-bold text-rose-600 tabular-nums">
-            {lowStockItems.length}
+            {formatNumber(kpiStats.lowStockCount)}
           </div>
           <div className="mt-2 text-xs text-slate-500">
             <span>Dưới định mức min hoặc hết tồn kho</span>
@@ -396,7 +519,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <Layers className="w-4 h-4 text-blue-600" />
           </div>
           <div className="text-2xl font-bold text-slate-900 tabular-nums">
-            {equipmentOnLoan.length}
+            {formatNumber(kpiStats.equipmentOnLoanCount)}
           </div>
           <div className="mt-2 text-xs text-slate-500">
             <span>Máy móc, công cụ tại các công trường</span>
@@ -414,15 +537,19 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
           <div className="flex items-center justify-between pt-1">
             <div>
-              <span className="text-xs text-emerald-700 block">Nhập ({totalReceipts.length})</span>
+              <span className="text-xs text-emerald-700 block">
+                Nhập ({formatNumber(kpiStats.receiptsCount)})
+              </span>
               <span className="text-sm font-bold text-slate-800 tabular-nums">
-                {formatCurrency(totalReceiptValue)}
+                {formatCurrency(kpiStats.totalReceiptValue)}
               </span>
             </div>
             <div className="text-right">
-              <span className="text-xs text-amber-700 block">Xuất ({totalIssues.length})</span>
+              <span className="text-xs text-amber-700 block">
+                Xuất ({formatNumber(kpiStats.issuesCount)})
+              </span>
               <span className="text-sm font-bold text-slate-800 tabular-nums">
-                {formatCurrency(totalIssueValue)}
+                {formatCurrency(kpiStats.totalIssueValue)}
               </span>
             </div>
           </div>
@@ -443,7 +570,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <PieChart className="w-4 h-4 text-slate-400" />
           </div>
 
-          <div className="space-y-3.5">
+          <div className="space-y-3.5 max-h-[380px] overflow-y-auto pr-1">
             {categoryBreakdown.map(cat => (
               <div key={`${cat.categoryCode || ''}-${cat.category}`} className="space-y-1">
                 <div className="flex items-center justify-between text-xs">
@@ -456,7 +583,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     {cat.category}
                   </span>
                   <div className="flex items-center gap-3 shrink-0 tabular-nums">
-                    <span className="text-slate-500">{cat.count} mặt hàng</span>
+                    <span className="text-slate-500">{formatNumber(cat.count)} mặt hàng</span>
                     <span className="font-semibold text-slate-900">
                       {formatCurrency(cat.value)}
                     </span>
@@ -465,7 +592,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     </span>
                   </div>
                 </div>
-                {/* Progress bar */}
                 <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
                   <div
                     className="h-full bg-indigo-600 rounded-full transition-all duration-300"
@@ -477,7 +603,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
 
-        {/* Warehouse Breakdown (1 column) with both Total Stock Quantity and Total Value */}
+        {/* Warehouse Breakdown (1 column) */}
         <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-xs">
           <div className="flex items-center justify-between mb-4">
             <div>
@@ -509,7 +635,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </span>
                 </div>
 
-                {/* Stock Quantity Highlight */}
                 <div className="grid grid-cols-2 gap-2 pt-1 border-t border-slate-200/60 text-xs">
                   <div>
                     <span className="text-[11px] text-slate-500 block">Số lượng tồn:</span>
@@ -527,7 +652,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </div>
 
                 <div className="flex items-center justify-between text-[11px] text-slate-500 pt-0.5">
-                  <span>{wh.itemCount} danh mục lưu trữ</span>
+                  <span>{formatNumber(wh.itemCount)} danh mục lưu trữ</span>
                 </div>
 
                 <div className="w-full h-1.5 bg-slate-200 rounded-full overflow-hidden">
@@ -561,7 +686,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
-            {/* View Mode Switcher */}
             <div className="inline-flex rounded-lg border border-slate-200 p-0.5 bg-white shadow-2xs">
               <button
                 type="button"
@@ -590,7 +714,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </button>
             </div>
 
-            {/* Warehouse Filter */}
             <select
               value={selectedReportWarehouse}
               onChange={e => setSelectedReportWarehouse(e.target.value)}
@@ -604,7 +727,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               ))}
             </select>
 
-            {/* Export Excel (.xlsx) button */}
             <button
               onClick={handleExportExcel}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors shadow-2xs whitespace-nowrap"
@@ -615,22 +737,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
 
-        {/* VIEW MODE 1: MATRIX TABLE (CHIA SỐ LƯỢNG TỒN THEO TỪNG KHO) */}
+        {/* VIEW MODE 1: MATRIX TABLE */}
         {reportViewMode === 'matrix' && (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="bg-slate-100/90 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[11px]">
-                  <th className="py-3 px-3 w-10 text-center">STT</th>
-                  <th className="py-3 px-3 whitespace-nowrap">Mã SKU</th>
-                  <th className="py-3 px-4 min-w-[220px]">Tên vật tư / thiết bị</th>
-                  <th className="py-3 px-2 text-center whitespace-nowrap">ĐVT</th>
-                  <th className="py-3 px-3 min-w-[120px] whitespace-nowrap">Vị trí kệ/ngăn</th>
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-100/90 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[11px]">
+                    <th className="py-3 px-3 w-10 text-center">STT</th>
+                    <th className="py-3 px-3 whitespace-nowrap">Mã SKU</th>
+                    <th className="py-3 px-4 min-w-[220px]">Tên vật tư / thiết bị</th>
+                    <th className="py-3 px-2 text-center whitespace-nowrap">ĐVT</th>
+                    <th className="py-3 px-3 min-w-[120px] whitespace-nowrap">Vị trí kệ/ngăn</th>
 
-                  {/* CỘT PHÂN BỔ SỐ LƯỢNG TỒN CHO TỪNG KHO */}
-                  {warehouses
-                    .filter(w => selectedReportWarehouse === 'ALL' || w.id === selectedReportWarehouse)
-                    .map(w => (
+                    {visibleWarehouses.map(w => (
                       <th
                         key={w.id}
                         className="py-3 px-3 text-right min-w-[130px] bg-indigo-50/50 text-indigo-950 font-bold border-x border-slate-200"
@@ -641,63 +761,57 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       </th>
                     ))}
 
-                  <th className="py-3 px-3 text-right min-w-[110px] bg-slate-200/80 font-bold text-slate-900 whitespace-nowrap">
-                    Tổng tồn kho
-                  </th>
-                  <th className="py-3 px-3 text-right whitespace-nowrap">Đơn giá vốn</th>
-                  <th className="py-3 px-4 text-right whitespace-nowrap">Tổng thành tiền</th>
-                  <th className="py-3 px-3 text-center whitespace-nowrap">Tình trạng</th>
-                  <th className="py-3 px-3 text-center whitespace-nowrap">Thẻ kho</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {warehouseMatrixRows.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={9 + warehouses.length}
-                      className="py-8 text-center text-slate-400 italic text-xs"
-                    >
-                      Không có mặt hàng nào có số lượng tồn tại kho đã chọn.
-                    </td>
+                    <th className="py-3 px-3 text-right min-w-[110px] bg-slate-200/80 font-bold text-slate-900 whitespace-nowrap">
+                      Tổng tồn kho
+                    </th>
+                    <th className="py-3 px-3 text-right whitespace-nowrap">Đơn giá vốn</th>
+                    <th className="py-3 px-4 text-right whitespace-nowrap">Tổng thành tiền</th>
+                    <th className="py-3 px-3 text-center whitespace-nowrap">Tình trạng</th>
+                    <th className="py-3 px-3 text-center whitespace-nowrap">Thẻ kho</th>
                   </tr>
-                ) : (
-                  warehouseMatrixRows.map((row, idx) => {
-                    const isLow = row.status === 'CANH_BAO_THAP' || row.status === 'HET_HANG';
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {warehouseMatrixRows.length === 0 ? (
+                    <tr>
+                      <td
+                        colSpan={9 + visibleWarehouses.length}
+                        className="py-8 text-center text-slate-400 italic text-xs"
+                      >
+                        Không có mặt hàng nào có số lượng tồn tại kho đã chọn.
+                      </td>
+                    </tr>
+                  ) : (
+                    paginatedMatrixRows.map((row, idx) => {
+                      const isLow = row.status === 'CANH_BAO_THAP' || row.status === 'HET_HANG';
 
-                    return (
-                      <tr key={row.id} className="hover:bg-slate-50/80 transition-colors">
-                        <td className="py-3 px-3 text-center font-mono text-slate-400 text-[11px]">
-                          {idx + 1}
-                        </td>
-                        <td className="py-3 px-3 font-mono font-semibold text-slate-900 whitespace-nowrap">
-                          {row.code}
-                        </td>
-                        <td className="py-3 px-4">
-                          <div className="font-semibold text-slate-900 line-clamp-1" title={row.name}>
-                            {row.name}
-                          </div>
-                          <div className="text-[11px] text-slate-500 mt-0.5 flex items-center gap-2">
-                            <span>{getItemTypeLabel(row.type as any)}</span>
-                            <span>&bull;</span>
-                            <span className="text-slate-400">{row.category}</span>
-                          </div>
-                        </td>
-                        <td className="py-3 px-2 text-center text-slate-600 whitespace-nowrap font-medium">
-                          {row.unit}
-                        </td>
-                        <td className="py-3 px-3 text-slate-700 whitespace-nowrap font-medium">
-                          <span className="inline-block bg-slate-100 text-slate-700 px-2 py-0.5 rounded text-[11px] border border-slate-200">
-                            {row.location}
-                          </span>
-                        </td>
+                      return (
+                        <tr key={row.id} className="hover:bg-slate-50/80 transition-colors">
+                          <td className="py-3 px-3 text-center font-mono text-slate-400 text-[11px]">
+                            {pageOffset + idx + 1}
+                          </td>
+                          <td className="py-3 px-3 font-mono font-semibold text-slate-900 whitespace-nowrap">
+                            {row.code}
+                          </td>
+                          <td className="py-3 px-4">
+                            <div className="font-semibold text-slate-900 line-clamp-1" title={row.name}>
+                              {row.name}
+                            </div>
+                            <div className="text-[11px] text-slate-500 mt-0.5 flex items-center gap-2">
+                              <span>{getItemTypeLabel(row.type as any)}</span>
+                              <span>&bull;</span>
+                              <span className="text-slate-400">{row.category}</span>
+                            </div>
+                          </td>
+                          <td className="py-3 px-2 text-center text-slate-600 whitespace-nowrap font-medium">
+                            {row.unit}
+                          </td>
+                          <td className="py-3 px-3 text-slate-700 whitespace-nowrap font-medium">
+                            <span className="inline-block bg-slate-100 text-slate-700 px-2 py-0.5 rounded text-[11px] border border-slate-200">
+                              {row.location}
+                            </span>
+                          </td>
 
-                        {/* GIÁ TRỊ TỒN TẠI TỪNG KHO */}
-                        {warehouses
-                          .filter(
-                            w =>
-                              selectedReportWarehouse === 'ALL' || w.id === selectedReportWarehouse
-                          )
-                          .map(w => {
+                          {visibleWarehouses.map(w => {
                             const whStock = row.stocks[w.id] || 0;
                             return (
                               <td
@@ -715,217 +829,216 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                             );
                           })}
 
-                        {/* TỔNG TỒN */}
-                        <td className="py-3 px-3 text-right tabular-nums font-bold text-slate-900 bg-slate-50/60 whitespace-nowrap">
-                          <span
-                            className={
-                              row.totalStock === 0
-                                ? 'text-rose-600'
-                                : isLow
-                                ? 'text-amber-600'
-                                : 'text-slate-900'
-                            }
-                          >
-                            {formatNumber(row.totalStock)}
+                          <td className="py-3 px-3 text-right tabular-nums font-bold text-slate-900 bg-slate-50/60 whitespace-nowrap">
+                            <span
+                              className={
+                                row.totalStock === 0
+                                  ? 'text-rose-600'
+                                  : isLow
+                                  ? 'text-amber-600'
+                                  : 'text-slate-900'
+                              }
+                            >
+                              {formatNumber(row.totalStock)}
+                            </span>
+                          </td>
+
+                          <td className="py-3 px-3 text-right tabular-nums text-slate-600 whitespace-nowrap">
+                            {formatCurrency(row.unitPrice)}
+                          </td>
+
+                          <td className="py-3 px-4 text-right tabular-nums font-bold text-indigo-700 whitespace-nowrap">
+                            {formatCurrency(row.totalValue)}
+                          </td>
+
+                          <td className="py-3 px-3 text-center whitespace-nowrap">
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                                row.status === 'HET_HANG'
+                                  ? 'bg-rose-100 text-rose-700'
+                                  : row.status === 'CANH_BAO_THAP'
+                                  ? 'bg-amber-100 text-amber-700'
+                                  : row.status === 'VUOT_DINH_MUC'
+                                  ? 'bg-purple-100 text-purple-700'
+                                  : 'bg-emerald-100 text-emerald-700'
+                              }`}
+                            >
+                              {getStockStatusLabel(row.status)}
+                            </span>
+                          </td>
+
+                          <td className="py-3 px-3 text-center whitespace-nowrap">
+                            <button
+                              onClick={() => onSelectStockCard(row.id)}
+                              className="text-indigo-600 hover:text-indigo-800 font-semibold underline underline-offset-2 hover:bg-indigo-50 px-2 py-1 rounded text-xs"
+                            >
+                              Xem thẻ kho
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+                <tfoot>
+                  <tr className="bg-slate-100/90 border-t-2 border-slate-300 font-bold text-slate-900 text-xs">
+                    <td colSpan={5} className="py-3.5 px-4 uppercase tracking-wider">
+                      Tổng cộng tồn kho ({formatNumber(warehouseMatrixRows.length)} mặt hàng)
+                    </td>
+
+                    {visibleWarehouses.map(w => (
+                      <td
+                        key={w.id}
+                        className="py-3.5 px-3 text-right tabular-nums text-indigo-950 font-bold bg-indigo-100/50 border-x border-slate-200 whitespace-nowrap"
+                      >
+                        {formatNumber(matrixTotals.byWh[w.id] || 0)}
+                      </td>
+                    ))}
+
+                    <td className="py-3.5 px-3 text-right tabular-nums font-bold text-slate-900 bg-slate-200/60 whitespace-nowrap">
+                      {formatNumber(matrixTotals.grandTotalStock)}
+                    </td>
+                    <td className="py-3.5 px-3 text-right text-slate-400">-</td>
+                    <td className="py-3.5 px-4 text-right tabular-nums font-bold text-indigo-700 whitespace-nowrap">
+                      {formatCurrency(matrixTotals.grandTotalValue)}
+                    </td>
+                    <td colSpan={2}></td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+            <PaginationBar
+              currentPage={safeReportPage}
+              totalItems={warehouseMatrixRows.length}
+              pageSize={reportPageSize}
+              onPageChange={setReportPage}
+              onPageSizeChange={setReportPageSize}
+              itemLabel="mặt hàng"
+            />
+          </>
+        )}
+
+        {/* VIEW MODE 2: SỔ NHẬP - XUẤT - TỒN CHI TIẾT (NXT LEDGER) */}
+        {reportViewMode === 'nxt' && (
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-100/90 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[11px]">
+                    <th className="py-3 px-3 w-10 text-center">STT</th>
+                    <th className="py-3 px-3 whitespace-nowrap">Mã SKU</th>
+                    <th className="py-3 px-4 min-w-[200px]">Tên vật tư / thiết bị</th>
+                    <th className="py-3 px-2 text-center whitespace-nowrap">ĐVT</th>
+                    <th className="py-3 px-3 whitespace-nowrap">Kho lưu trữ</th>
+                    <th className="py-3 px-3 whitespace-nowrap">Vị trí kệ/ngăn</th>
+                    <th className="py-3 px-3 text-right whitespace-nowrap">Tồn đầu kỳ</th>
+                    <th className="py-3 px-3 text-right text-emerald-700 whitespace-nowrap">Nhập kỳ</th>
+                    <th className="py-3 px-3 text-right text-amber-700 whitespace-nowrap">Xuất kỳ</th>
+                    <th className="py-3 px-3 text-right font-bold text-slate-900 whitespace-nowrap">Tồn cuối</th>
+                    <th className="py-3 px-3 text-right whitespace-nowrap">Đơn giá vốn</th>
+                    <th className="py-3 px-4 text-right whitespace-nowrap">Thành tiền tồn</th>
+                    <th className="py-3 px-3 text-center whitespace-nowrap">Thẻ kho</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {nxtReportRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={13} className="py-8 text-center text-slate-400 italic text-xs">
+                        Không có phát sinh giao dịch hoặc số dư tại kho này.
+                      </td>
+                    </tr>
+                  ) : (
+                    paginatedNxtRows.map((row, idx) => (
+                      <tr key={row.id} className="hover:bg-slate-50/80 transition-colors">
+                        <td className="py-3 px-3 text-center font-mono text-slate-400 text-[11px]">
+                          {pageOffset + idx + 1}
+                        </td>
+                        <td className="py-3 px-3 font-mono font-medium text-slate-900 whitespace-nowrap">
+                          {row.code}
+                        </td>
+                        <td className="py-3 px-4 font-medium text-slate-900 min-w-[200px]">
+                          <div className="line-clamp-1">{row.name}</div>
+                          <div className="text-[11px] text-slate-400 font-normal">
+                            {getItemTypeLabel(row.type as any)}
+                          </div>
+                        </td>
+                        <td className="py-3 px-2 text-center text-slate-600 whitespace-nowrap">{row.unit}</td>
+                        <td className="py-3 px-3 text-slate-700 whitespace-nowrap font-medium max-w-[150px] truncate" title={row.warehouseName}>
+                          <span className="inline-block bg-indigo-50 text-indigo-900 px-2 py-0.5 rounded text-[11px] border border-indigo-100 font-semibold">
+                            {row.warehouseName}
                           </span>
                         </td>
-
-                        {/* ĐƠN GIÁ */}
+                        <td className="py-3 px-3 text-slate-600 whitespace-nowrap">
+                          {row.location}
+                        </td>
+                        <td className="py-3 px-3 text-right tabular-nums text-slate-600">
+                          {formatNumber(row.openingStock)}
+                        </td>
+                        <td className="py-3 px-3 text-right tabular-nums font-medium text-emerald-700 bg-emerald-50/30">
+                          {row.totalIn > 0 ? `+${formatNumber(row.totalIn)}` : '-'}
+                        </td>
+                        <td className="py-3 px-3 text-right tabular-nums font-medium text-amber-700 bg-amber-50/30">
+                          {row.totalOut > 0 ? `-${formatNumber(row.totalOut)}` : '-'}
+                        </td>
+                        <td className="py-3 px-3 text-right tabular-nums font-bold text-slate-900 bg-slate-50/50">
+                          {formatNumber(row.closingStock)}
+                        </td>
                         <td className="py-3 px-3 text-right tabular-nums text-slate-600 whitespace-nowrap">
                           {formatCurrency(row.unitPrice)}
                         </td>
-
-                        {/* THÀNH TIỀN */}
-                        <td className="py-3 px-4 text-right tabular-nums font-bold text-indigo-700 whitespace-nowrap">
-                          {formatCurrency(row.totalValue)}
+                        <td className="py-3 px-4 text-right tabular-nums font-semibold text-slate-900 whitespace-nowrap">
+                          {formatCurrency(row.closingValue)}
                         </td>
-
-                        {/* TÌNH TRẠNG */}
-                        <td className="py-3 px-3 text-center whitespace-nowrap">
-                          <span
-                            className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
-                              row.status === 'HET_HANG'
-                                ? 'bg-rose-100 text-rose-700'
-                                : row.status === 'CANH_BAO_THAP'
-                                ? 'bg-amber-100 text-amber-700'
-                                : row.status === 'VUOT_DINH_MUC'
-                                ? 'bg-purple-100 text-purple-700'
-                                : 'bg-emerald-100 text-emerald-700'
-                            }`}
-                          >
-                            {getStockStatusLabel(row.status)}
-                          </span>
-                        </td>
-
-                        {/* THAO TÁC */}
                         <td className="py-3 px-3 text-center whitespace-nowrap">
                           <button
-                            onClick={() => onSelectStockCard(row.id)}
-                            className="text-indigo-600 hover:text-indigo-800 font-semibold underline underline-offset-2 hover:bg-indigo-50 px-2 py-1 rounded text-xs"
+                            onClick={() => onSelectStockCard(row.itemId)}
+                            className="text-indigo-600 hover:text-indigo-800 font-semibold underline underline-offset-2 hover:bg-indigo-50 px-2 py-1 rounded"
                           >
                             Xem thẻ kho
                           </button>
                         </td>
                       </tr>
-                    );
-                  })
-                )}
-              </tbody>
-              <tfoot>
-                <tr className="bg-slate-100/90 border-t-2 border-slate-300 font-bold text-slate-900 text-xs">
-                  <td colSpan={5} className="py-3.5 px-4 uppercase tracking-wider">
-                    Tổng cộng tồn kho ({warehouseMatrixRows.length} mặt hàng)
-                  </td>
-
-                  {/* TỔNG TỒN CỘNG CHO TỪNG KHO */}
-                  {warehouses
-                    .filter(
-                      w => selectedReportWarehouse === 'ALL' || w.id === selectedReportWarehouse
-                    )
-                    .map(w => {
-                      const colTotal = warehouseMatrixRows.reduce(
-                        (sum, r) => sum + (r.stocks[w.id] || 0),
-                        0
-                      );
-                      return (
-                        <td
-                          key={w.id}
-                          className="py-3.5 px-3 text-right tabular-nums text-indigo-950 font-bold bg-indigo-100/50 border-x border-slate-200 whitespace-nowrap"
-                        >
-                          {formatNumber(colTotal)}
-                        </td>
-                      );
-                    })}
-
-                  {/* TỔNG CỘNG TOÀN BỘ */}
-                  <td className="py-3.5 px-3 text-right tabular-nums font-bold text-slate-900 bg-slate-200/60 whitespace-nowrap">
-                    {formatNumber(
-                      warehouseMatrixRows.reduce((sum, r) => sum + r.totalStock, 0)
-                    )}
-                  </td>
-                  <td className="py-3.5 px-3 text-right text-slate-400">-</td>
-                  <td className="py-3.5 px-4 text-right tabular-nums font-bold text-indigo-700 whitespace-nowrap">
-                    {formatCurrency(
-                      warehouseMatrixRows.reduce((sum, r) => sum + r.totalValue, 0)
-                    )}
-                  </td>
-                  <td colSpan={2}></td>
-                </tr>
-              </tfoot>
-            </table>
-          </div>
-        )}
-
-        {/* VIEW MODE 2: SỔ NHẬP - XUẤT - TỒN CHI TIẾT (NXT LEDGER) */}
-        {reportViewMode === 'nxt' && (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="bg-slate-100/90 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[11px]">
-                  <th className="py-3 px-3 w-10 text-center">STT</th>
-                  <th className="py-3 px-3 whitespace-nowrap">Mã SKU</th>
-                  <th className="py-3 px-4 min-w-[200px]">Tên vật tư / thiết bị</th>
-                  <th className="py-3 px-2 text-center whitespace-nowrap">ĐVT</th>
-                  <th className="py-3 px-3 whitespace-nowrap">Kho lưu trữ</th>
-                  <th className="py-3 px-3 whitespace-nowrap">Vị trí kệ/ngăn</th>
-                  <th className="py-3 px-3 text-right whitespace-nowrap">Tồn đầu kỳ</th>
-                  <th className="py-3 px-3 text-right text-emerald-700 whitespace-nowrap">Nhập kỳ</th>
-                  <th className="py-3 px-3 text-right text-amber-700 whitespace-nowrap">Xuất kỳ</th>
-                  <th className="py-3 px-3 text-right font-bold text-slate-900 whitespace-nowrap">Tồn cuối</th>
-                  <th className="py-3 px-3 text-right whitespace-nowrap">Đơn giá vốn</th>
-                  <th className="py-3 px-4 text-right whitespace-nowrap">Thành tiền tồn</th>
-                  <th className="py-3 px-3 text-center whitespace-nowrap">Thẻ kho</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {nxtReportRows.length === 0 ? (
-                  <tr>
-                    <td colSpan={13} className="py-8 text-center text-slate-400 italic text-xs">
-                      Không có phát sinh giao dịch hoặc số dư tại kho này.
+                    ))
+                  )}
+                </tbody>
+                <tfoot>
+                  <tr className="bg-slate-100/90 border-t-2 border-slate-300 font-bold text-slate-900 text-xs">
+                    <td colSpan={6} className="py-3.5 px-4 uppercase tracking-wider">
+                      Tổng cộng báo cáo ({formatNumber(nxtReportRows.length)} dòng dữ liệu)
                     </td>
+                    <td className="py-3.5 px-3 text-right tabular-nums">
+                      {formatNumber(nxtTotals.openingStock)}
+                    </td>
+                    <td className="py-3.5 px-3 text-right tabular-nums text-emerald-800">
+                      +{formatNumber(nxtTotals.totalIn)}
+                    </td>
+                    <td className="py-3.5 px-3 text-right tabular-nums text-amber-800">
+                      -{formatNumber(nxtTotals.totalOut)}
+                    </td>
+                    <td className="py-3.5 px-3 text-right tabular-nums font-bold">
+                      {formatNumber(nxtTotals.closingStock)}
+                    </td>
+                    <td className="py-3.5 px-3 text-right text-slate-400">-</td>
+                    <td className="py-3.5 px-4 text-right tabular-nums font-bold text-indigo-700">
+                      {formatCurrency(nxtTotals.closingValue)}
+                    </td>
+                    <td></td>
                   </tr>
-                ) : (
-                  nxtReportRows.map((row, idx) => (
-                    <tr key={row.id} className="hover:bg-slate-50/80 transition-colors">
-                      <td className="py-3 px-3 text-center font-mono text-slate-400 text-[11px]">
-                        {idx + 1}
-                      </td>
-                      <td className="py-3 px-3 font-mono font-medium text-slate-900 whitespace-nowrap">
-                        {row.code}
-                      </td>
-                      <td className="py-3 px-4 font-medium text-slate-900 min-w-[200px]">
-                        <div className="line-clamp-1">{row.name}</div>
-                        <div className="text-[11px] text-slate-400 font-normal">
-                          {getItemTypeLabel(row.type as any)}
-                        </div>
-                      </td>
-                      <td className="py-3 px-2 text-center text-slate-600 whitespace-nowrap">{row.unit}</td>
-                      <td className="py-3 px-3 text-slate-700 whitespace-nowrap font-medium max-w-[150px] truncate" title={row.warehouseName}>
-                        <span className="inline-block bg-indigo-50 text-indigo-900 px-2 py-0.5 rounded text-[11px] border border-indigo-100 font-semibold">
-                          {row.warehouseName}
-                        </span>
-                      </td>
-                      <td className="py-3 px-3 text-slate-600 whitespace-nowrap">
-                        {row.location}
-                      </td>
-                      <td className="py-3 px-3 text-right tabular-nums text-slate-600">
-                        {formatNumber(row.openingStock)}
-                      </td>
-                      <td className="py-3 px-3 text-right tabular-nums font-medium text-emerald-700 bg-emerald-50/30">
-                        {row.totalIn > 0 ? `+${formatNumber(row.totalIn)}` : '-'}
-                      </td>
-                      <td className="py-3 px-3 text-right tabular-nums font-medium text-amber-700 bg-amber-50/30">
-                        {row.totalOut > 0 ? `-${formatNumber(row.totalOut)}` : '-'}
-                      </td>
-                      <td className="py-3 px-3 text-right tabular-nums font-bold text-slate-900 bg-slate-50/50">
-                        {formatNumber(row.closingStock)}
-                      </td>
-                      <td className="py-3 px-3 text-right tabular-nums text-slate-600 whitespace-nowrap">
-                        {formatCurrency(row.unitPrice)}
-                      </td>
-                      <td className="py-3 px-4 text-right tabular-nums font-semibold text-slate-900 whitespace-nowrap">
-                        {formatCurrency(row.closingValue)}
-                      </td>
-                      <td className="py-3 px-3 text-center whitespace-nowrap">
-                        <button
-                          onClick={() => onSelectStockCard(row.itemId)}
-                          className="text-indigo-600 hover:text-indigo-800 font-semibold underline underline-offset-2 hover:bg-indigo-50 px-2 py-1 rounded"
-                        >
-                          Xem thẻ kho
-                        </button>
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-              <tfoot>
-                <tr className="bg-slate-100/90 border-t-2 border-slate-300 font-bold text-slate-900 text-xs">
-                  <td colSpan={6} className="py-3.5 px-4 uppercase tracking-wider">
-                    Tổng cộng báo cáo ({nxtReportRows.length} dòng dữ liệu)
-                  </td>
-                  <td className="py-3.5 px-3 text-right tabular-nums">
-                    {formatNumber(nxtReportRows.reduce((a, b) => a + b.openingStock, 0))}
-                  </td>
-                  <td className="py-3.5 px-3 text-right tabular-nums text-emerald-800">
-                    +{formatNumber(nxtReportRows.reduce((a, b) => a + b.totalIn, 0))}
-                  </td>
-                  <td className="py-3.5 px-3 text-right tabular-nums text-amber-800">
-                    -{formatNumber(nxtReportRows.reduce((a, b) => a + b.totalOut, 0))}
-                  </td>
-                  <td className="py-3.5 px-3 text-right tabular-nums font-bold">
-                    {formatNumber(nxtReportRows.reduce((a, b) => a + b.closingStock, 0))}
-                  </td>
-                  <td className="py-3.5 px-3 text-right text-slate-400">-</td>
-                  <td className="py-3.5 px-4 text-right tabular-nums font-bold text-indigo-700">
-                    {formatCurrency(nxtReportRows.reduce((a, b) => a + b.closingValue, 0))}
-                  </td>
-                  <td></td>
-                </tr>
-              </tfoot>
-            </table>
-          </div>
+                </tfoot>
+              </table>
+            </div>
+            <PaginationBar
+              currentPage={safeReportPage}
+              totalItems={nxtReportRows.length}
+              pageSize={reportPageSize}
+              onPageChange={setReportPage}
+              onPageSizeChange={setReportPageSize}
+              itemLabel="dòng báo cáo"
+            />
+          </>
         )}
       </div>
     </div>
   );
 };
+

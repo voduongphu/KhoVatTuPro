@@ -1,27 +1,21 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   PackagePlus,
   PackageMinus,
   Search,
-  Filter,
   Download,
-  Eye,
   Printer,
-  Calendar,
-  Warehouse as WarehouseIcon,
   CheckCircle2,
-  Clock,
   FileSpreadsheet,
   Trash2,
   Edit2,
-  ShieldAlert,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
-import { Transaction, TransactionType } from '../types/inventory';
+import { Transaction, TransactionType, Warehouse } from '../types/inventory';
 import { ConfirmDeleteModal } from './ConfirmDeleteModal';
+import { PaginationBar } from './PaginationBar';
 import * as XLSX from 'xlsx';
 import {
-  exportToCSV,
   formatCurrency,
   formatDateTime,
   formatNumber,
@@ -49,47 +43,79 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedWarehouse, setSelectedWarehouse] = useState<string>('ALL');
   const [selectedCreator, setSelectedCreator] = useState<string>('ALL');
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [pageSize, setPageSize] = useState<number>(50);
 
   const isAdmin = currentUser?.role === 'ADMIN';
   const canManage = currentUser?.role === 'ADMIN' || currentUser?.role === 'THU_KHO';
 
-  // Extract unique creators for filtering
-  const creatorsList = React.useMemo(() => {
-    const set = new Set<string>();
-    transactions.forEach(t => {
-      if (t.creatorName && t.creatorName.trim()) {
-        set.add(t.creatorName.trim());
-      }
-    });
-    return Array.from(set).sort();
-  }, [transactions]);
+  useEffect(() => {
+    setTypeFilter(initialType || 'ALL');
+    setCurrentPage(1);
+  }, [initialType]);
 
-  const filteredTransactions = transactions.filter(trx => {
-    if (typeFilter !== 'ALL' && trx.type !== typeFilter) return false;
-    if (selectedWarehouse !== 'ALL' && trx.warehouseId !== selectedWarehouse) return false;
-    if (selectedCreator !== 'ALL' && trx.creatorName !== selectedCreator) return false;
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [typeFilter, selectedWarehouse, selectedCreator, searchQuery]);
 
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase().trim();
-      const matchCode = trx.code.toLowerCase().includes(q);
-      const matchPartner = trx.partnerName.toLowerCase().includes(q);
-      const matchProject = trx.departmentOrProject.toLowerCase().includes(q);
-      const matchNotes = trx.notes.toLowerCase().includes(q);
-      const matchItems = trx.items.some(
-        i => i.itemCode.toLowerCase().includes(q) || i.itemName.toLowerCase().includes(q)
-      );
-      if (!matchCode && !matchPartner && !matchProject && !matchNotes && !matchItems) {
-        return false;
+  const warehouseById = useMemo(() => {
+    const map = new Map<string, Warehouse>();
+    for (let i = 0; i < warehouses.length; i++) {
+      map.set(warehouses[i].id, warehouses[i]);
+    }
+    return map;
+  }, [warehouses]);
+
+  // Extract unique creators & counts in ONE O(T) pass
+  const creatorsWithCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (let i = 0; i < transactions.length; i++) {
+      const name = transactions[i].creatorName?.trim();
+      if (name) {
+        counts.set(name, (counts.get(name) || 0) + 1);
       }
     }
+    return Array.from(counts.entries())
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'vi'));
+  }, [transactions]);
 
-    return true;
-  });
+  const filteredTransactions = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return transactions.filter(trx => {
+      if (typeFilter !== 'ALL' && trx.type !== typeFilter) return false;
+      if (selectedWarehouse !== 'ALL' && trx.warehouseId !== selectedWarehouse) return false;
+      if (selectedCreator !== 'ALL' && (trx.creatorName || '').trim() !== selectedCreator) return false;
+
+      if (q) {
+        const matchCode = trx.code.toLowerCase().includes(q);
+        const matchPartner = trx.partnerName.toLowerCase().includes(q);
+        const matchProject = trx.departmentOrProject.toLowerCase().includes(q);
+        const matchNotes = trx.notes.toLowerCase().includes(q);
+        const matchItems = trx.items.some(
+          i => i.itemCode.toLowerCase().includes(q) || i.itemName.toLowerCase().includes(q)
+        );
+        if (!matchCode && !matchPartner && !matchProject && !matchNotes && !matchItems) {
+          return false;
+        }
+      }
+
+      return true;
+    });
+  }, [transactions, typeFilter, selectedWarehouse, selectedCreator, searchQuery]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredTransactions.length / pageSize));
+  const safePage = Math.min(Math.max(1, currentPage), totalPages);
+
+  const paginatedTransactions = useMemo(() => {
+    const start = (safePage - 1) * pageSize;
+    return filteredTransactions.slice(start, start + pageSize);
+  }, [filteredTransactions, safePage, pageSize]);
 
   // 1. Export Summary of vouchers with "Số Lượng Vật Tư" column
   const handleExportSummaryExcel = () => {
     const excelData = filteredTransactions.map((t, idx) => {
-      const wh = warehouses.find(w => w.id === t.warehouseId);
+      const wh = warehouseById.get(t.warehouseId);
       const totalQuantity = t.items.reduce((acc, it) => acc + (Number(it.quantity) || 0), 0);
       return {
         STT: idx + 1,
@@ -102,7 +128,7 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
         'Dự Án / Phòng Ban': t.departmentOrProject,
         'Người Lập Phiếu': t.creatorName,
         'Số Mặt Hàng': t.items.length,
-        'Số Lượng Vật Tư': totalQuantity, // Crucial column
+        'Số Lượng Vật Tư': totalQuantity,
         'Tổng Giá Trị (VNĐ)': t.totalAmount,
         'Ghi Chú': t.notes || '',
         'Trạng Thái': t.status === 'HOAN_THANH' ? 'Hoàn thành' : 'Chờ duyệt',
@@ -151,7 +177,7 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
     let rowIdx = 1;
 
     filteredTransactions.forEach(t => {
-      const wh = warehouses.find(w => w.id === t.warehouseId);
+      const wh = warehouseById.get(t.warehouseId);
       t.items.forEach(line => {
         detailData.push({
           STT: rowIdx++,
@@ -165,7 +191,7 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
           'Mã Vật Tư': line.itemCode,
           'Tên Vật Tư Thiết Bị': line.itemName,
           'ĐVT': line.unit,
-          'Số Lượng Vật Tư': line.quantity, // Crucial column
+          'Số Lượng Vật Tư': line.quantity,
           'Đơn Giá (VNĐ)': line.unitPrice,
           'Thành Tiền (VNĐ)': line.amount || line.quantity * line.unitPrice,
           'Số Lô / Serial': line.serialNumber || '-',
@@ -210,7 +236,7 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
 
   // 3. Export single voucher to Excel with "Số Lượng Vật Tư" column
   const handleExportSingleTrx = (trx: Transaction) => {
-    const wh = warehouses.find(w => w.id === trx.warehouseId);
+    const wh = warehouseById.get(trx.warehouseId);
     const isReceipt = trx.type === 'NHAP_KHO';
     const title = isReceipt ? 'PHIẾU NHẬP KHO' : 'PHIẾU XUẤT KHO';
 
@@ -228,7 +254,7 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
         B: 'Mã Vật Tư',
         C: 'Tên Vật Tư Thiết Bị',
         D: 'ĐVT',
-        E: 'Số Lượng Vật Tư', // Crucial column
+        E: 'Số Lượng Vật Tư',
         F: 'Đơn Giá (VNĐ)',
         G: 'Thành Tiền (VNĐ)',
         H: 'Số Lô / Serial',
@@ -360,7 +386,7 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
 
       {/* Filter and Search Bar */}
       <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-xs flex flex-col md:flex-row gap-3 items-stretch md:items-center justify-between">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center flex-wrap gap-2">
           {!initialType && (
             <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg text-xs">
               <button
@@ -371,7 +397,7 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
                     : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
-                Tất cả ({transactions.length})
+                Tất cả ({formatNumber(transactions.length)})
               </button>
               <button
                 onClick={() => setTypeFilter('NHAP_KHO')}
@@ -411,7 +437,7 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
             ))}
           </select>
 
-          {creatorsList.length > 0 && (
+          {creatorsWithCounts.length > 0 && (
             <select
               value={selectedCreator}
               onChange={e => setSelectedCreator(e.target.value)}
@@ -419,14 +445,11 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
               title="Lọc chứng từ theo người lập phiếu"
             >
               <option value="ALL">Tất cả người lập</option>
-              {creatorsList.map(c => {
-                const count = transactions.filter(t => t.creatorName === c).length;
-                return (
-                  <option key={c} value={c}>
-                    {c} ({count} phiếu)
-                  </option>
-                );
-              })}
+              {creatorsWithCounts.map(c => (
+                <option key={c.name} value={c.name}>
+                  {c.name} ({formatNumber(c.count)} phiếu)
+                </option>
+              ))}
             </select>
           )}
         </div>
@@ -451,160 +474,165 @@ export const TransactionListView: React.FC<TransactionListViewProps> = ({
             Không tìm thấy phiếu giao dịch nào phù hợp.
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="bg-slate-50/80 border-b border-slate-200 text-slate-500 font-semibold uppercase tracking-wider text-[11px]">
-                  <th className="py-3 px-4">Số chứng từ</th>
-                  <th className="py-3 px-3">Loại phiếu</th>
-                  <th className="py-3 px-3">Thời gian</th>
-                  <th className="py-3 px-3">Kho lưu</th>
-                  <th className="py-3 px-4 min-w-[180px]">Đối tác / Bên nhận</th>
-                  <th className="py-3 px-4 min-w-[160px]">Dự án / Mục đích</th>
-                  <th className="py-3 px-3 text-center">Số khoản</th>
-                  <th className="py-3 px-3 text-right">Số lượng vật tư</th>
-                  <th className="py-3 px-4 text-right">Tổng thành tiền</th>
-                  <th className="py-3 px-3 text-center">Trạng thái</th>
-                  <th className="py-3 px-4 text-center">Thao tác</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {filteredTransactions.map(trx => {
-                  const wh = warehouses.find(w => w.id === trx.warehouseId);
-                  const isReceipt = trx.type === 'NHAP_KHO';
-                  const totalVoucherQty = trx.items.reduce(
-                    (acc, it) => acc + (Number(it.quantity) || 0),
-                    0
-                  );
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-50/80 border-b border-slate-200 text-slate-500 font-semibold uppercase tracking-wider text-[11px]">
+                    <th className="py-3 px-4">Số chứng từ</th>
+                    <th className="py-3 px-3">Loại phiếu</th>
+                    <th className="py-3 px-3">Thời gian</th>
+                    <th className="py-3 px-3">Kho lưu</th>
+                    <th className="py-3 px-4 min-w-[180px]">Đối tác / Bên nhận</th>
+                    <th className="py-3 px-4 min-w-[160px]">Dự án / Mục đích</th>
+                    <th className="py-3 px-3 text-center">Số khoản</th>
+                    <th className="py-3 px-3 text-right">Số lượng vật tư</th>
+                    <th className="py-3 px-4 text-right">Tổng thành tiền</th>
+                    <th className="py-3 px-3 text-center">Trạng thái</th>
+                    <th className="py-3 px-4 text-center">Thao tác</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {paginatedTransactions.map(trx => {
+                    const wh = warehouseById.get(trx.warehouseId);
+                    const isReceipt = trx.type === 'NHAP_KHO';
+                    const totalVoucherQty = trx.items.reduce(
+                      (acc, it) => acc + (Number(it.quantity) || 0),
+                      0
+                    );
 
-                  return (
-                    <tr key={trx.id} className="hover:bg-slate-50/80 transition-colors">
-                      {/* Code */}
-                      <td className="py-3.5 px-4 font-mono font-bold whitespace-nowrap">
-                        <span
-                          className={
-                            isReceipt ? 'text-emerald-700' : 'text-amber-800'
-                          }
-                        >
-                          {trx.code}
-                        </span>
-                      </td>
+                    return (
+                      <tr key={trx.id} className="hover:bg-slate-50/80 transition-colors">
+                        {/* Code */}
+                        <td className="py-3.5 px-4 font-mono font-bold whitespace-nowrap">
+                          <span className={isReceipt ? 'text-emerald-700' : 'text-amber-800'}>
+                            {trx.code}
+                          </span>
+                        </td>
 
-                      {/* Subtype */}
-                      <td className="py-3.5 px-3 whitespace-nowrap">
-                        <span
-                          className={`inline-block px-2 py-0.5 rounded text-[11px] font-medium ${
-                            isReceipt
-                              ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                              : 'bg-amber-50 text-amber-800 border border-amber-200'
-                          }`}
-                        >
-                          {getSubtypeLabel(trx.subtype)}
-                        </span>
-                      </td>
+                        {/* Subtype */}
+                        <td className="py-3.5 px-3 whitespace-nowrap">
+                          <span
+                            className={`inline-block px-2 py-0.5 rounded text-[11px] font-medium ${
+                              isReceipt
+                                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                : 'bg-amber-50 text-amber-800 border border-amber-200'
+                            }`}
+                          >
+                            {getSubtypeLabel(trx.subtype)}
+                          </span>
+                        </td>
 
-                      {/* Date */}
-                      <td className="py-3.5 px-3 whitespace-nowrap text-slate-600 tabular-nums">
-                        {formatDateTime(trx.date)}
-                      </td>
+                        {/* Date */}
+                        <td className="py-3.5 px-3 whitespace-nowrap text-slate-600 tabular-nums">
+                          {formatDateTime(trx.date)}
+                        </td>
 
-                      {/* Warehouse */}
-                      <td className="py-3.5 px-3 whitespace-nowrap text-slate-700 max-w-[140px] truncate" title={wh?.name}>
-                        {wh?.name}
-                      </td>
+                        {/* Warehouse */}
+                        <td className="py-3.5 px-3 whitespace-nowrap text-slate-700 max-w-[140px] truncate" title={wh?.name}>
+                          {wh?.name}
+                        </td>
 
-                      {/* Partner */}
-                      <td className="py-3.5 px-4">
-                        <div className="font-semibold text-slate-900 line-clamp-1" title={trx.partnerName}>
-                          {trx.partnerName}
-                        </div>
-                        <div className="text-[11px] text-slate-400">
-                          Người lập: {trx.creatorName}
-                        </div>
-                      </td>
-
-                      {/* Project / Purpose */}
-                      <td className="py-3.5 px-4 text-slate-600">
-                        <div className="line-clamp-1 font-medium text-slate-800" title={trx.departmentOrProject}>
-                          {trx.departmentOrProject}
-                        </div>
-                        {trx.notes && (
-                          <div className="text-[11px] text-slate-400 line-clamp-1" title={trx.notes}>
-                            {trx.notes}
+                        {/* Partner */}
+                        <td className="py-3.5 px-4">
+                          <div className="font-semibold text-slate-900 line-clamp-1" title={trx.partnerName}>
+                            {trx.partnerName}
                           </div>
-                        )}
-                      </td>
+                          <div className="text-[11px] text-slate-400">
+                            Người lập: {trx.creatorName}
+                          </div>
+                        </td>
 
-                      {/* Items count */}
-                      <td className="py-3.5 px-3 text-center tabular-nums text-slate-700 font-semibold whitespace-nowrap">
-                        {trx.items.length} mặt hàng
-                      </td>
-
-                      {/* Total Quantity Column */}
-                      <td className="py-3.5 px-3 text-right tabular-nums font-bold text-indigo-700 whitespace-nowrap bg-indigo-50/20">
-                        {formatNumber(totalVoucherQty)}
-                      </td>
-
-                      {/* Total Amount */}
-                      <td className="py-3.5 px-4 text-right tabular-nums font-bold text-slate-900 whitespace-nowrap">
-                        {formatCurrency(trx.totalAmount)}
-                      </td>
-
-                      {/* Status */}
-                      <td className="py-3.5 px-3 text-center whitespace-nowrap">
-                        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                          <CheckCircle2 className="w-3 h-3" />
-                          <span>Đã lưu sổ</span>
-                        </span>
-                      </td>
-
-                      {/* Actions */}
-                      <td className="py-3.5 px-4 text-center whitespace-nowrap">
-                        <div className="flex items-center justify-center gap-1">
-                          {/* Export voucher Excel button */}
-                          <button
-                            onClick={() => handleExportSingleTrx(trx)}
-                            className="p-1.5 text-slate-500 hover:text-emerald-700 hover:bg-emerald-50 rounded transition-colors"
-                            title="Xuất phiếu này ra file Excel (.xlsx) kèm cột số lượng vật tư"
-                          >
-                            <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
-                          </button>
-
-                          <button
-                            onClick={() => onPrintTransaction(trx)}
-                            className="p-1.5 text-slate-600 hover:text-indigo-600 hover:bg-indigo-50 rounded transition-colors"
-                            title="Xem / In mẫu phiếu"
-                          >
-                            <Printer className="w-4 h-4" />
-                          </button>
-
-                          {canManage && (
-                            <button
-                              onClick={() => onEditTransaction(trx)}
-                              className="p-1.5 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors"
-                              title="Sửa thông tin phiếu"
-                            >
-                              <Edit2 className="w-4 h-4" />
-                            </button>
+                        {/* Project / Purpose */}
+                        <td className="py-3.5 px-4 text-slate-600">
+                          <div className="line-clamp-1 font-medium text-slate-800" title={trx.departmentOrProject}>
+                            {trx.departmentOrProject}
+                          </div>
+                          {trx.notes && (
+                            <div className="text-[11px] text-slate-400 line-clamp-1" title={trx.notes}>
+                              {trx.notes}
+                            </div>
                           )}
+                        </td>
 
-                          {isAdmin && (
+                        {/* Items count */}
+                        <td className="py-3.5 px-3 text-center tabular-nums text-slate-700 font-semibold whitespace-nowrap">
+                          {trx.items.length} mặt hàng
+                        </td>
+
+                        {/* Total Quantity Column */}
+                        <td className="py-3.5 px-3 text-right tabular-nums font-bold text-indigo-700 whitespace-nowrap bg-indigo-50/20">
+                          {formatNumber(totalVoucherQty)}
+                        </td>
+
+                        {/* Total Amount */}
+                        <td className="py-3.5 px-4 text-right tabular-nums font-bold text-slate-900 whitespace-nowrap">
+                          {formatCurrency(trx.totalAmount)}
+                        </td>
+
+                        {/* Status */}
+                        <td className="py-3.5 px-3 text-center whitespace-nowrap">
+                          <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                            <CheckCircle2 className="w-3 h-3" />
+                            <span>Đã lưu sổ</span>
+                          </span>
+                        </td>
+
+                        {/* Actions */}
+                        <td className="py-3.5 px-4 text-center whitespace-nowrap">
+                          <div className="flex items-center justify-center gap-1">
                             <button
-                              onClick={() => handleDelete(trx)}
-                              className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors"
-                              title="Xóa phiếu (Quản trị viên)"
+                              onClick={() => handleExportSingleTrx(trx)}
+                              className="p-1.5 text-slate-500 hover:text-emerald-700 hover:bg-emerald-50 rounded transition-colors"
+                              title="Xuất phiếu này ra file Excel (.xlsx) kèm cột số lượng vật tư"
                             >
-                              <Trash2 className="w-4 h-4" />
+                              <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
                             </button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+
+                            <button
+                              onClick={() => onPrintTransaction(trx)}
+                              className="p-1.5 text-slate-600 hover:text-indigo-600 hover:bg-indigo-50 rounded transition-colors"
+                              title="Xem / In mẫu phiếu"
+                            >
+                              <Printer className="w-4 h-4" />
+                            </button>
+
+                            {canManage && (
+                              <button
+                                onClick={() => onEditTransaction(trx)}
+                                className="p-1.5 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors"
+                                title="Sửa thông tin phiếu"
+                              >
+                                <Edit2 className="w-4 h-4" />
+                              </button>
+                            )}
+
+                            {isAdmin && (
+                              <button
+                                onClick={() => handleDelete(trx)}
+                                className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors"
+                                title="Xóa phiếu (Quản trị viên)"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <PaginationBar
+              currentPage={safePage}
+              totalItems={filteredTransactions.length}
+              pageSize={pageSize}
+              onPageChange={setCurrentPage}
+              onPageSizeChange={setPageSize}
+              itemLabel="phiếu"
+            />
+          </>
         )}
       </div>
 

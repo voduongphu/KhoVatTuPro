@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   X,
   Edit2,
@@ -7,9 +7,7 @@ import {
   Plus,
   Trash2,
   Package,
-  Layers,
   CheckCircle2,
-  Info,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
 import { Transaction, TransactionLineItem, TransactionSubtype } from '../types/inventory';
@@ -19,6 +17,7 @@ import {
   getSubtypeLabel,
   getTransactionTypeLabel,
 } from '../utils/formatters';
+import { SearchableItemSelect } from './SearchableItemSelect';
 
 interface EditTransactionModalProps {
   transaction: Transaction | null;
@@ -64,9 +63,9 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
   const [selectedAddItemId, setSelectedAddItemId] = useState('');
   const [rawInputs, setRawInputs] = useState<Record<string, string>>({});
 
-  // Available inventory items for quick addition
-  const availableItemsInWarehouse = inventoryItems.filter(
-    i => i.warehouseId === warehouseId
+  const itemsById = useMemo(
+    () => new Map(inventoryItems.map(i => [i.id, i])),
+    [inventoryItems]
   );
 
   // Calculate live totals
@@ -144,7 +143,7 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
       return;
     }
 
-    const item = inventoryItems.find(i => i.id === selectedAddItemId);
+    const item = itemsById.get(selectedAddItemId);
     if (!item) return;
 
     const newLine: TransactionLineItem = {
@@ -474,25 +473,26 @@ export const EditTransactionModal: React.FC<EditTransactionModalProps> = ({
 
               {/* Add item control for Admin */}
               {isAdmin && (
-                <div className="flex items-center gap-2">
-                  <select
-                    value={selectedAddItemId}
-                    onChange={e => setSelectedAddItemId(e.target.value)}
-                    className="text-xs border border-slate-300 rounded-lg px-3 py-2 bg-white outline-none max-w-[280px]"
-                  >
-                    <option value="">-- Thêm vật tư vào phiếu --</option>
-                    {availableItemsInWarehouse.map(it => (
-                      <option key={it.id} value={it.id}>
-                        [{it.code}] {it.name}
-                      </option>
-                    ))}
-                    <option value="__CUSTOM__">+ Nhập tên vật tư mới tự do</option>
-                  </select>
+                <div className="flex items-center gap-2 w-full sm:w-auto">
+                  <div className="w-full sm:w-[320px]">
+                    <SearchableItemSelect
+                      items={inventoryItems}
+                      itemsById={itemsById}
+                      value={selectedAddItemId}
+                      onChange={setSelectedAddItemId}
+                      warehouseId={warehouseId}
+                      allowNewItem={true}
+                      newItemValue="__CUSTOM__"
+                      newItemLabel="+ Nhập tên vật tư mới tự do"
+                      placeholder="-- Tìm vật tư thêm vào phiếu --"
+                      showStockInWarehouse={true}
+                    />
+                  </div>
                   <button
                     type="button"
                     onClick={handleAddCatalogItem}
                     disabled={!selectedAddItemId}
-                    className="inline-flex items-center gap-1 px-3.5 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
+                    className="inline-flex items-center gap-1 px-3.5 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded-lg transition-colors cursor-pointer shrink-0"
                   >
                     <Plus className="w-3.5 h-3.5" />
                     <span>Thêm dòng</span>

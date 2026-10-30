@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import * as XLSX from 'xlsx';
 import {
   X,
@@ -7,16 +7,15 @@ import {
   Download,
   AlertTriangle,
   CheckCircle2,
-  Boxes,
   Check,
   AlertCircle,
   RefreshCw,
   Plus,
-  ArrowRight,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
-import { EquipmentCondition, InventoryItem, ItemType } from '../types/inventory';
+import { EquipmentCondition, ItemType, MaterialCategory } from '../types/inventory';
 import { formatCurrency, formatNumber, getItemTypeLabel } from '../utils/formatters';
+import { PaginationBar } from './PaginationBar';
 
 interface ImportItemsExcelModalProps {
   onClose: () => void;
@@ -59,6 +58,8 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
   const [isProcessing, setIsProcessing] = useState(false);
   const [updateExisting, setUpdateExisting] = useState(true);
   const [filterTab, setFilterTab] = useState<'ALL' | 'NEW' | 'UPDATE' | 'ERROR'>('ALL');
+  const [previewPage, setPreviewPage] = useState(1);
+  const [previewPageSize, setPreviewPageSize] = useState(100);
   const [parseError, setParseError] = useState('');
   const [importSummary, setImportSummary] = useState<{
     success: boolean;
@@ -67,26 +68,40 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
     errors: string[];
   } | null>(null);
 
-  // Helper to extract values by looking up candidate column headers
-  const getCleanVal = (row: any, ...candidates: string[]) => {
-    for (const cand of candidates) {
-      for (const key of Object.keys(row)) {
-        const cleanKey = key
-          .toLowerCase()
-          .replace(/[_\-*#]/g, '')
-          .replace(/\s+/g, '')
-          .trim();
-        const cleanCand = cand
-          .toLowerCase()
-          .replace(/[_\-*#]/g, '')
-          .replace(/\s+/g, '')
-          .trim();
-        if (cleanKey === cleanCand || cleanKey.includes(cleanCand)) {
-          return row[key];
-        }
+  const normalizeKey = (s: string) =>
+    s
+      .toLowerCase()
+      .replace(/[_\-*#]/g, '')
+      .replace(/\s+/g, '')
+      .trim();
+
+  // Build once-per-row normalized header lookup instead of re-normalizing all keys on every column read
+  const createRowExtractor = (row: Record<string, any>) => {
+    const entries: Array<[string, any]> = [];
+    const exactMap = new Map<string, any>();
+    for (const k of Object.keys(row)) {
+      const cleanK = normalizeKey(k);
+      const val = row[k];
+      entries.push([cleanK, val]);
+      if (!exactMap.has(cleanK)) {
+        exactMap.set(cleanK, val);
       }
     }
-    return undefined;
+    return (...cleanCandidates: string[]) => {
+      for (let i = 0; i < cleanCandidates.length; i++) {
+        const cand = cleanCandidates[i];
+        if (exactMap.has(cand)) return exactMap.get(cand);
+      }
+      for (let i = 0; i < cleanCandidates.length; i++) {
+        const cand = cleanCandidates[i];
+        for (let j = 0; j < entries.length; j++) {
+          if (entries[j][0].includes(cand)) {
+            return entries[j][1];
+          }
+        }
+      }
+      return undefined;
+    };
   };
 
   // Helper to parse ItemType
@@ -228,7 +243,7 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
     XLSX.writeFile(workbook, 'Mau_Import_Danh_Muc_Vat_Tu.xlsx');
   };
 
-  // 2. Parse Excel/CSV File
+  // 2. Parse Excel/CSV File in O(M)
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -237,15 +252,16 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
     setIsProcessing(true);
     setImportSummary(null);
     setParseError('');
+    setPreviewPage(1);
 
     const reader = new FileReader();
     reader.onload = evt => {
       try {
-        const bstr = evt.target?.result;
-        const wb = XLSX.read(bstr, { type: 'binary', cellDates: true });
+        const buffer = evt.target?.result;
+        const wb = XLSX.read(buffer, { type: 'array', cellDates: true });
         const wsname = wb.SheetNames[0];
         const ws = wb.Sheets[wsname];
-        const rawData: any[] = XLSX.utils.sheet_to_json(ws);
+        const rawData: Record<string, any>[] = XLSX.utils.sheet_to_json(ws);
 
         if (!rawData || rawData.length === 0) {
           setParseError('File Excel trống hoặc không đọc được dữ liệu.');
@@ -253,25 +269,62 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
           return;
         }
 
-        const seenCodes = new Set<string>();
-        const parsed: ParsedItemRow[] = [];
+        // Pre-index existing SKUs, categories, and warehouses for O(1) lookup across >5,000 rows
+        const existingCodesSet = new Set<string>();
+        for (let i = 0; i < items.length; i++) {
+          existingCodesSet.add(items[i].code.trim().toUpperCase());
+        }
 
-        rawData.forEach((row, idx) => {
+        const catByCodeUpper = new Map<string, MaterialCategory>();
+        const catByNameOrCodeLower = new Map<string, MaterialCategory>();
+        for (let i = 0; i < materialCategories.length; i++) {
+          const c = materialCategories[i];
+          const cUpper = c.code.trim().toUpperCase();
+          catByCodeUpper.set(cUpper, c);
+          catByNameOrCodeLower.set(c.name.trim().toLowerCase(), c);
+          catByNameOrCodeLower.set(c.code.trim().toLowerCase(), c);
+        }
+
+        const whExactMap = new Map<string, (typeof warehouses)[number]>();
+        const whNormList = warehouses.map(w => {
+          const codeL = w.code.toLowerCase();
+          const idL = w.id.toLowerCase();
+          const nameL = w.name.toLowerCase();
+          whExactMap.set(codeL, w);
+          whExactMap.set(idL, w);
+          whExactMap.set(nameL, w);
+          return { wh: w, nameL };
+        });
+
+        const CAND_CODE = ['mãsku()', 'mãsku', 'mãvậttư', 'mãvt', 'sku', 'code', 'mavt', 'mã'];
+        const CAND_NAME = ['tênvậttư/thiếtbị()', 'tênvậttư', 'tênthiếtbị', 'tênhàng', 'tên', 'name', 'tenvt'];
+        const CAND_TYPE = ['phânloại', 'loại', 'type', 'phanloai'];
+        const CAND_CAT_CODE = ['mãdanhmục', 'mãdm', 'categorycode', 'madanhmuc'];
+        const CAND_CAT_NAME = ['nhómngành/danhmục()', 'têndanhmục', 'nhómngành', 'danhmục', 'category', 'danhmuc'];
+        const CAND_UNIT = ['đơnvịtính()', 'đơnvịtính', 'đvt', 'unit', 'donvitinh'];
+        const CAND_WH = ['mãkholưutrữ()', 'mãkho', 'kholưutrữ', 'khohàng', 'kho', 'warehouse', 'makho'];
+        const CAND_LOC = ['vịtríkệ', 'vịtrí', 'kệ', 'location', 'vitri'];
+        const CAND_STOCK = ['sốlượngtồnkho', 'tồnkho', 'sốlượng', 'stock', 'tonkho'];
+        const CAND_MIN = ['địnhmứcmin', 'tồnmin', 'min', 'minstock'];
+        const CAND_MAX = ['địnhmứcmax', 'tồnmax', 'max', 'maxstock'];
+        const CAND_PRICE = ['đơngiávốn(vnđ)', 'đơngiávốn', 'đơngiá', 'giá', 'price', 'dongia'];
+        const CAND_SERIAL = ['sốserial/lô', 'sốserial', 'serial', 'sốlô', 'lô'];
+        const CAND_COND = ['tìnhtrạngthiếtbị', 'tìnhtrạng', 'condition', 'tinhtrang'];
+        const CAND_DATE = ['hạnkiểmđịnh', 'hạnkiểmđịnh(yyyymmdd)', 'kiểmđịnh'];
+        const CAND_SUPPLIER = ['nhàcungcấpmặcđịnh', 'nhàcungcấp', 'ncc', 'supplier'];
+        const CAND_SPEC = ['quycáchkỹthuật', 'quycách', 'thôngsố', 'spec'];
+
+        const seenCodes = new Set<string>();
+        const parsed: ParsedItemRow[] = new Array(rawData.length);
+
+        for (let idx = 0; idx < rawData.length; idx++) {
+          const row = rawData[idx];
+          const getVal = createRowExtractor(row);
           const rowNum = idx + 2;
           const errors: string[] = [];
 
           // 1. Code
-          const rawCode = getCleanVal(
-            row,
-            'Mã SKU (*)',
-            'Mã SKU',
-            'Mã vật tư',
-            'Mã VT',
-            'SKU',
-            'Code',
-            'ma_vt',
-            'Mã'
-          );
+          const rawCode = getVal(...CAND_CODE);
           const code = String(rawCode || '').trim().toUpperCase();
           if (!code) {
             errors.push(`Dòng ${rowNum}: Thiếu mã SKU định danh.`);
@@ -282,114 +335,63 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
           }
 
           // 2. Name
-          const rawName = getCleanVal(
-            row,
-            'Tên Vật Tư / Thiết Bị (*)',
-            'Tên Vật Tư',
-            'Tên Thiết Bị',
-            'Tên hàng',
-            'Tên',
-            'Name',
-            'ten_vt'
-          );
+          const rawName = getVal(...CAND_NAME);
           const name = String(rawName || '').trim();
           if (!name) {
             errors.push(`Dòng ${rowNum}: Thiếu tên vật tư / thiết bị.`);
           }
 
           // 3. Type
-          const rawType = getCleanVal(row, 'Phân Loại', 'Loại', 'Type', 'phan_loai');
-          const type = parseItemType(rawType);
+          const type = parseItemType(getVal(...CAND_TYPE));
 
-          // 4. Category (by Code or Name)
-          const rawCatCode = getCleanVal(
-            row,
-            'Mã Danh Mục',
-            'Mã DM',
-            'Category Code',
-            'ma_danh_muc'
-          );
-          const rawCat = getCleanVal(
-            row,
-            'Nhóm Ngành / Danh Mục (*)',
-            'Tên Danh Mục',
-            'Nhóm Ngành',
-            'Danh Mục',
-            'Category',
-            'danh_muc'
-          );
+          // 4. Category (O(1) lookup by Code or Name)
+          const rawCatCode = getVal(...CAND_CAT_CODE);
+          const rawCat = getVal(...CAND_CAT_NAME);
           const cleanCatCode = rawCatCode ? String(rawCatCode).trim().toUpperCase() : '';
           const cleanCatName = rawCat ? String(rawCat).trim() : '';
 
           const matchedCategory =
-            (cleanCatCode
-              ? materialCategories.find(c => c.code.trim().toUpperCase() === cleanCatCode)
-              : undefined) ||
-            (cleanCatName
-              ? materialCategories.find(
-                  c =>
-                    c.name.trim().toLowerCase() === cleanCatName.toLowerCase() ||
-                    c.code.trim().toLowerCase() === cleanCatName.toLowerCase()
-                )
-              : undefined);
+            (cleanCatCode ? catByCodeUpper.get(cleanCatCode) : undefined) ||
+            (cleanCatName ? catByNameOrCodeLower.get(cleanCatName.toLowerCase()) : undefined);
 
           const categoryId = matchedCategory?.id;
           const categoryCode = matchedCategory?.code || cleanCatCode || undefined;
           const category = matchedCategory?.name || cleanCatName || 'Vật tư tổng hợp';
 
           // 5. Unit
-          const rawUnit = getCleanVal(row, 'Đơn Vị Tính (*)', 'Đơn Vị Tính', 'ĐVT', 'Unit', 'don_vi_tinh');
+          const rawUnit = getVal(...CAND_UNIT);
           const unit = String(rawUnit || 'Cái').trim();
 
-          // 6. Warehouse
-          const rawWh = String(
-            getCleanVal(
-              row,
-              'Mã Kho Lưu Trữ (*)',
-              'Mã Kho',
-              'Kho Lưu Trữ',
-              'Kho Hàng',
-              'Kho',
-              'Warehouse',
-              'ma_kho'
-            ) || ''
-          ).trim();
-
-          let matchedWh = warehouses.find(
-            w =>
-              w.code.toLowerCase() === rawWh.toLowerCase() ||
-              w.id.toLowerCase() === rawWh.toLowerCase() ||
-              w.name.toLowerCase().includes(rawWh.toLowerCase())
-          );
+          // 6. Warehouse (O(1) exact + fast fallback)
+          const rawWhLower = String(getVal(...CAND_WH) || '').trim().toLowerCase();
+          let matchedWh = rawWhLower ? whExactMap.get(rawWhLower) : undefined;
+          if (!matchedWh && rawWhLower) {
+            for (let wIdx = 0; wIdx < whNormList.length; wIdx++) {
+              if (whNormList[wIdx].nameL.includes(rawWhLower)) {
+                matchedWh = whNormList[wIdx].wh;
+                break;
+              }
+            }
+          }
           if (!matchedWh) {
-            matchedWh = warehouses[0]; // Fallback to first available warehouse
+            matchedWh = warehouses[0];
           }
 
           // 7. Location
-          const rawLoc = getCleanVal(row, 'Vị Trí Kệ', 'Vị Trí', 'Kệ', 'Location', 'vi_tri');
-          const location = String(rawLoc || 'Kệ A1-01').trim();
+          const location = String(getVal(...CAND_LOC) || 'Kệ A1-01').trim();
 
           // 8. Stock & Price
-          const rawStock = getCleanVal(row, 'Số Lượng Tồn Kho', 'Tồn Kho', 'Số Lượng', 'Stock', 'ton_kho');
-          const currentStock = Math.max(0, Number(rawStock) || 0);
-
-          const rawMin = getCleanVal(row, 'Định Mức Min', 'Tồn Min', 'Min', 'min_stock');
-          const minStock = Math.max(0, Number(rawMin) || 5);
-
-          const rawMax = getCleanVal(row, 'Định Mức Max', 'Tồn Max', 'Max', 'max_stock');
-          const maxStock = Math.max(minStock, Number(rawMax) || 100);
-
-          const rawPrice = getCleanVal(row, 'Đơn Giá Vốn (VNĐ)', 'Đơn Giá Vốn', 'Đơn Giá', 'Giá', 'Price', 'don_gia');
-          const unitPrice = Math.max(0, Number(rawPrice) || 0);
+          const currentStock = Math.max(0, Number(getVal(...CAND_STOCK)) || 0);
+          const minStock = Math.max(0, Number(getVal(...CAND_MIN)) || 5);
+          const maxStock = Math.max(minStock, Number(getVal(...CAND_MAX)) || 100);
+          const unitPrice = Math.max(0, Number(getVal(...CAND_PRICE)) || 0);
 
           // 9. Serial & Condition & Others
-          const rawSerial = getCleanVal(row, 'Số Serial / Lô', 'Số Serial', 'Serial', 'Số Lô', 'Lô', 'serial');
+          const rawSerial = getVal(...CAND_SERIAL);
           const serialOrLot = rawSerial ? String(rawSerial).trim() : undefined;
+          const condition = parseCondition(getVal(...CAND_COND));
 
-          const rawCond = getCleanVal(row, 'Tình Trạng Thiết Bị', 'Tình Trạng', 'Condition', 'tinh_trang');
-          const condition = parseCondition(rawCond);
-
-          const rawDate = getCleanVal(row, 'Hạn Kiểm Định', 'Hạn Kiểm Định (YYYY-MM-DD)', 'Kiểm Định');
+          const rawDate = getVal(...CAND_DATE);
           let inspectionDueDate: string | undefined = undefined;
           if (rawDate instanceof Date) {
             inspectionDueDate = rawDate.toISOString().substring(0, 10);
@@ -397,25 +399,21 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
             inspectionDueDate = rawDate.trim();
           }
 
-          const rawSupplier = getCleanVal(row, 'Nhà Cung Cấp Mặc Định', 'Nhà Cung Cấp', 'NCC', 'Supplier');
+          const rawSupplier = getVal(...CAND_SUPPLIER);
           const supplierDefault = rawSupplier ? String(rawSupplier).trim() : undefined;
 
-          const rawSpec = getCleanVal(row, 'Quy Cách Kỹ Thuật', 'Quy Cách', 'Thông Số', 'Spec');
+          const rawSpec = getVal(...CAND_SPEC);
           const spec = rawSpec ? String(rawSpec).trim() : undefined;
 
-          // Check if code already exists in catalog
-          const existingItem = items.find(
-            i => i.code.trim().toUpperCase() === code
-          );
-
+          // O(1) SKU existence check
           let rowStatus: 'NEW' | 'UPDATE' | 'ERROR' = 'NEW';
           if (errors.length > 0) {
             rowStatus = 'ERROR';
-          } else if (existingItem) {
+          } else if (code && existingCodesSet.has(code)) {
             rowStatus = 'UPDATE';
           }
 
-          parsed.push({
+          parsed[idx] = {
             code,
             name,
             type,
@@ -437,8 +435,8 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
             spec,
             status: rowStatus,
             errors,
-          });
-        });
+          };
+        }
 
         setParsedRows(parsed);
       } catch (err: any) {
@@ -448,23 +446,38 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
       }
     };
 
-    reader.readAsBinaryString(file);
+    reader.readAsArrayBuffer(file);
   };
 
-  // Summary counts
-  const totalCount = parsedRows.length;
-  const newCount = parsedRows.filter(r => r.status === 'NEW').length;
-  const updateCount = parsedRows.filter(r => r.status === 'UPDATE').length;
-  const errorCount = parsedRows.filter(r => r.status === 'ERROR').length;
+  // Single-pass summary counts
+  const { totalCount, newCount, updateCount, errorCount } = useMemo(() => {
+    let n = 0;
+    let u = 0;
+    let err = 0;
+    for (let i = 0; i < parsedRows.length; i++) {
+      const st = parsedRows[i].status;
+      if (st === 'NEW') n++;
+      else if (st === 'UPDATE') u++;
+      else err++;
+    }
+    return { totalCount: parsedRows.length, newCount: n, updateCount: u, errorCount: err };
+  }, [parsedRows]);
+
   const validCount = updateExisting ? newCount + updateCount : newCount;
 
   // Filtered rows for preview
-  const displayRows = parsedRows.filter(r => {
-    if (filterTab === 'NEW') return r.status === 'NEW';
-    if (filterTab === 'UPDATE') return r.status === 'UPDATE';
-    if (filterTab === 'ERROR') return r.status === 'ERROR';
-    return true;
-  });
+  const displayRows = useMemo(() => {
+    if (filterTab === 'ALL') return parsedRows;
+    return parsedRows.filter(r => r.status === filterTab);
+  }, [parsedRows, filterTab]);
+
+  const totalPreviewPages = Math.max(1, Math.ceil(displayRows.length / previewPageSize));
+  const safePreviewPage = Math.min(previewPage, totalPreviewPages);
+  const paginatedDisplayRows = useMemo(() => {
+    const start = (safePreviewPage - 1) * previewPageSize;
+    return displayRows.slice(start, start + previewPageSize);
+  }, [displayRows, safePreviewPage, previewPageSize]);
+  const previewStartIndex = (safePreviewPage - 1) * previewPageSize;
 
   // Handle final import confirmation
   const handleExecuteImport = () => {
@@ -659,51 +672,63 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
                 </label>
 
                 {/* Filter Tabs */}
-                <div className="flex items-center gap-1 text-xs">
+                <div className="flex items-center gap-1 text-xs flex-wrap">
                   <button
                     type="button"
-                    onClick={() => setFilterTab('ALL')}
+                    onClick={() => {
+                      setFilterTab('ALL');
+                      setPreviewPage(1);
+                    }}
                     className={`px-2.5 py-1 rounded-md font-medium transition-colors ${
                       filterTab === 'ALL'
                         ? 'bg-slate-800 text-white'
                         : 'text-slate-600 hover:bg-slate-200/60'
                     }`}
                   >
-                    Tất cả ({totalCount})
+                    Tất cả ({formatNumber(totalCount)})
                   </button>
                   <button
                     type="button"
-                    onClick={() => setFilterTab('NEW')}
+                    onClick={() => {
+                      setFilterTab('NEW');
+                      setPreviewPage(1);
+                    }}
                     className={`px-2.5 py-1 rounded-md font-medium transition-colors ${
                       filterTab === 'NEW'
                         ? 'bg-emerald-600 text-white'
                         : 'text-emerald-700 hover:bg-emerald-100/60'
                     }`}
                   >
-                    Thêm mới ({newCount})
+                    Thêm mới ({formatNumber(newCount)})
                   </button>
                   <button
                     type="button"
-                    onClick={() => setFilterTab('UPDATE')}
+                    onClick={() => {
+                      setFilterTab('UPDATE');
+                      setPreviewPage(1);
+                    }}
                     className={`px-2.5 py-1 rounded-md font-medium transition-colors ${
                       filterTab === 'UPDATE'
                         ? 'bg-indigo-600 text-white'
                         : 'text-indigo-700 hover:bg-indigo-100/60'
                     }`}
                   >
-                    Cập nhật ({updateCount})
+                    Cập nhật ({formatNumber(updateCount)})
                   </button>
                   {errorCount > 0 && (
                     <button
                       type="button"
-                      onClick={() => setFilterTab('ERROR')}
+                      onClick={() => {
+                        setFilterTab('ERROR');
+                        setPreviewPage(1);
+                      }}
                       className={`px-2.5 py-1 rounded-md font-medium transition-colors ${
                         filterTab === 'ERROR'
                           ? 'bg-rose-600 text-white'
                           : 'text-rose-700 hover:bg-rose-100/60'
                       }`}
                     >
-                      Lỗi ({errorCount})
+                      Lỗi ({formatNumber(errorCount)})
                     </button>
                   )}
                 </div>
@@ -715,7 +740,7 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
                   <table className="w-full text-left border-collapse text-xs">
                     <thead className="bg-slate-100/80 sticky top-0 border-b border-slate-200 text-slate-600 font-semibold uppercase text-[10px] tracking-wider z-10">
                       <tr>
-                        <th className="py-2.5 px-3 w-10 text-center">STT</th>
+                        <th className="py-2.5 px-3 w-12 text-center">STT</th>
                         <th className="py-2.5 px-3 w-28">Trạng thái</th>
                         <th className="py-2.5 px-3 w-28">Mã SKU</th>
                         <th className="py-2.5 px-3 min-w-[200px]">Tên Vật tư / Thiết bị</th>
@@ -728,20 +753,20 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
-                      {displayRows.length === 0 ? (
+                      {paginatedDisplayRows.length === 0 ? (
                         <tr>
                           <td colSpan={10} className="py-8 text-center text-slate-400">
                             Không có dòng nào trong bộ lọc này.
                           </td>
                         </tr>
                       ) : (
-                        displayRows.map((row, idx) => {
+                        paginatedDisplayRows.map((row, idx) => {
                           const isErr = row.status === 'ERROR';
                           const isUpd = row.status === 'UPDATE';
 
                           return (
                             <tr
-                              key={idx}
+                              key={`${row.code}-${previewStartIndex + idx}`}
                               className={`hover:bg-slate-50/60 ${
                                 isErr
                                   ? 'bg-rose-50/40 text-rose-900'
@@ -750,8 +775,8 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
                                   : ''
                               }`}
                             >
-                              <td className="py-2 px-3 text-center text-slate-400 font-medium">
-                                {idx + 1}
+                              <td className="py-2 px-3 text-center text-slate-400 font-medium tabular-nums">
+                                {previewStartIndex + idx + 1}
                               </td>
                               <td className="py-2 px-3">
                                 {row.status === 'NEW' && (
@@ -813,6 +838,21 @@ export const ImportItemsExcelModal: React.FC<ImportItemsExcelModalProps> = ({
                     </tbody>
                   </table>
                 </div>
+                {displayRows.length > previewPageSize && (
+                  <PaginationBar
+                    currentPage={safePreviewPage}
+                    totalItems={displayRows.length}
+                    pageSize={previewPageSize}
+                    onPageChange={setPreviewPage}
+                    onPageSizeChange={size => {
+                      setPreviewPageSize(size);
+                      setPreviewPage(1);
+                    }}
+                    pageSizeOptions={[50, 100, 200, 500]}
+                    itemLabel="dòng dữ liệu"
+                    compact
+                  />
+                )}
               </div>
             </div>
           )}

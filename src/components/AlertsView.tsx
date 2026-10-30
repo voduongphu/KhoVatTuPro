@@ -1,16 +1,12 @@
-import React from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   AlertTriangle,
   Clock,
   PackagePlus,
-  ArrowUpRight,
-  TrendingDown,
-  Warehouse as WarehouseIcon,
   CheckCircle2,
-  DollarSign,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
-import { InventoryItem } from '../types/inventory';
+import { InventoryItem, Warehouse } from '../types/inventory';
 import {
   formatCurrency,
   formatDate,
@@ -18,6 +14,7 @@ import {
   getItemTypeLabel,
   getStockStatus,
 } from '../utils/formatters';
+import { PaginationBar } from './PaginationBar';
 
 interface AlertsViewProps {
   onQuickReorder: (item: InventoryItem, suggestedQty: number) => void;
@@ -27,34 +24,88 @@ interface AlertsViewProps {
 export const AlertsView: React.FC<AlertsViewProps> = ({ onQuickReorder, onEditItem }) => {
   const { items, warehouses } = useInventory();
 
-  // 1. Under-min items and out-of-stock items
-  const deficitItems = items.filter(item => {
-    const status = getStockStatus(item);
-    return status === 'CANH_BAO_THAP' || status === 'HET_HANG';
-  });
+  const [deficitPage, setDeficitPage] = useState(1);
+  const [deficitPageSize, setDeficitPageSize] = useState(50);
+  const [inspPage, setInspPage] = useState(1);
+  const [inspPageSize, setInspPageSize] = useState(50);
+  const [overPage, setOverPage] = useState(1);
+  const [overPageSize, setOverPageSize] = useState(50);
 
-  // Calculate total replenishment budget needed
-  const totalReplenishBudget = deficitItems.reduce((acc, item) => {
-    const suggestedQty = Math.max(0, item.maxStock - item.currentStock);
-    return acc + suggestedQty * item.unitPrice;
-  }, 0);
+  const warehouseById = useMemo(() => {
+    const map = new Map<string, Warehouse>();
+    for (let i = 0; i < warehouses.length; i++) map.set(warehouses[i].id, warehouses[i]);
+    return map;
+  }, [warehouses]);
 
-  // 2. Equipment inspection alerts
-  const today = new Date();
-  const thirtyDaysLater = new Date();
-  thirtyDaysLater.setDate(today.getDate() + 30);
+  const { deficitItems, totalReplenishBudget, inspectionAlerts, overstockedItems, nowMs } = useMemo(() => {
+    const deficit: InventoryItem[] = [];
+    const inspection: InventoryItem[] = [];
+    const overstocked: InventoryItem[] = [];
+    let replenishBudget = 0;
 
-  const inspectionAlerts = items.filter(item => {
-    if (!item.inspectionDueDate) return false;
-    const due = new Date(item.inspectionDueDate);
-    return due <= thirtyDaysLater;
-  });
+    const currentMs = Date.now();
+    const limitMs = currentMs + 30 * 24 * 60 * 60 * 1000;
 
-  // 3. Overstocked items
-  const overstockedItems = items.filter(item => {
-    const status = getStockStatus(item);
-    return status === 'VUOT_DINH_MUC';
-  });
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const status = getStockStatus(item);
+      if (status === 'CANH_BAO_THAP' || status === 'HET_HANG') {
+        deficit.push(item);
+        const suggestedQty = Math.max(0, item.maxStock - item.currentStock);
+        replenishBudget += suggestedQty * item.unitPrice;
+      } else if (status === 'VUOT_DINH_MUC') {
+        overstocked.push(item);
+      }
+
+      if (item.inspectionDueDate) {
+        const dueMs = Date.parse(item.inspectionDueDate);
+        if (!Number.isNaN(dueMs) && dueMs <= limitMs) {
+          inspection.push(item);
+        }
+      }
+    }
+
+    return {
+      deficitItems: deficit,
+      totalReplenishBudget: replenishBudget,
+      inspectionAlerts: inspection,
+      overstockedItems: overstocked,
+      nowMs: currentMs,
+    };
+  }, [items]);
+
+  const safeDeficitPage = Math.min(
+    Math.max(1, deficitPage),
+    Math.max(1, Math.ceil(deficitItems.length / deficitPageSize))
+  );
+  const paginatedDeficit = useMemo(
+    () =>
+      deficitItems.slice(
+        (safeDeficitPage - 1) * deficitPageSize,
+        safeDeficitPage * deficitPageSize
+      ),
+    [deficitItems, safeDeficitPage, deficitPageSize]
+  );
+
+  const safeInspPage = Math.min(
+    Math.max(1, inspPage),
+    Math.max(1, Math.ceil(inspectionAlerts.length / inspPageSize))
+  );
+  const paginatedInsp = useMemo(
+    () =>
+      inspectionAlerts.slice((safeInspPage - 1) * inspPageSize, safeInspPage * inspPageSize),
+    [inspectionAlerts, safeInspPage, inspPageSize]
+  );
+
+  const safeOverPage = Math.min(
+    Math.max(1, overPage),
+    Math.max(1, Math.ceil(overstockedItems.length / overPageSize))
+  );
+  const paginatedOver = useMemo(
+    () =>
+      overstockedItems.slice((safeOverPage - 1) * overPageSize, safeOverPage * overPageSize),
+    [overstockedItems, safeOverPage, overPageSize]
+  );
 
   return (
     <div className="space-y-6">
@@ -107,24 +158,25 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ onQuickReorder, onEditIt
             </span>
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase text-[10px]">
-                  <th className="py-3 px-4">Mã SKU</th>
-                  <th className="py-3 px-4 min-w-[200px]">Tên vật tư / thiết bị</th>
-                  <th className="py-3 px-3">Kho hàng</th>
-                  <th className="py-3 px-3 text-right">Tồn hiện tại</th>
-                  <th className="py-3 px-3 text-right">Định mức Min</th>
-                  <th className="py-3 px-3 text-right">Định mức Max</th>
-                  <th className="py-3 px-3 text-right text-rose-700 font-bold">Số lượng đề xuất nhập</th>
-                  <th className="py-3 px-4 text-right">Dự toán kinh phí</th>
-                  <th className="py-3 px-4 text-center">Hành động</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {deficitItems.map(item => {
-                  const wh = warehouses.find(w => w.id === item.warehouseId);
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase text-[10px]">
+                    <th className="py-3 px-4">Mã SKU</th>
+                    <th className="py-3 px-4 min-w-[200px]">Tên vật tư / thiết bị</th>
+                    <th className="py-3 px-3">Kho hàng</th>
+                    <th className="py-3 px-3 text-right">Tồn hiện tại</th>
+                    <th className="py-3 px-3 text-right">Định mức Min</th>
+                    <th className="py-3 px-3 text-right">Định mức Max</th>
+                    <th className="py-3 px-3 text-right text-rose-700 font-bold">Số lượng đề xuất nhập</th>
+                    <th className="py-3 px-4 text-right">Dự toán kinh phí</th>
+                    <th className="py-3 px-4 text-center">Hành động</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {paginatedDeficit.map(item => {
+                    const wh = item.warehouseId ? warehouseById.get(item.warehouseId) : undefined;
                   const isZero = item.currentStock === 0;
                   const suggestedQty = Math.max(0, item.maxStock - item.currentStock);
                   const estBudget = suggestedQty * item.unitPrice;
@@ -182,9 +234,18 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ onQuickReorder, onEditIt
                     </tr>
                   );
                 })}
-              </tbody>
-            </table>
-          </div>
+                </tbody>
+              </table>
+            </div>
+            <PaginationBar
+              currentPage={safeDeficitPage}
+              totalItems={deficitItems.length}
+              pageSize={deficitPageSize}
+              onPageChange={setDeficitPage}
+              onPageSizeChange={setDeficitPageSize}
+              itemLabel="mặt hàng thiếu hụt"
+            />
+          </>
         )}
       </div>
 
@@ -207,66 +268,76 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ onQuickReorder, onEditIt
             Hiện tại không có thiết bị máy móc nào bị quá hạn hoặc sắp đến hạn kiểm định trong 30 ngày.
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase text-[10px]">
-                  <th className="py-3 px-4">Mã SKU</th>
-                  <th className="py-3 px-4">Tên thiết bị</th>
-                  <th className="py-3 px-3">Số Serial / Lô</th>
-                  <th className="py-3 px-3">Vị trí lưu kho</th>
-                  <th className="py-3 px-3">Hạn kiểm định</th>
-                  <th className="py-3 px-3">Tình trạng cảnh báo</th>
-                  <th className="py-3 px-4 text-center">Thao tác</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {inspectionAlerts.map(item => {
-                  const isExpired = new Date(item.inspectionDueDate!) < today;
-                  return (
-                    <tr key={item.id} className="hover:bg-slate-50/80">
-                      <td className="py-3 px-4 font-mono font-bold text-slate-900">
-                        {item.code}
-                      </td>
-                      <td className="py-3 px-4 font-semibold text-slate-900">
-                        {item.name}
-                      </td>
-                      <td className="py-3 px-3 font-mono text-slate-700">
-                        {item.serialOrLot || '-'}
-                      </td>
-                      <td className="py-3 px-3 text-slate-600">
-                        {item.location || 'Tại kho'}
-                      </td>
-                      <td className="py-3 px-3 font-bold tabular-nums">
-                        <span className={isExpired ? 'text-rose-600' : 'text-amber-700'}>
-                          {formatDate(item.inspectionDueDate)}
-                        </span>
-                      </td>
-                      <td className="py-3 px-3">
-                        <span
-                          className={`inline-block px-2 py-0.5 rounded text-[11px] font-semibold ${
-                            isExpired
-                              ? 'bg-rose-100 text-rose-800 border border-rose-300'
-                              : 'bg-amber-100 text-amber-800 border border-amber-300'
-                          }`}
-                        >
-                          {isExpired ? 'ĐÃ QUÁ HẠN KIỂM ĐỊNH' : 'SẮP ĐẾN HẠN (< 30 NGÀY)'}
-                        </span>
-                      </td>
-                      <td className="py-3 px-4 text-center">
-                        <button
-                          onClick={() => onEditItem(item)}
-                          className="text-xs text-indigo-600 hover:text-indigo-800 font-semibold underline underline-offset-2"
-                        >
-                          Cập nhật gia hạn
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase text-[10px]">
+                    <th className="py-3 px-4">Mã SKU</th>
+                    <th className="py-3 px-4">Tên thiết bị</th>
+                    <th className="py-3 px-3">Số Serial / Lô</th>
+                    <th className="py-3 px-3">Vị trí lưu kho</th>
+                    <th className="py-3 px-3">Hạn kiểm định</th>
+                    <th className="py-3 px-3">Tình trạng cảnh báo</th>
+                    <th className="py-3 px-4 text-center">Thao tác</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {paginatedInsp.map(item => {
+                    const isExpired = Date.parse(item.inspectionDueDate!) < nowMs;
+                    return (
+                      <tr key={item.id} className="hover:bg-slate-50/80">
+                        <td className="py-3 px-4 font-mono font-bold text-slate-900">
+                          {item.code}
+                        </td>
+                        <td className="py-3 px-4 font-semibold text-slate-900">
+                          {item.name}
+                        </td>
+                        <td className="py-3 px-3 font-mono text-slate-700">
+                          {item.serialOrLot || '-'}
+                        </td>
+                        <td className="py-3 px-3 text-slate-600">
+                          {item.location || 'Tại kho'}
+                        </td>
+                        <td className="py-3 px-3 font-bold tabular-nums">
+                          <span className={isExpired ? 'text-rose-600' : 'text-amber-700'}>
+                            {formatDate(item.inspectionDueDate)}
+                          </span>
+                        </td>
+                        <td className="py-3 px-3">
+                          <span
+                            className={`inline-block px-2 py-0.5 rounded text-[11px] font-semibold ${
+                              isExpired
+                                ? 'bg-rose-100 text-rose-800 border border-rose-300'
+                                : 'bg-amber-100 text-amber-800 border border-amber-300'
+                            }`}
+                          >
+                            {isExpired ? 'ĐÃ QUÁ HẠN KIỂM ĐỊNH' : 'SẮP ĐẾN HẠN (< 30 NGÀY)'}
+                          </span>
+                        </td>
+                        <td className="py-3 px-4 text-center">
+                          <button
+                            onClick={() => onEditItem(item)}
+                            className="text-xs text-indigo-600 hover:text-indigo-800 font-semibold underline underline-offset-2"
+                          >
+                            Cập nhật gia hạn
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <PaginationBar
+              currentPage={safeInspPage}
+              totalItems={inspectionAlerts.length}
+              pageSize={inspPageSize}
+              onPageChange={setInspPage}
+              onPageSizeChange={setInspPageSize}
+              itemLabel="thiết bị"
+            />
+          </>
         )}
       </div>
 
@@ -275,7 +346,7 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ onQuickReorder, onEditIt
         <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
           <div className="p-4 sm:p-5 border-b border-slate-200 bg-purple-50/30">
             <h3 className="text-base font-semibold text-purple-950">
-              Vật tư tồn kho vượt mức tối đa ({overstockedItems.length})
+              Vật tư tồn kho vượt mức tối đa ({formatNumber(overstockedItems.length)})
             </h3>
             <p className="text-xs text-slate-500">
               Các mặt hàng có lượng tồn vượt định mức max, cần xem xét điều chuyển hoặc ngưng mua mới
@@ -283,7 +354,7 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ onQuickReorder, onEditIt
           </div>
 
           <div className="p-4 space-y-2">
-            {overstockedItems.map(item => (
+            {paginatedOver.map(item => (
               <div
                 key={item.id}
                 className="flex items-center justify-between p-3 bg-slate-50 rounded-lg text-xs"
@@ -303,6 +374,14 @@ export const AlertsView: React.FC<AlertsViewProps> = ({ onQuickReorder, onEditIt
               </div>
             ))}
           </div>
+          <PaginationBar
+            currentPage={safeOverPage}
+            totalItems={overstockedItems.length}
+            pageSize={overPageSize}
+            onPageChange={setOverPage}
+            onPageSizeChange={setOverPageSize}
+            itemLabel="vật tư vượt định mức"
+          />
         </div>
       )}
     </div>

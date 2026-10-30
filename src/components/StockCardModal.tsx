@@ -1,12 +1,8 @@
-import React from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   X,
-  FileSpreadsheet,
   Download,
   Warehouse as WarehouseIcon,
-  Layers,
-  ArrowUpRight,
-  ArrowDownLeft,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
 import {
@@ -19,6 +15,7 @@ import {
   getStockStatusLabel,
   getSubtypeLabel,
 } from '../utils/formatters';
+import { PaginationBar } from './PaginationBar';
 
 interface StockCardModalProps {
   itemId: string | null;
@@ -27,14 +24,37 @@ interface StockCardModalProps {
 
 export const StockCardModal: React.FC<StockCardModalProps> = ({ itemId, onClose }) => {
   const { items, warehouses, getItemLedger } = useInventory();
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
 
-  if (!itemId) return null;
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [itemId]);
 
-  const item = items.find(i => i.id === itemId);
-  if (!item) return null;
+  const item = useMemo(
+    () => (itemId ? items.find(i => i.id === itemId) : undefined),
+    [items, itemId]
+  );
 
-  const wh = warehouses.find(w => w.id === item.warehouseId);
-  const ledger = getItemLedger(item.id);
+  const wh = useMemo(
+    () => (item ? warehouses.find(w => w.id === item.warehouseId) : undefined),
+    [warehouses, item]
+  );
+
+  const ledger = useMemo(
+    () => (item ? getItemLedger(item.id) : []),
+    [item, getItemLedger]
+  );
+
+  const totalPages = Math.max(1, Math.ceil(ledger.length / pageSize));
+  const safePage = Math.min(currentPage, totalPages);
+  const paginatedLedger = useMemo(() => {
+    const start = (safePage - 1) * pageSize;
+    return ledger.slice(start, start + pageSize);
+  }, [ledger, safePage, pageSize]);
+
+  if (!itemId || !item) return null;
+
   const status = getStockStatus(item);
 
   const handleExportCard = () => {
@@ -166,8 +186,8 @@ export const StockCardModal: React.FC<StockCardModalProps> = ({ itemId, onClose 
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {ledger.map((entry, idx) => (
-                    <tr key={idx} className="hover:bg-slate-50/70 transition-colors">
+                  {paginatedLedger.map((entry, idx) => (
+                    <tr key={`${entry.transactionCode}-${idx}`} className="hover:bg-slate-50/70 transition-colors">
                       <td className="py-2.5 px-3 text-slate-600 whitespace-nowrap tabular-nums">
                         {formatDateTime(entry.date)}
                       </td>
@@ -205,6 +225,21 @@ export const StockCardModal: React.FC<StockCardModalProps> = ({ itemId, onClose 
                   ))}
                 </tbody>
               </table>
+              {ledger.length > pageSize && (
+                <PaginationBar
+                  currentPage={safePage}
+                  totalItems={ledger.length}
+                  pageSize={pageSize}
+                  onPageChange={setCurrentPage}
+                  onPageSizeChange={size => {
+                    setPageSize(size);
+                    setCurrentPage(1);
+                  }}
+                  pageSizeOptions={[25, 50, 100, 200]}
+                  itemLabel="giao dịch"
+                  compact
+                />
+              )}
             </div>
           )}
         </div>
