@@ -856,6 +856,10 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     [persistSnapshotToLocalStorage]
   );
 
+  const isPushingRef = useRef(false);
+  const isPollingRef = useRef(false);
+  const v2MigrationTriggeredRef = useRef(false);
+
   /**
    * Direct push helper for instant authoritative multi-user broadcast + immediate response reconciliation
    */
@@ -892,6 +896,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       stateRef.current = immediateSnapshot;
       persistSnapshotToLocalStorage(immediateSnapshot);
 
+      isPushingRef.current = true;
       setSyncStatus('syncing');
 
       const outboundPayload: CentralDataPayload = {
@@ -909,21 +914,25 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         source,
       };
 
+      const clientManagesSupabase = supabaseRealtimeService.isConfigured();
       let mergedFromServer: CentralDataPayload | null = null;
 
       try {
-        const res = await centralSyncService.pushUpdate({
-          items: newItems,
-          transactions: newTransactions,
-          warehouses: newWarehouses,
-          materialCategories: catsToPush,
-          users: newUsers,
-          deletedRegistry: regToPush,
-          ...legacyArrays,
-          supabaseConfig,
-          clientId: clientIdRef.current,
-          source,
-        });
+        const res = await centralSyncService.pushUpdate(
+          {
+            items: newItems,
+            transactions: newTransactions,
+            warehouses: newWarehouses,
+            materialCategories: catsToPush,
+            users: newUsers,
+            deletedRegistry: regToPush,
+            ...legacyArrays,
+            supabaseConfig,
+            clientId: clientIdRef.current,
+            source,
+          },
+          { skipRemoteCloudSave: clientManagesSupabase }
+        );
         if (res.success && res.payload) {
           mergedFromServer = res.payload;
           setSyncProvider(res.provider);
@@ -933,17 +942,20 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
 
       try {
-        if (supabaseRealtimeService.isConfigured()) {
+        if (clientManagesSupabase) {
           const supaMerged = await supabaseRealtimeService.pushState(
             mergedFromServer || outboundPayload
           );
           if (supaMerged) {
             mergedFromServer = supaMerged;
+            v2MigrationTriggeredRef.current = true;
             setSyncProvider('supabase');
           }
         }
       } catch (err) {
         console.warn('Immediate supabase push failed:', err);
+      } finally {
+        isPushingRef.current = false;
       }
 
       if (mergedFromServer) {
@@ -958,26 +970,30 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const saveSupabaseCredentials = useCallback(
     (url: string, key: string) => {
+      v2MigrationTriggeredRef.current = false;
       const configured = supabaseRealtimeService.setCredentials(url, key);
       setSupabaseCredentials({ url, key });
       if (configured) {
         setSyncProvider('supabase');
-        supabaseRealtimeService.fetchLatest().then(remoteData => {
-          if (remoteData) {
-            applyRemotePayloadAdditive(remoteData);
-          }
-          // Share Supabase credentials to central server so all other users connect to the same store
-          const cur = stateRef.current;
-          pushCloudSyncImmediately(
-            cur.items,
-            cur.transactions,
-            cur.warehouses,
-            cur.users,
-            cur.deletedRegistry,
-            'supabase-config-share',
-            { url: url.trim(), key: key.trim() }
-          );
-        });
+        const hasLargeLocalState = stateRef.current.items.length > 120;
+        supabaseRealtimeService
+          .fetchLatest({ skipLegacyFallback: hasLargeLocalState })
+          .then(remoteData => {
+            if (remoteData) {
+              applyRemotePayloadAdditive(remoteData);
+            }
+            // Share Supabase credentials to central server & persist Sharded V2 state
+            const cur = stateRef.current;
+            pushCloudSyncImmediately(
+              cur.items,
+              cur.transactions,
+              cur.warehouses,
+              cur.users,
+              cur.deletedRegistry,
+              'supabase-config-share',
+              { url: url.trim(), key: key.trim() }
+            );
+          });
       }
       return configured;
     },
@@ -1101,11 +1117,37 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
 
       if (supabaseRealtimeService.isConfigured()) {
-        const directPayload = await supabaseRealtimeService.fetchLatest();
+        const hasLocalRecords =
+          stateRef.current.items.length > 120 || stateRef.current.transactions.length > 80;
+        const directPayload = await supabaseRealtimeService.fetchLatest({
+          onlyIfChanged: false,
+          skipLegacyFallback: hasLocalRecords,
+        });
         if (directPayload) {
           anySuccess = true;
           applyRemotePayloadAdditive(directPayload);
           setSyncProvider('supabase');
+        } else if (supabaseRealtimeService.needsV2Migration() && stateRef.current.items.length > 0) {
+          const cur = stateRef.current;
+          const legacy = extractLegacyDeletedArrays(cur.deletedRegistry);
+          const migrated = await supabaseRealtimeService.pushState({
+            version: Math.max(1, centralSyncService.getCurrentVersion()) + 1,
+            lastUpdated: new Date().toISOString(),
+            items: cur.items,
+            transactions: cur.transactions,
+            warehouses: cur.warehouses,
+            materialCategories: cur.materialCategories,
+            users: cur.users,
+            deletedRegistry: cur.deletedRegistry,
+            ...legacy,
+            clientId: clientIdRef.current,
+            source: 'auto-migrate-v2',
+          });
+          if (migrated) {
+            anySuccess = true;
+            v2MigrationTriggeredRef.current = true;
+            setSyncProvider('supabase');
+          }
         }
       }
 
@@ -1120,8 +1162,11 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   }, [applyRemotePayloadAdditive]);
 
-  // Silent background polling (uses sinceVersion so unchanged 5,000+ row payloads are neither downloaded nor re-rendered)
+  // Silent background polling (uses sinceVersion + lightweight manifest_v2 check so 5,000+ rows are never re-downloaded when unchanged)
   const pollBackgroundSync = useCallback(async () => {
+    if (isPollingRef.current || isPushingRef.current) return;
+    isPollingRef.current = true;
+
     try {
       let anySuccess = false;
 
@@ -1137,14 +1182,57 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       }
 
-      if (supabaseRealtimeService.isConfigured()) {
-        const directPayload = await supabaseRealtimeService.fetchLatest();
+      if (supabaseRealtimeService.isConfigured() && !isPushingRef.current) {
+        const hasLocalRecords =
+          stateRef.current.items.length > 0 || stateRef.current.transactions.length > 0;
+        const directPayload = await supabaseRealtimeService.fetchLatestIfChanged({
+          skipLegacyFallback: hasLocalRecords,
+        });
+
         if (directPayload) {
           anySuccess = true;
           if (directPayload.lastUpdated !== lastServerTimestampRef.current) {
             applyRemotePayloadAdditive(directPayload);
           }
           setSyncProvider(prev => (prev === 'supabase' ? prev : 'supabase'));
+        } else if (supabaseRealtimeService.getConnectionState() === 'CONNECTED') {
+          anySuccess = true;
+        }
+
+        // One-time background migration of existing local dataset into Sharded V2 on Supabase
+        if (
+          !v2MigrationTriggeredRef.current &&
+          supabaseRealtimeService.needsV2Migration() &&
+          hasLocalRecords &&
+          !isPushingRef.current
+        ) {
+          v2MigrationTriggeredRef.current = true;
+          const cur = stateRef.current;
+          const legacy = extractLegacyDeletedArrays(cur.deletedRegistry);
+          supabaseRealtimeService
+            .pushState({
+              version: Math.max(1, centralSyncService.getCurrentVersion()) + 1,
+              lastUpdated: new Date().toISOString(),
+              items: cur.items,
+              transactions: cur.transactions,
+              warehouses: cur.warehouses,
+              materialCategories: cur.materialCategories,
+              users: cur.users,
+              deletedRegistry: cur.deletedRegistry,
+              ...legacy,
+              clientId: clientIdRef.current,
+              source: 'background-migrate-sharded-v2',
+            })
+            .then(migrated => {
+              if (migrated) {
+                setSyncProvider(prev => (prev === 'supabase' ? prev : 'supabase'));
+              } else {
+                v2MigrationTriggeredRef.current = false;
+              }
+            })
+            .catch(() => {
+              v2MigrationTriggeredRef.current = false;
+            });
         }
       }
 
@@ -1156,10 +1244,12 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
     } catch {
       setSyncStatus(prev => (prev === 'offline' ? prev : 'offline'));
+    } finally {
+      isPollingRef.current = false;
     }
   }, [applyRemotePayloadAdditive]);
 
-  // Automatic 3-second polling as resilient fallback alongside SSE + WebSocket
+  // Automatic 4-second polling as resilient fallback alongside SSE + WebSocket
   useEffect(() => {
     if (!autoSyncEnabled) return;
 
@@ -1170,7 +1260,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         return;
       }
       pollBackgroundSync();
-    }, 3000);
+    }, 4000);
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
@@ -1284,7 +1374,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         applyRemotePayloadAdditive(syncRes.payload);
       }
       if (supabaseRealtimeService.isConfigured()) {
-        const remoteSupa = await supabaseRealtimeService.fetchLatest();
+        const remoteSupa = await supabaseRealtimeService.fetchLatest({
+          skipLegacyFallback: stateRef.current.items.length > 120,
+        });
         if (remoteSupa) {
           applyRemotePayloadAdditive(remoteSupa);
         }
@@ -1389,7 +1481,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         applyRemotePayloadAdditive(syncRes.payload);
       }
       if (supabaseRealtimeService.isConfigured()) {
-        const remoteSupa = await supabaseRealtimeService.fetchLatest();
+        const remoteSupa = await supabaseRealtimeService.fetchLatest({
+          skipLegacyFallback: stateRef.current.items.length > 120,
+        });
         if (remoteSupa) {
           applyRemotePayloadAdditive(remoteSupa);
         }
@@ -3836,26 +3930,35 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     localStorage.removeItem(STORAGE_KEYS.DELETED_WAREHOUSES);
     localStorage.removeItem(STORAGE_KEYS.DELETED_CATEGORIES);
 
+    const cleanResetPayload: CentralDataPayload = {
+      cleanReset: true,
+      resetEpoch: RESET_EPOCH,
+      version: Math.max(1, centralSyncService.getCurrentVersion()) + 1,
+      lastUpdated: new Date().toISOString(),
+      users: INITIAL_USERS,
+      warehouses: INITIAL_WAREHOUSES,
+      materialCategories: INITIAL_CATEGORIES,
+      items: INITIAL_ITEMS,
+      transactions: INITIAL_TRANSACTIONS,
+      deletedRegistry: {},
+      source: 'admin-clean-reset',
+    };
+
+    const clientManagesSupabase = supabaseRealtimeService.isConfigured();
+
     fetch('/api/sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         cleanReset: true,
-        payload: {
-          cleanReset: true,
-          resetEpoch: RESET_EPOCH,
-          version: 1,
-          lastUpdated: new Date().toISOString(),
-          users: INITIAL_USERS,
-          warehouses: INITIAL_WAREHOUSES,
-          materialCategories: INITIAL_CATEGORIES,
-          items: INITIAL_ITEMS,
-          transactions: INITIAL_TRANSACTIONS,
-          deletedRegistry: {},
-          source: 'admin-clean-reset',
-        },
+        skipRemoteCloudSave: clientManagesSupabase,
+        payload: cleanResetPayload,
       }),
     }).catch(() => {});
+
+    if (clientManagesSupabase) {
+      supabaseRealtimeService.pushState(cleanResetPayload).catch(() => {});
+    }
   };
 
   return (

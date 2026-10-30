@@ -885,8 +885,35 @@ function mergeServerStateDeterministic(existing: any, incoming: any): any {
   };
 }
 
-// Optional external cloud persistence (Supabase REST) if configured via env or shared config
-async function fetchRemoteSupabaseIfConfigured(sharedConfig?: { url?: string; key?: string }): Promise<any | null> {
+function fnv1a32Server(str: string, seed = 0x811c9dc5): number {
+  let h = seed >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+function computeServerShardHash(jsonStr: string): string {
+  const h1 = fnv1a32Server(jsonStr, 0x811c9dc5).toString(36);
+  const h2 = fnv1a32Server(jsonStr, 0x9e3779b9).toString(36);
+  return `${h1}-${h2}-${jsonStr.length.toString(36)}`;
+}
+
+function pickServerBucketCount(total: number, targetPerShard: number): number {
+  const raw = Math.max(2, Math.ceil(total / targetPerShard));
+  let p = 2;
+  while (p < raw && p < 256) p <<= 1;
+  return p;
+}
+
+const serverWrittenShardHashes = new Map<string, string>();
+
+// Optional external cloud persistence (Supabase REST Sharded V2) if configured via env or shared config
+async function fetchRemoteSupabaseIfConfigured(
+  sharedConfig?: { url?: string; key?: string },
+  skipLegacyFallback = false
+): Promise<any | null> {
   const supabaseUrl =
     process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || sharedConfig?.url;
   const supabaseKey =
@@ -896,17 +923,103 @@ async function fetchRemoteSupabaseIfConfigured(sharedConfig?: { url?: string; ke
     sharedConfig?.key;
 
   if (!supabaseUrl || !supabaseKey) return null;
+  const headers = {
+    apikey: supabaseKey,
+    Authorization: `Bearer ${supabaseKey}`,
+  };
+
   try {
-    const res = await fetch(`${supabaseUrl}/rest/v1/inventory_state?id=eq.default&select=*`, {
-      headers: {
-        apikey: supabaseKey,
-        Authorization: `Bearer ${supabaseKey}`,
-      },
-    });
-    if (!res.ok) return null;
-    const rows = await res.json();
-    if (Array.isArray(rows) && rows.length > 0 && rows[0].data) {
-      return rows[0].data;
+    // 1. Query lightweight Sharded V2 manifest row (< 20KB)
+    const v2Res = await fetch(
+      `${supabaseUrl}/rest/v1/inventory_state?id=eq.manifest_v2&select=data`,
+      { headers }
+    );
+    if (v2Res.ok) {
+      const v2Rows = await v2Res.json();
+      if (Array.isArray(v2Rows) && v2Rows.length > 0 && v2Rows[0]?.data?.__shardedV2) {
+        const manifest = v2Rows[0].data;
+        const itemShards: { id: string; hash: string }[] = manifest.itemShards || [];
+        const txShards: { id: string; hash: string }[] = manifest.txShards || [];
+        const delShards: { id: string; hash: string }[] = manifest.delShards || [];
+        const allShardIds = [
+          ...itemShards.map(s => s.id),
+          ...txShards.map(s => s.id),
+          ...delShards.map(s => s.id),
+        ];
+
+        const shardDataMap = new Map<string, any>();
+        for (let i = 0; i < allShardIds.length; i += 5) {
+          const chunk = allShardIds.slice(i, i + 5);
+          const inList = chunk.map(id => `"${id}"`).join(',');
+          const sRes = await fetch(
+            `${supabaseUrl}/rest/v1/inventory_state?id=in.(${encodeURIComponent(inList)})&select=id,data`,
+            { headers }
+          );
+          if (sRes.ok) {
+            const sRows = await sRes.json();
+            if (Array.isArray(sRows)) {
+              for (const r of sRows) {
+                if (r?.id && r?.data) {
+                  shardDataMap.set(r.id, r.data);
+                  if (r.data.hash) serverWrittenShardHashes.set(r.id, r.data.hash);
+                }
+              }
+            }
+          }
+        }
+
+        const deletedRegistry: DeletedRegistry = manifest.inlineDeletedRegistry
+          ? { ...manifest.inlineDeletedRegistry }
+          : {};
+        for (const ds of delShards) {
+          const d = shardDataMap.get(ds.id);
+          if (d?.entries) Object.assign(deletedRegistry, d.entries);
+        }
+
+        const items: any[] = Array.isArray(manifest.inlineItems) ? [...manifest.inlineItems] : [];
+        for (const is of itemShards) {
+          const d = shardDataMap.get(is.id);
+          if (Array.isArray(d?.records)) items.push(...d.records);
+        }
+
+        const transactions: any[] = Array.isArray(manifest.inlineTransactions)
+          ? [...manifest.inlineTransactions]
+          : [];
+        for (const ts of txShards) {
+          const d = shardDataMap.get(ts.id);
+          if (Array.isArray(d?.records)) transactions.push(...d.records);
+        }
+
+        return mergeServerStateDeterministic(
+          {},
+          {
+            ...manifest,
+            items,
+            transactions,
+            deletedRegistry,
+          }
+        );
+      }
+    }
+
+    if (skipLegacyFallback) return null;
+
+    // 2. Safe one-time legacy fallback with 2.5s abort timeout
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    try {
+      const res = await fetch(
+        `${supabaseUrl}/rest/v1/inventory_state?id=eq.default&select=data`,
+        { headers, signal: controller.signal }
+      );
+      clearTimeout(timer);
+      if (!res.ok) return null;
+      const rows = await res.json();
+      if (Array.isArray(rows) && rows.length > 0 && rows[0].data) {
+        return rows[0].data;
+      }
+    } catch {
+      clearTimeout(timer);
     }
   } catch {
     // ignore remote fetch failure
@@ -923,23 +1036,138 @@ async function saveRemoteSupabaseIfConfigured(state: any): Promise<boolean> {
     process.env.VITE_SUPABASE_ANON_KEY ||
     state?.supabaseConfig?.key;
 
-  if (!supabaseUrl || !supabaseKey) return false;
+  if (!supabaseUrl || !supabaseKey || !state) return false;
+  const headers = {
+    apikey: supabaseKey,
+    Authorization: `Bearer ${supabaseKey}`,
+    'Content-Type': 'application/json',
+    Prefer: 'resolution=merge-duplicates,return=minimal',
+  };
+
   try {
-    const res = await fetch(`${supabaseUrl}/rest/v1/inventory_state`, {
+    const nowIso = new Date().toISOString();
+    const items: any[] = Array.isArray(state.items) ? state.items : [];
+    const transactions: any[] = Array.isArray(state.transactions) ? state.transactions : [];
+    const deletedRegistry: DeletedRegistry = state.deletedRegistry || {};
+
+    const shardRows: { id: string; hash: string; data: any }[] = [];
+    let inlineItems: any[] | undefined;
+    let itemShards: { id: string; hash: string; count: number }[] | undefined;
+
+    if (items.length <= 120) {
+      inlineItems = items.map(({ warehouseStocks, ...rest }) => rest);
+    } else {
+      const numBuckets = pickServerBucketCount(items.length, 250);
+      const buckets: any[][] = Array.from({ length: numBuckets }, () => []);
+      for (let i = 0; i < items.length; i++) {
+        const { warehouseStocks, ...slim } = items[i];
+        const key = String(slim.code || slim.id || '').trim().toUpperCase();
+        buckets[fnv1a32Server(key) & (numBuckets - 1)].push(slim);
+      }
+      itemShards = [];
+      for (let b = 0; b < numBuckets; b++) {
+        if (buckets[b].length === 0) continue;
+        buckets[b].sort((x, y) => String(x.code || '').localeCompare(String(y.code || '')));
+        const hash = computeServerShardHash(JSON.stringify(buckets[b]));
+        const id = `s2:i:${numBuckets}:${b}`;
+        itemShards.push({ id, hash, count: buckets[b].length });
+        shardRows.push({ id, hash, data: { hash, records: buckets[b] } });
+      }
+    }
+
+    let inlineTransactions: any[] | undefined;
+    let txShards: { id: string; hash: string; count: number }[] | undefined;
+
+    if (transactions.length <= 80) {
+      inlineTransactions = transactions;
+    } else {
+      const numBuckets = pickServerBucketCount(transactions.length, 160);
+      const buckets: any[][] = Array.from({ length: numBuckets }, () => []);
+      for (let i = 0; i < transactions.length; i++) {
+        const tx = transactions[i];
+        const key = String(tx.id || tx.code || '').trim().toUpperCase();
+        buckets[fnv1a32Server(key) & (numBuckets - 1)].push(tx);
+      }
+      txShards = [];
+      for (let b = 0; b < numBuckets; b++) {
+        if (buckets[b].length === 0) continue;
+        buckets[b].sort((x, y) => String(x.id || '').localeCompare(String(y.id || '')));
+        const hash = computeServerShardHash(JSON.stringify(buckets[b]));
+        const id = `s2:t:${numBuckets}:${b}`;
+        txShards.push({ id, hash, count: buckets[b].length });
+        shardRows.push({ id, hash, data: { hash, records: buckets[b] } });
+      }
+    }
+
+    const delKeys = Object.keys(deletedRegistry);
+    let inlineDeletedRegistry: DeletedRegistry | undefined;
+    let delShards: { id: string; hash: string; count: number }[] | undefined;
+
+    if (delKeys.length <= 400) {
+      inlineDeletedRegistry = deletedRegistry;
+    } else {
+      const numBuckets = pickServerBucketCount(delKeys.length, 1200);
+      const bucketEntries: DeletedRegistry[] = Array.from({ length: numBuckets }, () => ({}));
+      const counts = new Array<number>(numBuckets).fill(0);
+      delKeys.sort();
+      for (const k of delKeys) {
+        const b = fnv1a32Server(k) & (numBuckets - 1);
+        bucketEntries[b][k] = deletedRegistry[k];
+        counts[b]++;
+      }
+      delShards = [];
+      for (let b = 0; b < numBuckets; b++) {
+        if (counts[b] === 0) continue;
+        const hash = computeServerShardHash(JSON.stringify(bucketEntries[b]));
+        const id = `s2:d:${numBuckets}:${b}`;
+        delShards.push({ id, hash, count: counts[b] });
+        shardRows.push({ id, hash, data: { hash, entries: bucketEntries[b] } });
+      }
+    }
+
+    const dirtyShards = shardRows.filter(s => serverWrittenShardHashes.get(s.id) !== s.hash);
+    for (let i = 0; i < dirtyShards.length; i += 3) {
+      const batch = dirtyShards.slice(i, i + 3);
+      const res = await fetch(`${supabaseUrl}/rest/v1/inventory_state`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(
+          batch.map(s => ({ id: s.id, data: s.data, updated_at: nowIso }))
+        ),
+      });
+      if (res.ok) {
+        batch.forEach(s => serverWrittenShardHashes.set(s.id, s.hash));
+      } else {
+        return false;
+      }
+    }
+
+    const manifest = {
+      __shardedV2: true,
+      version: state.version,
+      lastUpdated: state.lastUpdated || nowIso,
+      lastUpdatedBy: state.lastUpdatedBy,
+      clientId: state.clientId,
+      source: state.source,
+      supabaseConfig: state.supabaseConfig,
+      users: state.users || [],
+      warehouses: state.warehouses || [],
+      materialCategories: state.materialCategories || [],
+      ...(inlineItems !== undefined ? { inlineItems } : { itemShards }),
+      ...(inlineTransactions !== undefined ? { inlineTransactions } : { txShards }),
+      ...(inlineDeletedRegistry !== undefined ? { inlineDeletedRegistry } : { delShards }),
+    };
+
+    const mRes = await fetch(`${supabaseUrl}/rest/v1/inventory_state`, {
       method: 'POST',
-      headers: {
-        apikey: supabaseKey,
-        Authorization: `Bearer ${supabaseKey}`,
-        'Content-Type': 'application/json',
-        Prefer: 'resolution=merge-duplicates',
-      },
+      headers,
       body: JSON.stringify({
-        id: 'default',
-        data: state,
-        updated_at: new Date().toISOString(),
+        id: 'manifest_v2',
+        data: manifest,
+        updated_at: nowIso,
       }),
     });
-    return res.ok;
+    return mRes.ok;
   } catch {
     return false;
   }
@@ -962,7 +1190,11 @@ async function startServer() {
 
   // On boot, also reconcile with external Supabase if configured
   try {
-    const remoteBoot = await fetchRemoteSupabaseIfConfigured(memoryState?.supabaseConfig);
+    const hasLargeBootState = Array.isArray(memoryState?.items) && memoryState.items.length > 120;
+    const remoteBoot = await fetchRemoteSupabaseIfConfigured(
+      memoryState?.supabaseConfig,
+      hasLargeBootState
+    );
     if (remoteBoot && Object.keys(remoteBoot).length > 0) {
       memoryState = memoryState
         ? mergeServerStateDeterministic(memoryState, remoteBoot)
@@ -1133,7 +1365,9 @@ async function startServer() {
           console.warn('[server] Could not persist .sync-state.json:', writeErr);
         }
 
-        saveRemoteSupabaseIfConfigured(stateSnapshot).catch(() => {});
+        if (!body.skipRemoteCloudSave) {
+          saveRemoteSupabaseIfConfigured(stateSnapshot).catch(() => {});
+        }
       })
       .catch(err => {
         console.error('[server] Error handling POST /api/sync:', err);

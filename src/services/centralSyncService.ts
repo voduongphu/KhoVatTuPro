@@ -218,7 +218,8 @@ class CentralSyncService {
    * Push current state to central server (/api/sync) and return the authoritative merged state!
    */
   public async pushUpdate(
-    payload: Omit<CentralDataPayload, 'version' | 'lastUpdated'>
+    payload: Omit<CentralDataPayload, 'version' | 'lastUpdated'>,
+    options?: { skipRemoteCloudSave?: boolean }
   ): Promise<SyncResult> {
     const fullPayload: CentralDataPayload = {
       ...payload,
@@ -233,7 +234,10 @@ class CentralSyncService {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ payload: fullPayload }),
+        body: JSON.stringify({
+          payload: fullPayload,
+          skipRemoteCloudSave: Boolean(options?.skipRemoteCloudSave),
+        }),
       });
 
       if (response.ok) {

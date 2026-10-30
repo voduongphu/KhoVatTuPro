@@ -84,25 +84,20 @@ export const SyncStatusModal: React.FC = () => {
     }
   };
 
-  const supabaseRealtimeSQL = `-- 1. Tạo bảng lưu trữ trạng thái vật tư tập trung cho Supabase
+  const supabaseRealtimeSQL = `-- 1. Tạo bảng lưu trữ phân mảnh (Sharded V2) tốc độ cao cho >50.000 dòng dữ liệu
 CREATE TABLE IF NOT EXISTS inventory_state (
   id TEXT PRIMARY KEY,
   data JSONB NOT NULL,
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now())
 );
 
--- 2. Thêm bản ghi mặc định
-INSERT INTO inventory_state (id, data) 
-VALUES ('default', '{}')
-ON CONFLICT (id) DO NOTHING;
+-- 2. Tối ưu WAL cho dữ liệu lớn (giảm tải CPU/IO, chống lỗi statement timeout 57014)
+ALTER TABLE inventory_state REPLICA IDENTITY DEFAULT;
 
 -- 3. KÍCH HOẠT SUPABASE REALTIME (BẮT BUỘC ĐỂ WEBSOCKET HOẠT ĐỘNG TỨC THÌ)
 ALTER PUBLICATION supabase_realtime ADD TABLE inventory_state;
 
--- 4. Bật REPLICA IDENTITY FULL để gửi toàn bộ payload khi có UPDATE
-ALTER TABLE inventory_state REPLICA IDENTITY FULL;
-
--- 5. Bật Row Level Security (RLS) & Cấp quyền truy cập Realtime
+-- 4. Bật Row Level Security (RLS) & Cấp quyền truy cập Realtime
 ALTER TABLE inventory_state ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "Allow public realtime read" 
