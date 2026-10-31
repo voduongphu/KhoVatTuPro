@@ -1,251 +1,121 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 import React, { useState } from 'react';
-import { InventoryProvider, useInventory } from './context/InventoryContext';
-import { Header } from './components/Header';
-import { DashboardView } from './components/DashboardView';
-import { InventoryTableView } from './components/InventoryTableView';
-import { TransactionListView } from './components/TransactionListView';
-import { AlertsView } from './components/AlertsView';
-import { UserManagementView } from './components/UserManagementView';
-import { WarehouseManagementView } from './components/WarehouseManagementView';
-import { CategoryManagementView } from './components/CategoryManagementView';
-import { StockCardModal } from './components/StockCardModal';
-import { CreateTransactionModal } from './components/CreateTransactionModal';
-import { CreateItemModal } from './components/CreateItemModal';
-import { TransactionPrintModal } from './components/TransactionPrintModal';
-import { ExcelImportModal } from './components/ExcelImportModal';
-import { ImportItemsExcelModal } from './components/ImportItemsExcelModal';
-import { EditTransactionModal } from './components/EditTransactionModal';
-import { SyncStatusModal } from './components/SyncStatusModal';
-import { LoginView } from './components/LoginView';
-import { InventoryItem, Transaction, TransactionType } from './types/inventory';
-import { ActiveTabType } from './components/Header';
+import { AuthProvider, useAuth } from './context/AuthContext';
+import { Navbar } from './components/layout/Navbar';
+import { Sidebar } from './components/layout/Sidebar';
+import { DashboardOverview } from './components/dashboard/DashboardOverview';
+import { InboundManager } from './components/inbound/InboundManager';
+import { OutboundManager } from './components/outbound/OutboundManager';
+import { InventoryReport } from './components/reports/InventoryReport';
+import { WarehouseManager } from './components/warehouses/WarehouseManager';
+import { MaterialCatalog } from './components/materials/MaterialCatalog';
+import { UserManager } from './components/users/UserManager';
+import { 
+  LayoutDashboard, 
+  ArrowDownLeft, 
+  ArrowUpRight, 
+  BarChart3, 
+  Warehouse, 
+  Package, 
+  Users 
+} from 'lucide-react';
 
-function InventoryApp() {
-  const { currentUser } = useInventory();
+import { LoginScreen } from './components/auth/LoginScreen';
 
-  // Navigation tab state
-  const [activeTab, setActiveTab] = useState<ActiveTabType>('dashboard');
+const MainLayout: React.FC = () => {
+  const [activeTab, setActiveTab] = useState<string>('dashboard');
+  const { currentUser, isAdmin } = useAuth();
 
-  // Modals state
-  const [stockCardItemId, setStockCardItemId] = useState<string | null>(null);
-  const [printTransaction, setPrintTransaction] = useState<Transaction | null>(null);
-  const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
-  const [isExcelImportOpen, setIsExcelImportOpen] = useState(false);
-  const [isItemsExcelImportOpen, setIsItemsExcelImportOpen] = useState(false);
-
-  const [createTransactionState, setCreateTransactionState] = useState<{
-    isOpen: boolean;
-    type: TransactionType;
-    item?: InventoryItem;
-  }>({
-    isOpen: false,
-    type: 'NHAP_KHO',
-  });
-
-  const [createItemState, setCreateItemState] = useState<{
-    isOpen: boolean;
-    itemToEdit?: InventoryItem | null;
-  }>({
-    isOpen: false,
-    itemToEdit: null,
-  });
-
-  // Handlers
-  const handleOpenCreateTransaction = (type: TransactionType, item?: InventoryItem) => {
-    setCreateTransactionState({
-      isOpen: true,
-      type,
-      item,
-    });
-  };
-
-  const handleOpenCreateItem = (itemToEdit?: InventoryItem) => {
-    setCreateItemState({
-      isOpen: true,
-      itemToEdit: itemToEdit || null,
-    });
-  };
-
-  const handleQuickReorder = (item: InventoryItem, suggestedQty: number) => {
-    setCreateTransactionState({
-      isOpen: true,
-      type: 'NHAP_KHO',
-      item: {
-        ...item,
-        currentStock: suggestedQty,
-      },
-    });
-  };
-
-  // If not logged in, render the login screen with username & password and quick demo logins
+  // Hiển thị màn hình đăng nhập nếu người dùng chưa xác thực
   if (!currentUser) {
-    return <LoginView />;
+    return <LoginScreen />;
   }
 
+  const renderContent = () => {
+    switch (activeTab) {
+      case 'dashboard':
+        return <DashboardOverview onNavigate={(tab) => setActiveTab(tab)} />;
+      case 'inbound':
+        return <InboundManager />;
+      case 'outbound':
+        return <OutboundManager />;
+      case 'report':
+        return <InventoryReport />;
+      case 'warehouses':
+        return <WarehouseManager />;
+      case 'materials':
+        return <MaterialCatalog />;
+      case 'users':
+        return <UserManager />;
+      default:
+        return <DashboardOverview onNavigate={(tab) => setActiveTab(tab)} />;
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-slate-100/70 text-slate-900 flex flex-col font-['Plus_Jakarta_Sans',sans-serif]">
-      {/* Top Header Contract */}
-      <Header
-        activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        onOpenCreateItem={() => handleOpenCreateItem()}
-        onOpenCreateTransaction={type => handleOpenCreateTransaction(type)}
-        onOpenImportExcel={() => setIsExcelImportOpen(true)}
-      />
+    <div className="min-h-screen bg-slate-100/70 flex flex-col font-sans">
+      <Navbar />
 
-      {/* Main Viewport Content - Full screen fit without restrictive 1280px bottleneck */}
-      <main className="flex-1 w-full px-3 sm:px-6 lg:px-8 py-4 sm:py-6">
-        {activeTab === 'dashboard' && (
-          <DashboardView
-            onSelectStockCard={id => setStockCardItemId(id)}
-            onOpenCreateTransaction={type => handleOpenCreateTransaction(type)}
-          />
+      <div className="flex-1 flex flex-col md:flex-row max-w-7xl w-full mx-auto">
+        <Sidebar activeTab={activeTab} onTabChange={setActiveTab} />
+
+        <main className="flex-1 p-4 sm:p-6 lg:p-8 overflow-y-auto">
+          {renderContent()}
+        </main>
+      </div>
+
+      {/* Mobile Bottom Navigation for quick accessibility on mobile */}
+      <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 z-30 flex justify-around p-2 text-[10px] font-semibold text-slate-600 shadow-lg">
+        <button
+          onClick={() => setActiveTab('dashboard')}
+          className={`flex flex-col items-center gap-1 p-1 ${activeTab === 'dashboard' ? 'text-blue-600' : ''}`}
+        >
+          <LayoutDashboard className="w-4 h-4" />
+          <span>Tổng quan</span>
+        </button>
+        <button
+          onClick={() => setActiveTab('inbound')}
+          className={`flex flex-col items-center gap-1 p-1 ${activeTab === 'inbound' ? 'text-blue-600' : ''}`}
+        >
+          <ArrowDownLeft className="w-4 h-4" />
+          <span>Nhập kho</span>
+        </button>
+        <button
+          onClick={() => setActiveTab('outbound')}
+          className={`flex flex-col items-center gap-1 p-1 ${activeTab === 'outbound' ? 'text-blue-600' : ''}`}
+        >
+          <ArrowUpRight className="w-4 h-4" />
+          <span>Xuất kho</span>
+        </button>
+        <button
+          onClick={() => setActiveTab('report')}
+          className={`flex flex-col items-center gap-1 p-1 ${activeTab === 'report' ? 'text-blue-600' : ''}`}
+        >
+          <BarChart3 className="w-4 h-4" />
+          <span>Báo cáo</span>
+        </button>
+        {isAdmin && (
+          <button
+            onClick={() => setActiveTab('users')}
+            className={`flex flex-col items-center gap-1 p-1 ${activeTab === 'users' ? 'text-blue-600' : ''}`}
+          >
+            <Users className="w-4 h-4" />
+            <span>Người dùng</span>
+          </button>
         )}
-
-        {activeTab === 'inventory' && (
-          <InventoryTableView
-            onSelectStockCard={id => setStockCardItemId(id)}
-            onEditItem={item => handleOpenCreateItem(item)}
-            onOpenCreateItem={() => handleOpenCreateItem()}
-            onQuickGoodsIn={item => handleOpenCreateTransaction('NHAP_KHO', item)}
-            onOpenImportItems={() => setIsItemsExcelImportOpen(true)}
-            onOpenCategories={() => setActiveTab('categories')}
-          />
-        )}
-
-        {activeTab === 'categories' && (
-          <CategoryManagementView
-            onNavigateToInventoryWithCategory={() => setActiveTab('inventory')}
-            onEditItem={item => handleOpenCreateItem(item)}
-          />
-        )}
-
-        {activeTab === 'warehouses' && (
-          <WarehouseManagementView
-            onNavigateToInventoryWithWarehouse={() => setActiveTab('inventory')}
-          />
-        )}
-
-        {activeTab === 'receipts' && (
-          <TransactionListView
-            initialType="NHAP_KHO"
-            onOpenCreateTransaction={type => handleOpenCreateTransaction(type)}
-            onPrintTransaction={trx => setPrintTransaction(trx)}
-            onOpenImportExcel={() => setIsExcelImportOpen(true)}
-            onEditTransaction={trx => setEditingTransaction(trx)}
-          />
-        )}
-
-        {activeTab === 'issues' && (
-          <TransactionListView
-            initialType="XUAT_KHO"
-            onOpenCreateTransaction={type => handleOpenCreateTransaction(type)}
-            onPrintTransaction={trx => setPrintTransaction(trx)}
-            onOpenImportExcel={() => setIsExcelImportOpen(true)}
-            onEditTransaction={trx => setEditingTransaction(trx)}
-          />
-        )}
-
-        {activeTab === 'alerts' && (
-          <AlertsView
-            onQuickReorder={(item, suggestedQty) => handleQuickReorder(item, suggestedQty)}
-            onEditItem={item => handleOpenCreateItem(item)}
-          />
-        )}
-
-        {activeTab === 'users' && <UserManagementView />}
-      </main>
-
-      {/* Clean quiet footer - Full screen width matching header */}
-      <footer className="border-t border-slate-200 bg-white py-4 mt-auto">
-        <div className="w-full px-3 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
-          <div className="flex items-center gap-2">
-            <span className="font-semibold text-slate-700">Hệ Thống Quản Lý Kho Vật Tư &amp; Thiết Bị</span>
-            <span aria-hidden="true">&bull;</span>
-            <span>KhoVatTu Pro &bull; Phiên bản Kế toán &amp; Kỹ thuật</span>
-          </div>
-          <div className="flex items-center gap-3">
-            <span>Đang đăng nhập: <strong className="text-slate-800">{currentUser.fullName}</strong> ({currentUser.role})</span>
-            <span aria-hidden="true">&bull;</span>
-            <span>Hỗ trợ Import / Export Excel UTF-8</span>
-          </div>
-        </div>
-      </footer>
-
-      {/* Modals */}
-      {stockCardItemId && (
-        <StockCardModal
-          itemId={stockCardItemId}
-          onClose={() => setStockCardItemId(null)}
-        />
-      )}
-
-      {createTransactionState.isOpen && (
-        <CreateTransactionModal
-          initialType={createTransactionState.type}
-          initialItem={createTransactionState.item}
-          onClose={() =>
-            setCreateTransactionState({
-              isOpen: false,
-              type: 'NHAP_KHO',
-            })
-          }
-          onSuccess={() => {
-            setCreateTransactionState({
-              isOpen: false,
-              type: 'NHAP_KHO',
-            });
-          }}
-        />
-      )}
-
-      {createItemState.isOpen && (
-        <CreateItemModal
-          itemToEdit={createItemState.itemToEdit}
-          onClose={() => setCreateItemState({ isOpen: false, itemToEdit: null })}
-          onSuccess={() => setCreateItemState({ isOpen: false, itemToEdit: null })}
-        />
-      )}
-
-      {printTransaction && (
-        <TransactionPrintModal
-          transaction={printTransaction}
-          onClose={() => setPrintTransaction(null)}
-        />
-      )}
-
-      {editingTransaction && (
-        <EditTransactionModal
-          transaction={editingTransaction}
-          onClose={() => setEditingTransaction(null)}
-          onSuccess={() => setEditingTransaction(null)}
-        />
-      )}
-
-      {isExcelImportOpen && (
-        <ExcelImportModal
-          onClose={() => setIsExcelImportOpen(false)}
-          onSuccess={() => setIsExcelImportOpen(false)}
-        />
-      )}
-
-      {isItemsExcelImportOpen && (
-        <ImportItemsExcelModal
-          onClose={() => setIsItemsExcelImportOpen(false)}
-          onSuccess={() => setIsItemsExcelImportOpen(false)}
-        />
-      )}
-
-      {/* Real-time Central Cloud Sync Modal */}
-      <SyncStatusModal />
+      </nav>
     </div>
   );
-}
+};
 
 export default function App() {
   return (
-    <InventoryProvider>
-      <InventoryApp />
-    </InventoryProvider>
+    <AuthProvider>
+      <MainLayout />
+    </AuthProvider>
   );
 }
