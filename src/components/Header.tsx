@@ -55,6 +55,7 @@ export const Header: React.FC<HeaderProps> = ({
 
   const [isCreateMenuOpen, setIsCreateMenuOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [isManageMenuOpen, setIsManageMenuOpen] = useState(false);
 
   // Count items needing attention
   const alertCount = items.filter(
@@ -64,7 +65,8 @@ export const Header: React.FC<HeaderProps> = ({
   const isAdmin = currentUser?.role === 'ADMIN';
   const canManage = currentUser?.role === 'ADMIN' || currentUser?.role === 'THU_KHO';
 
-  const navItems: {
+  // Primary operational tabs (Directly visible on laptops and desktops)
+  const primaryNavItems: {
     id: ActiveTabType;
     label: string;
     icon: React.ReactNode;
@@ -80,18 +82,6 @@ export const Header: React.FC<HeaderProps> = ({
       id: 'inventory',
       label: 'Vật tư',
       icon: <Boxes className="w-3.5 h-3.5" />,
-    },
-    {
-      id: 'categories',
-      label: 'Danh mục',
-      icon: <FolderTree className="w-3.5 h-3.5" />,
-      badge: materialCategories.length > 0 ? materialCategories.length : undefined,
-      badgeColor: 'bg-slate-700 text-white',
-    },
-    {
-      id: 'warehouses',
-      label: 'Kho hàng',
-      icon: <Building2 className="w-3.5 h-3.5" />,
     },
     {
       id: 'receipts',
@@ -110,6 +100,28 @@ export const Header: React.FC<HeaderProps> = ({
       badge: alertCount > 0 ? alertCount : undefined,
       badgeColor: 'bg-rose-500 text-white',
     },
+  ];
+
+  // Secondary management tabs (Directly inline on wide screens >=1400px, grouped in "Quản lý ▾" on laptop screens)
+  const secondaryNavItems: {
+    id: ActiveTabType;
+    label: string;
+    icon: React.ReactNode;
+    badge?: number | string;
+    badgeColor?: string;
+  }[] = [
+    {
+      id: 'categories',
+      label: 'Danh mục',
+      icon: <FolderTree className="w-3.5 h-3.5" />,
+      badge: materialCategories.length > 0 ? materialCategories.length : undefined,
+      badgeColor: 'bg-slate-700 text-white',
+    },
+    {
+      id: 'warehouses',
+      label: 'Kho hàng',
+      icon: <Building2 className="w-3.5 h-3.5" />,
+    },
     {
       id: 'users',
       label: 'Người dùng',
@@ -119,35 +131,155 @@ export const Header: React.FC<HeaderProps> = ({
     },
   ];
 
+  // All nav items combined (for mobile drawer & sub-bar)
+  const navItems = [...primaryNavItems.slice(0, 2), secondaryNavItems[0], secondaryNavItems[1], ...primaryNavItems.slice(2), secondaryNavItems[2]];
+
+  const isSecondaryActive = secondaryNavItems.some(i => i.id === activeTab);
+  const activeSecondaryItem = secondaryNavItems.find(i => i.id === activeTab);
+
   return (
-    <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-md border-b border-slate-200 shadow-xs w-full">
+    <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-md border-b border-slate-200 shadow-xs w-full max-w-full overflow-x-clip">
       {/* Main Single-row Navigation Auto-fitting container */}
-      <div className="w-full px-3 sm:px-4 lg:px-6">
-        <div className="flex items-center justify-between h-14 sm:h-16 gap-2 sm:gap-3">
+      <div className="w-full max-w-[1600px] mx-auto px-2 sm:px-4 lg:px-5">
+        <div className="flex items-center justify-between h-14 sm:h-16 gap-1.5 sm:gap-2.5">
           {/* Brand - Compact & Always Fits */}
           <div
             onClick={() => setActiveTab('dashboard')}
-            className="flex items-center gap-2 cursor-pointer shrink-0"
+            className="flex items-center gap-1.5 sm:gap-2 cursor-pointer shrink-0"
           >
-            <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-lg bg-indigo-600 flex items-center justify-center text-white shadow-xs">
+            <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center text-white shadow-xs">
               <Boxes className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
-            <div className="flex items-baseline gap-1">
-              <span className="text-base sm:text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap">
+            <div className="flex items-baseline gap-0.5 sm:gap-1">
+              <span className="text-base font-bold tracking-tight text-slate-900 whitespace-nowrap">
                 KhoVatTu<span className="text-indigo-600">Pro</span>
               </span>
             </div>
           </div>
 
-          {/* Desktop Navigation Links (Visible on lg+ screens: 1024px and up) */}
-          <nav className="hidden lg:flex items-center justify-center gap-1 xl:gap-1.5 text-xs font-medium">
-            {navItems.map((item) => {
+          {/* Desktop & Laptop Responsive Navigation Links (Visible on lg+ screens >= 1024px) */}
+          <nav className="hidden lg:flex items-center justify-center gap-0.5 xl:gap-1 text-xs font-medium min-w-0">
+            {/* 1. Core Operational Tabs - Always Visible on Laptops & Desktops */}
+            {primaryNavItems.map((item) => {
               const isActive = activeTab === item.id;
               return (
                 <button
                   key={item.id}
                   onClick={() => setActiveTab(item.id)}
-                  className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg transition-colors whitespace-nowrap ${
+                  className={`flex items-center gap-1 px-2 xl:px-2.5 py-1.5 rounded-lg transition-colors whitespace-nowrap ${
+                    isActive
+                      ? 'bg-slate-900 text-white font-semibold shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                  }`}
+                >
+                  {item.icon}
+                  <span>{item.label}</span>
+                  {item.badge !== undefined && (
+                    <span
+                      className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold tabular-nums ${
+                        item.badgeColor || 'bg-slate-700 text-white'
+                      }`}
+                    >
+                      {item.badge}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+
+            {/* 2. Secondary Management Tabs: Inline on Wide Screens (>= 1400px / 2xl), Compact Dropdown on Laptop Screens (1024px - 1399px) */}
+            {/* 2a. Laptop Compact Dropdown: "Quản lý ▾" (hidden on 2xl where tabs are shown inline) */}
+            <div className="relative 2xl:hidden">
+              <button
+                type="button"
+                onClick={() => setIsManageMenuOpen(!isManageMenuOpen)}
+                className={`flex items-center gap-1 px-2 xl:px-2.5 py-1.5 rounded-lg transition-colors whitespace-nowrap ${
+                  isSecondaryActive
+                    ? 'bg-slate-900 text-white font-semibold shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                }`}
+                title="Các mục quản lý danh mục, kho hàng và người dùng"
+              >
+                {activeSecondaryItem ? (
+                  <>
+                    {activeSecondaryItem.icon}
+                    <span>{activeSecondaryItem.label}</span>
+                    {activeSecondaryItem.badge !== undefined && (
+                      <span
+                        className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold tabular-nums ${
+                          activeSecondaryItem.badgeColor || 'bg-slate-700 text-white'
+                        }`}
+                      >
+                        {activeSecondaryItem.badge}
+                      </span>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <FolderTree className="w-3.5 h-3.5" />
+                    <span>Quản lý</span>
+                  </>
+                )}
+                <ChevronDown className="w-3 h-3 opacity-70 ml-0.5" />
+              </button>
+
+              {isManageMenuOpen && (
+                <>
+                  <div
+                    className="fixed inset-0 z-40"
+                    onClick={() => setIsManageMenuOpen(false)}
+                  />
+                  <div className="absolute left-0 mt-1.5 w-52 bg-white border border-slate-200 rounded-xl shadow-xl z-50 py-1.5 text-xs animate-in zoom-in-95 duration-150">
+                    <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-3 py-1">
+                      Danh mục &amp; Quản trị
+                    </div>
+                    {secondaryNavItems.map((item) => {
+                      const isActive = activeTab === item.id;
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => {
+                            setActiveTab(item.id);
+                            setIsManageMenuOpen(false);
+                          }}
+                          className={`w-full text-left px-3.5 py-2 hover:bg-slate-50 flex items-center justify-between text-xs font-medium transition-colors ${
+                            isActive
+                              ? 'text-indigo-600 bg-indigo-50/70 font-semibold'
+                              : 'text-slate-700'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className={isActive ? 'text-indigo-600' : 'text-slate-500'}>
+                              {item.icon}
+                            </span>
+                            <span>{item.label}</span>
+                          </div>
+                          {item.badge !== undefined && (
+                            <span
+                              className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold tabular-nums ${
+                                item.badgeColor || 'bg-slate-700 text-white'
+                              }`}
+                            >
+                              {item.badge}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* 2b. Wide Screen Inline Tabs (visible only on >= 1400px / 2xl:flex) */}
+            {secondaryNavItems.map((item) => {
+              const isActive = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => setActiveTab(item.id)}
+                  className={`hidden 2xl:flex items-center gap-1 px-2.5 py-1.5 rounded-lg transition-colors whitespace-nowrap ${
                     isActive
                       ? 'bg-slate-900 text-white font-semibold shadow-xs'
                       : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
@@ -209,12 +341,12 @@ export const Header: React.FC<HeaderProps> = ({
               <Zap className="w-3 h-3 text-amber-500 fill-amber-400 shrink-0" />
               <span className="hidden sm:inline font-medium">
                 {realtimeConnectionState === 'CONNECTED'
-                  ? 'Realtime (0s)'
+                  ? 'Realtime'
                   : syncStatus === 'syncing'
-                  ? 'Syncing...'
-                  : 'Live Sync 5s'}
+                  ? 'Syncing'
+                  : 'Live 5s'}
               </span>
-              <span className="text-[10px] text-slate-400 hidden xl:inline">
+              <span className="text-[10px] text-slate-400 hidden 2xl:inline">
                 {lastSyncedAt
                   ? lastSyncedAt.toLocaleTimeString('vi-VN', {
                       hour: '2-digit',
