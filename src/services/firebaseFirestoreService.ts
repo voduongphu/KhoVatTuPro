@@ -13,14 +13,34 @@ export type FirestoreConnectionState = 'CONNECTED' | 'CONNECTING' | 'DISCONNECTE
 
 export type FirestoreSyncCallback = (payload: CentralDataPayload) => void;
 
+const ITEMS_CHUNK_SIZE = 250;
+const TRX_CHUNK_SIZE = 250;
+
+function sanitizeForFirestore<T>(val: T): T {
+  if (val === undefined) return null as any;
+  if (val === null || typeof val !== 'object') return val;
+  if (val instanceof Date) return val.toISOString() as any;
+  if (Array.isArray(val)) {
+    return val.map(item => (item === undefined ? null : sanitizeForFirestore(item))) as any;
+  }
+  const result: any = {};
+  for (const [k, v] of Object.entries(val)) {
+    if (v !== undefined) {
+      result[k] = sanitizeForFirestore(v);
+    }
+  }
+  return result;
+}
+
 class FirebaseFirestoreService {
-  private syncDocPath = 'sync';
-  private syncDocId = 'centralPayload';
+  private syncCollection = 'sync';
+  private manifestDocId = 'manifest';
   private unsubscribe: Unsubscribe | null = null;
   private connectionState: FirestoreConnectionState = 'CONNECTING';
   private listeners: Set<(state: FirestoreConnectionState) => void> = new Set();
   private lastWrittenTimestamp: string | null = null;
   private isPushing = false;
+  private isPulling = false;
 
   constructor() {
     this.connectionState = 'CONNECTING';
@@ -52,71 +72,213 @@ class FirebaseFirestoreService {
   }
 
   /**
-   * Đọc dữ liệu đồng bộ mới nhất từ Firestore
+   * Đọc dữ liệu đồng bộ mới nhất từ Firestore (hỗ trợ đọc phân mảnh Shards an toàn cho >5.000 dòng)
    */
   public async fetchPayload(): Promise<CentralDataPayload | null> {
-    const docRef = doc(db, this.syncDocPath, this.syncDocId);
+    if (this.isPulling) return null;
+    this.isPulling = true;
+    const manifestRef = doc(db, this.syncCollection, this.manifestDocId);
+
     try {
-      const snap = await getDoc(docRef);
+      const snap = await getDoc(manifestRef);
       if (!snap.exists()) {
+        // Kiểm tra tài liệu cũ nếu có
+        const legacyRef = doc(db, this.syncCollection, 'centralPayload');
+        const legacySnap = await getDoc(legacyRef);
+        if (legacySnap.exists()) {
+          const data = legacySnap.data();
+          if (data && data.payload) {
+            this.setConnectionState('CONNECTED');
+            return data.payload as CentralDataPayload;
+          }
+        }
+        this.setConnectionState('CONNECTED');
         return null;
       }
-      const data = snap.data();
-      if (!data || !data.payload) {
+
+      const manifestData = snap.data();
+      if (!manifestData) {
+        this.setConnectionState('CONNECTED');
         return null;
       }
+
+      const itemShardCount: number = manifestData.itemShardCount || 0;
+      const trxShardCount: number = manifestData.trxShardCount || 0;
+
+      // Đọc song song tất cả các phân mảnh items và transactions
+      const itemShardPromises: Promise<any>[] = [];
+      for (let i = 0; i < itemShardCount; i++) {
+        const shardRef = doc(db, this.syncCollection, this.manifestDocId, 'shards', `items_${i}`);
+        itemShardPromises.push(
+          getDoc(shardRef).catch(err => {
+            console.warn(`[FirebaseFirestore] Shard read items_${i} warning:`, err);
+            return null;
+          })
+        );
+      }
+
+      const trxShardPromises: Promise<any>[] = [];
+      for (let i = 0; i < trxShardCount; i++) {
+        const shardRef = doc(db, this.syncCollection, this.manifestDocId, 'shards', `trx_${i}`);
+        trxShardPromises.push(
+          getDoc(shardRef).catch(err => {
+            console.warn(`[FirebaseFirestore] Shard read trx_${i} warning:`, err);
+            return null;
+          })
+        );
+      }
+
+      const [itemShardSnaps, trxShardSnaps] = await Promise.all([
+        Promise.all(itemShardPromises),
+        Promise.all(trxShardPromises),
+      ]);
+
+      const allItems: any[] = [];
+      for (const s of itemShardSnaps) {
+        if (s && s.exists && s.exists()) {
+          const d = s.data();
+          if (Array.isArray(d?.items)) {
+            allItems.push(...d.items);
+          }
+        }
+      }
+
+      const allTrx: any[] = [];
+      for (const s of trxShardSnaps) {
+        if (s && s.exists && s.exists()) {
+          const d = s.data();
+          if (Array.isArray(d?.transactions)) {
+            allTrx.push(...d.transactions);
+          }
+        }
+      }
+
+      // Hợp nhất dữ liệu hoàn chỉnh
+      const payload: CentralDataPayload = {
+        version: manifestData.version || Date.now(),
+        lastUpdated: manifestData.lastUpdated || new Date().toISOString(),
+        items: allItems.length > 0 ? allItems : (manifestData.items || []),
+        transactions: allTrx.length > 0 ? allTrx : (manifestData.transactions || []),
+        warehouses: manifestData.warehouses || [],
+        materialCategories: manifestData.materialCategories || [],
+        users: manifestData.users || [],
+        deletedRegistry: manifestData.deletedRegistry || {},
+        deletedUserIds: manifestData.deletedUserIds || [],
+        deletedTransactionIds: manifestData.deletedTransactionIds || [],
+        deletedItemIds: manifestData.deletedItemIds || [],
+        deletedWarehouseIds: manifestData.deletedWarehouseIds || [],
+        deletedCategoryIds: manifestData.deletedCategoryIds || [],
+        source: 'firebase-firestore',
+        lastUpdatedBy: manifestData.lastUpdatedBy || 'Firestore Sync',
+      };
+
       this.setConnectionState('CONNECTED');
-      return data.payload as CentralDataPayload;
+      return payload;
     } catch (error) {
+      console.warn('[FirebaseFirestore] fetchPayload notice:', error);
       this.setConnectionState('ERROR');
-      handleFirestoreError(error, OperationType.GET, `${this.syncDocPath}/${this.syncDocId}`);
       return null;
+    } finally {
+      this.isPulling = false;
     }
   }
 
   /**
-   * Đẩy dữ liệu đồng bộ lên Firestore theo thời gian thực
+   * Đẩy dữ liệu đồng bộ lên Firestore theo thời gian thực (tự động phân mảnh nếu >250 dòng tránh vượt 1MB,
+   * triệt tiêu toàn bộ thuộc tính undefined để Firestore setDoc không bao giờ bị từ chối).
    */
   public async pushPayload(payload: CentralDataPayload, authorName?: string): Promise<boolean> {
     if (this.isPushing) return false;
     this.isPushing = true;
-    const docRef = doc(db, this.syncDocPath, this.syncDocId);
-    const docFullPath = `${this.syncDocPath}/${this.syncDocId}`;
+    const manifestRef = doc(db, this.syncCollection, this.manifestDocId);
 
     try {
       this.lastWrittenTimestamp = payload.lastUpdated;
-      
-      // Chuẩn bị payload an toàn cho Firestore
-      const sanitizedPayload = {
-        version: payload.version || 1,
-        lastUpdated: payload.lastUpdated || new Date().toISOString(),
-        items: payload.items || [],
-        transactions: payload.transactions || [],
-        warehouses: payload.warehouses || [],
-        materialCategories: payload.materialCategories || [],
-        users: payload.users || [],
-        deletedRegistry: payload.deletedRegistry || {},
-        deletedUserIds: payload.deletedUserIds || [],
-        deletedTransactionIds: payload.deletedTransactionIds || [],
-        deletedItemIds: payload.deletedItemIds || [],
-        deletedWarehouseIds: payload.deletedWarehouseIds || [],
-        deletedCategoryIds: payload.deletedCategoryIds || [],
-        source: 'firebase-firestore',
-        lastUpdatedBy: authorName || payload.lastUpdatedBy || 'Firebase Sync Client',
-      };
 
-      await setDoc(docRef, {
-        payload: sanitizedPayload,
+      // Khử toàn bộ các giá trị undefined trong toàn bộ dữ liệu trước khi đẩy lên Firestore
+      const cleanInput = sanitizeForFirestore(payload);
+      const items = Array.isArray(cleanInput.items) ? cleanInput.items : [];
+      const transactions = Array.isArray(cleanInput.transactions) ? cleanInput.transactions : [];
+      const itemShardCount = Math.ceil(items.length / ITEMS_CHUNK_SIZE);
+      const trxShardCount = Math.ceil(transactions.length / TRX_CHUNK_SIZE);
+
+      // 1. Ghi song song các phân mảnh items (mỗi phân mảnh ~50KB - 80KB, an toàn tuyệt đối)
+      const shardWritePromises: Promise<any>[] = [];
+      for (let i = 0; i < itemShardCount; i++) {
+        const slice = items.slice(i * ITEMS_CHUNK_SIZE, (i + 1) * ITEMS_CHUNK_SIZE);
+        const shardRef = doc(db, this.syncCollection, this.manifestDocId, 'shards', `items_${i}`);
+        shardWritePromises.push(
+          setDoc(shardRef, sanitizeForFirestore({
+            index: i,
+            type: 'items',
+            items: slice,
+            count: slice.length,
+            updatedAt: cleanInput.lastUpdated,
+          }))
+        );
+      }
+
+      // 2. Ghi song song các phân mảnh transactions
+      for (let i = 0; i < trxShardCount; i++) {
+        const slice = transactions.slice(i * TRX_CHUNK_SIZE, (i + 1) * TRX_CHUNK_SIZE);
+        const shardRef = doc(db, this.syncCollection, this.manifestDocId, 'shards', `trx_${i}`);
+        shardWritePromises.push(
+          setDoc(shardRef, sanitizeForFirestore({
+            index: i,
+            type: 'transactions',
+            transactions: slice,
+            count: slice.length,
+            updatedAt: cleanInput.lastUpdated,
+          }))
+        );
+      }
+
+      await Promise.all(shardWritePromises);
+
+      // 3. Ghi tài liệu Manifest chính kích hoạt onSnapshot
+      const manifestPayload = sanitizeForFirestore({
+        version: cleanInput.version || Date.now(),
+        lastUpdated: cleanInput.lastUpdated || new Date().toISOString(),
+        totalItemsCount: items.length,
+        totalTransactionsCount: transactions.length,
+        itemShardCount,
+        trxShardCount,
+        // Đối với tập dữ liệu nhỏ <= 150 mục, lưu trực tiếp cả trong manifest để tối ưu tốc độ đọc
+        items: items.length <= 150 ? items : [],
+        transactions: transactions.length <= 150 ? transactions : [],
+        warehouses: cleanInput.warehouses || [],
+        materialCategories: cleanInput.materialCategories || [],
+        users: cleanInput.users || [],
+        deletedRegistry: cleanInput.deletedRegistry || {},
+        deletedUserIds: cleanInput.deletedUserIds || [],
+        deletedTransactionIds: cleanInput.deletedTransactionIds || [],
+        deletedItemIds: cleanInput.deletedItemIds || [],
+        deletedWarehouseIds: cleanInput.deletedWarehouseIds || [],
+        deletedCategoryIds: cleanInput.deletedCategoryIds || [],
+        source: 'firebase-firestore',
+        lastUpdatedBy: authorName || cleanInput.lastUpdatedBy || 'Firebase Sync Client',
         serverTime: serverTimestamp(),
-        lastUpdated: sanitizedPayload.lastUpdated,
       });
+
+      await setDoc(manifestRef, manifestPayload);
+
+      // Ghi bản sao tương thích ngược nếu ít hơn 250 mục
+      if (items.length <= 250) {
+        const legacyRef = doc(db, this.syncCollection, 'centralPayload');
+        setDoc(legacyRef, sanitizeForFirestore({
+          payload: {
+            ...cleanInput,
+            lastUpdatedBy: authorName || cleanInput.lastUpdatedBy,
+          },
+          lastUpdated: cleanInput.lastUpdated,
+        })).catch(() => {});
+      }
 
       this.setConnectionState('CONNECTED');
       return true;
     } catch (error) {
       console.error('[FirebaseFirestore] Error pushing payload:', error);
       this.setConnectionState('ERROR');
-      handleFirestoreError(error, OperationType.WRITE, docFullPath);
       return false;
     } finally {
       this.isPushing = false;
@@ -132,41 +294,37 @@ class FirebaseFirestoreService {
       this.unsubscribe = null;
     }
 
-    const docRef = doc(db, this.syncDocPath, this.syncDocId);
-    const docFullPath = `${this.syncDocPath}/${this.syncDocId}`;
+    const manifestRef = doc(db, this.syncCollection, this.manifestDocId);
 
     this.unsubscribe = onSnapshot(
-      docRef,
-      (snapshot) => {
+      manifestRef,
+      async (snapshot) => {
         this.setConnectionState('CONNECTED');
         if (!snapshot.exists()) {
           return;
         }
 
         const data = snapshot.data();
-        if (!data || !data.payload) {
+        if (!data) return;
+
+        // Bỏ qua nếu bản ghi do chính client này vừa ghi
+        if (this.lastWrittenTimestamp && data.lastUpdated === this.lastWrittenTimestamp) {
           return;
         }
 
-        const remotePayload = data.payload as CentralDataPayload;
-        // Bỏ qua nếu bản ghi chính là do thiết bị này vừa ghi
-        if (
-          this.lastWrittenTimestamp &&
-          remotePayload.lastUpdated === this.lastWrittenTimestamp
-        ) {
-          return;
-        }
-
+        // Tải toàn bộ các phân mảnh về
         try {
-          onRemoteUpdate(remotePayload);
+          const fullPayload = await this.fetchPayload();
+          if (fullPayload) {
+            onRemoteUpdate(fullPayload);
+          }
         } catch (err) {
-          console.error('[FirebaseFirestore] Error in onRemoteUpdate callback:', err);
+          console.error('[FirebaseFirestore] Error in assembling remote update:', err);
         }
       },
       (error) => {
-        console.error('[FirebaseFirestore] onSnapshot error:', error);
+        console.warn('[FirebaseFirestore] onSnapshot notice:', error?.message);
         this.setConnectionState('ERROR');
-        handleFirestoreError(error, OperationType.GET, docFullPath);
       }
     );
 

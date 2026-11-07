@@ -23,8 +23,7 @@ import {
   calculateItemWarehouseStocks,
   getStockStatus,
 } from '../utils/formatters';
-import { SyncStatus, CloudProvider, CentralDataPayload, centralSyncService } from '../services/centralSyncService';
-import { supabaseRealtimeService, RealtimeConnectionState } from '../services/supabaseRealtimeService';
+import { SyncStatus, CloudProvider, CentralDataPayload } from '../services/centralSyncService';
 import { firebaseFirestoreService, FirestoreConnectionState } from '../services/firebaseFirestoreService';
 import { DeviceInfo, getDeviceId, getDeviceInfo, getDeviceName } from '../utils/deviceHelper';
 import { sessionBus } from '../services/sessionBus';
@@ -154,7 +153,7 @@ interface InventoryContextType {
   getItemLedger: (itemId: string) => StockLedgerEntry[];
   resetToDefaultData: () => void;
 
-  // Central Cloud Synchronization (Server SSE / Vercel KV / Supabase)
+  // Firebase Firestore Realtime Cloud Synchronization
   syncStatus: SyncStatus;
   lastSyncedAt: Date | null;
   autoSyncEnabled: boolean;
@@ -164,17 +163,10 @@ interface InventoryContextType {
   isSyncModalOpen: boolean;
   setIsSyncModalOpen: (open: boolean) => void;
 
-  // Supabase Realtime WebSocket Connection & Google AI Sync
-  realtimeConnectionState: RealtimeConnectionState;
-  lastRealtimeUpdateMessage: string | null;
-  clearRealtimeMessage: () => void;
-  simulateGoogleAIUpdate: () => Promise<{ success: boolean; message: string }>;
-  saveSupabaseCredentials: (url: string, key: string) => boolean;
-  supabaseCredentials: { url: string; key: string };
-
   // Firebase Firestore Realtime Storage & Synchronization
   firestoreConnectionState: FirestoreConnectionState;
   syncWithFirestore: () => Promise<{ success: boolean; error?: string }>;
+  pullFromFirestore: () => Promise<{ success: boolean; count?: number; error?: string }>;
 }
 
 const defaultCriteria: MultiFilterCriteria = {
@@ -617,26 +609,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('synced');
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(new Date());
   const [autoSyncEnabled, setAutoSyncEnabled] = useState<boolean>(true);
-  const [syncProvider, setSyncProvider] = useState<CloudProvider>(() => {
-    if (supabaseRealtimeService.isConfigured()) return 'supabase';
-    return centralSyncService.getProvider();
-  });
+  const [syncProvider, setSyncProvider] = useState<CloudProvider>('firestore');
   const [isSyncModalOpen, setIsSyncModalOpen] = useState<boolean>(false);
   const [lastServerTimestamp, setLastServerTimestamp] = useState<string>('');
 
-  // Supabase Realtime state
-  const [realtimeConnectionState, setRealtimeConnectionState] = useState<RealtimeConnectionState>(() =>
-    supabaseRealtimeService.getConnectionState()
-  );
+  // Firebase Firestore Realtime Connection State
   const [firestoreConnectionState, setFirestoreConnectionState] = useState<FirestoreConnectionState>(() =>
     firebaseFirestoreService.getConnectionState()
   );
-  const [lastRealtimeUpdateMessage, setLastRealtimeUpdateMessage] = useState<string | null>(null);
-  const [supabaseCredentials, setSupabaseCredentials] = useState<{ url: string; key: string }>(() =>
-    supabaseRealtimeService.getCredentials()
-  );
-
-  const clearRealtimeMessage = useCallback(() => setLastRealtimeUpdateMessage(null), []);
 
   const pendingSnapshotRef = useRef<{
     warehouses: Warehouse[];
@@ -733,25 +713,6 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const applyRemotePayloadAdditive = useCallback(
     (payload: CentralDataPayload) => {
       if (!payload) return;
-
-      // Auto-propagate shared Supabase credentials across users/browsers if configured by Admin
-      if (payload.supabaseConfig?.url && payload.supabaseConfig?.key) {
-        const currentCreds = supabaseRealtimeService.getCredentials();
-        if (
-          currentCreds.url !== payload.supabaseConfig.url ||
-          currentCreds.key !== payload.supabaseConfig.key
-        ) {
-          supabaseRealtimeService.setCredentials(
-            payload.supabaseConfig.url,
-            payload.supabaseConfig.key
-          );
-          setSupabaseCredentials({
-            url: payload.supabaseConfig.url,
-            key: payload.supabaseConfig.key,
-          });
-          setSyncProvider('supabase');
-        }
-      }
 
       if (payload.cleanReset) {
         const cleanSnapshot = {
@@ -869,7 +830,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const v2MigrationTriggeredRef = useRef(false);
 
   /**
-   * Direct push helper for instant authoritative multi-user broadcast + immediate response reconciliation
+   * Đẩy dữ liệu lên Firebase Firestore thời gian thực và cập nhật đồng bộ snapshot cục bộ
    */
   const pushCloudSyncImmediately = useCallback(
     async (
@@ -879,19 +840,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       newUsers: User[],
       customDeletedRegistry?: DeletedRegistry,
       source = 'web-client',
-      extraSupabaseConfig?: { url: string; key: string },
+      _unusedConfig?: any,
       customCategories?: MaterialCategory[]
     ) => {
       const regToPush = customDeletedRegistry || stateRef.current.deletedRegistry;
       const catsToPush = customCategories || stateRef.current.materialCategories;
       const legacyArrays = extractLegacyDeletedArrays(regToPush);
-      const activeCreds = extraSupabaseConfig || supabaseRealtimeService.getCredentials();
-      const supabaseConfig =
-        activeCreds.url && activeCreds.key
-          ? { url: activeCreds.url, key: activeCreds.key }
-          : undefined;
 
-      // Update stateRef & localStorage synchronously first so local UI and concurrent reads see new state immediately
+      // 1. Cập nhật ngay lập tức stateRef & localStorage để giao diện phản hồi 0ms
       const immediateSnapshot = {
         warehouses: newWarehouses,
         materialCategories: catsToPush,
@@ -917,75 +873,36 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         users: newUsers,
         deletedRegistry: regToPush,
         ...legacyArrays,
-        supabaseConfig,
         clientId: clientIdRef.current,
         source,
+        lastUpdatedBy: currentUser?.fullName || 'Người dùng',
       };
 
-      const clientManagesSupabase = supabaseRealtimeService.isConfigured();
-      let mergedFromServer: CentralDataPayload | null = null;
-
       try {
-        const res = await centralSyncService.pushUpdate(
-          {
-            items: newItems,
-            transactions: newTransactions,
-            warehouses: newWarehouses,
-            materialCategories: catsToPush,
-            users: newUsers,
-            deletedRegistry: regToPush,
-            ...legacyArrays,
-            supabaseConfig,
-            clientId: clientIdRef.current,
-            source,
-          },
-          { skipRemoteCloudSave: clientManagesSupabase }
+        const ok = await firebaseFirestoreService.pushPayload(
+          outboundPayload,
+          currentUser?.fullName || 'Người dùng'
         );
-        if (res.success && res.payload) {
-          mergedFromServer = res.payload;
-          setSyncProvider(res.provider);
+        if (ok) {
+          setSyncStatus('synced');
+          setLastSyncedAt(new Date());
+          setSyncProvider('firestore');
+        } else {
+          setSyncStatus('error');
         }
-      } catch (err) {
-        console.warn('Immediate centralSync push failed:', err);
-      }
-
-      try {
-        if (clientManagesSupabase) {
-          const supaMerged = await supabaseRealtimeService.pushState(
-            mergedFromServer || outboundPayload
-          );
-          if (supaMerged) {
-            mergedFromServer = supaMerged;
-            v2MigrationTriggeredRef.current = true;
-            setSyncProvider('supabase');
-          }
-        }
-      } catch (err) {
-        console.warn('Immediate supabase push failed:', err);
+      } catch (fErr) {
+        console.warn('Firebase Firestore push failed:', fErr);
+        setSyncStatus('error');
       } finally {
         isPushingRef.current = false;
       }
-
-      // Đồng bộ dữ liệu hai chiều tự động lên Firebase Firestore
-      try {
-        await firebaseFirestoreService.pushPayload(
-          mergedFromServer || outboundPayload,
-          currentUser?.fullName || 'Người dùng'
-        );
-      } catch (fErr) {
-        console.warn('Firebase Firestore push failed:', fErr);
-      }
-
-      if (mergedFromServer) {
-        applyRemotePayloadAdditive(mergedFromServer);
-      } else {
-        setSyncStatus('synced');
-        setLastSyncedAt(new Date());
-      }
     },
-    [applyRemotePayloadAdditive, currentUser, persistSnapshotToLocalStorage]
+    [currentUser, persistSnapshotToLocalStorage]
   );
 
+  /**
+   * Đồng bộ thủ công dữ liệu cục bộ trên thiết bị lên Firebase Firestore
+   */
   const syncWithFirestore = useCallback(async (): Promise<{ success: boolean; error?: string }> => {
     setSyncStatus('syncing');
     try {
@@ -1008,118 +925,83 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       if (ok) {
         setSyncStatus('synced');
         setLastSyncedAt(new Date());
+        setSyncProvider('firestore');
         return { success: true };
       }
-      return { success: false, error: 'Không thể kết nối hoặc ghi dữ liệu lên Firestore' };
+      setSyncStatus('error');
+      return { success: false, error: 'Không thể kết nối hoặc lưu dữ liệu lên Firestore' };
     } catch (e: any) {
       setSyncStatus('error');
       return { success: false, error: e?.message || String(e) };
     }
   }, [currentUser]);
 
-  const saveSupabaseCredentials = useCallback(
-    (url: string, key: string) => {
-      v2MigrationTriggeredRef.current = false;
-      const configured = supabaseRealtimeService.setCredentials(url, key);
-      setSupabaseCredentials({ url, key });
-      if (configured) {
-        setSyncProvider('supabase');
-        const hasLargeLocalState = stateRef.current.items.length > 120;
-        supabaseRealtimeService
-          .fetchLatest({ skipLegacyFallback: hasLargeLocalState })
-          .then(remoteData => {
-            if (remoteData) {
-              applyRemotePayloadAdditive(remoteData);
-            }
-            // Share Supabase credentials to central server & persist Sharded V2 state
-            const cur = stateRef.current;
-            pushCloudSyncImmediately(
-              cur.items,
-              cur.transactions,
-              cur.warehouses,
-              cur.users,
-              cur.deletedRegistry,
-              'supabase-config-share',
-              { url: url.trim(), key: key.trim() }
-            );
-          });
+  /**
+   * Tải dữ liệu mới nhất từ Firebase Firestore về thiết bị
+   */
+  const pullFromFirestore = useCallback(async (): Promise<{ success: boolean; count?: number; error?: string }> => {
+    setSyncStatus('syncing');
+    try {
+      const remotePayload = await firebaseFirestoreService.fetchPayload();
+      if (remotePayload) {
+        applyRemotePayloadAdditive(remotePayload);
+        setSyncStatus('synced');
+        setLastSyncedAt(new Date());
+        return { success: true, count: remotePayload.items?.length || 0 };
       }
-      return configured;
-    },
-    [applyRemotePayloadAdditive, pushCloudSyncImmediately]
-  );
-
-  // 1. Subscribe to Central Server SSE Real-Time Stream (/api/sync/stream) for <50ms multi-user updates
-  useEffect(() => {
-    const unsubscribeStream = centralSyncService.subscribeToStream(payload => {
-      if (!payload) return;
-      applyRemotePayloadAdditive(payload);
-    });
-    return () => {
-      unsubscribeStream();
-    };
+      setSyncStatus('synced');
+      return { success: false, error: 'Chưa có bản ghi nào trên Firestore để tải về' };
+    } catch (err: any) {
+      setSyncStatus('error');
+      return { success: false, error: err?.message || String(err) };
+    }
   }, [applyRemotePayloadAdditive]);
 
-  // 2. Listen to Supabase Realtime WebSocket events (when configured)
-  useEffect(() => {
-    supabaseRealtimeService.subscribe(payload => {
-      if (!payload) return;
-      applyRemotePayloadAdditive(payload);
-
-      const isAI = payload.source === 'google-ai';
-      const msg = isAI
-        ? `⚡ Số liệu mới từ Google AI vừa được cập nhật tức thì (Supabase Realtime)!`
-        : `⚡ Dữ liệu vừa được hợp nhất tự động qua Supabase Realtime WebSocket!`;
-      setLastRealtimeUpdateMessage(msg);
-
-      setTimeout(() => {
-        setLastRealtimeUpdateMessage(prev => (prev === msg ? null : prev));
-      }, 6000);
-    });
-
-    const unsubscribeStatus = supabaseRealtimeService.onConnectionStateChange(state => {
-      setRealtimeConnectionState(state);
-      if (state === 'CONNECTED') {
-        setSyncProvider('supabase');
-      }
-    });
-
-    return () => {
-      unsubscribeStatus();
-    };
-  }, [applyRemotePayloadAdditive]);
-
-  // 3. Listen to Firebase Firestore Realtime WebSocket events (onSnapshot)
+  // Kết nối và đồng bộ thời gian thực với Firebase Firestore (onSnapshot WebSocket 0s delay)
+  // Tự động tải dữ liệu cục bộ lên đám mây Firestore ngay khi ứng dụng khởi chạy nếu đám mây còn trống
   useEffect(() => {
     const unsubscribeFirestore = firebaseFirestoreService.subscribeToChanges(payload => {
       if (!payload) return;
       applyRemotePayloadAdditive(payload);
       setSyncProvider('firestore');
-
-      const msg = `⚡ Dữ liệu vừa được đồng bộ tự động theo thời gian thực qua Firebase Firestore!`;
-      setLastRealtimeUpdateMessage(msg);
-
-      setTimeout(() => {
-        setLastRealtimeUpdateMessage(prev => (prev === msg ? null : prev));
-      }, 6000);
+      setLastSyncedAt(new Date());
+      setSyncStatus('synced');
     });
 
     const unsubscribeFirestoreStatus = firebaseFirestoreService.onConnectionStateChange(state => {
       setFirestoreConnectionState(state);
     });
 
-    // On mount, also check for remote state from Firestore
-    firebaseFirestoreService.fetchPayload().then(remotePayload => {
-      if (remotePayload) {
+    // Khi khởi động ứng dụng: đọc dữ liệu từ Firestore hoặc đồng bộ dữ liệu cục bộ lên
+    firebaseFirestoreService.fetchPayload().then(async remotePayload => {
+      const snap = stateRef.current;
+      const localHasData = (snap.items && snap.items.length > 0) || (snap.warehouses && snap.warehouses.length > 0);
+      const remoteHasData = remotePayload && ((remotePayload.items && remotePayload.items.length > 0) || (remotePayload.version && remotePayload.version > 0));
+
+      if (remoteHasData && remotePayload) {
+        // Có dữ liệu đám mây: hợp nhất dữ liệu hai chiều
         applyRemotePayloadAdditive(remotePayload);
+        // Nếu thiết bị cục bộ có nhiều vật tư hơn dữ liệu đám mây (ví dụ mới nhập offline), đẩy bổ sung lên
+        if (snap.items.length > (remotePayload.items?.length || 0)) {
+          setTimeout(() => {
+            syncWithFirestore();
+          }, 800);
+        }
+      } else if (localHasData) {
+        // Đám mây Firestore vừa khởi tạo (trống), trong khi thiết bị cục bộ đã có dữ liệu:
+        // Tự động kết nối và đồng bộ toàn bộ dữ liệu cục bộ lên Firestore ngay lập tức!
+        console.log('[Firestore] Tự động đồng bộ dữ liệu cục bộ trên thiết bị lên Firestore...');
+        await syncWithFirestore();
       }
-    }).catch(() => {});
+    }).catch(err => {
+      console.warn('Khởi tạo Firestore ban đầu:', err);
+    });
 
     return () => {
       unsubscribeFirestore();
       unsubscribeFirestoreStatus();
     };
-  }, [applyRemotePayloadAdditive]);
+  }, [applyRemotePayloadAdditive, syncWithFirestore]);
 
   // Active session monitor: Terminate session if another device logs in with this user account
   useEffect(() => {
@@ -1176,261 +1058,10 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return () => unsubscribe();
   }, [currentUser]);
 
-  const lastServerTimestampRef = useRef<string>('');
-  lastServerTimestampRef.current = lastServerTimestamp;
-
-  // Explicit manual sync (forces full payload download & shows syncing indicator)
+  // Kích hoạt đồng bộ thủ công với Firebase Firestore
   const triggerManualSync = useCallback(async () => {
-    setSyncStatus('syncing');
-    try {
-      let anySuccess = false;
-
-      const centralRes = await centralSyncService.fetchLatestData(
-        lastServerTimestampRef.current,
-        true
-      );
-      if (centralRes.success) {
-        anySuccess = true;
-        setSyncProvider(prev => (prev === centralRes.provider ? prev : centralRes.provider));
-        if (centralRes.payload) {
-          applyRemotePayloadAdditive(centralRes.payload);
-        }
-      }
-
-      if (supabaseRealtimeService.isConfigured()) {
-        const hasLocalRecords =
-          stateRef.current.items.length > 120 || stateRef.current.transactions.length > 80;
-        const directPayload = await supabaseRealtimeService.fetchLatest({
-          onlyIfChanged: false,
-          skipLegacyFallback: hasLocalRecords,
-        });
-        if (directPayload) {
-          anySuccess = true;
-          applyRemotePayloadAdditive(directPayload);
-          setSyncProvider('supabase');
-        } else if (supabaseRealtimeService.needsV2Migration() && stateRef.current.items.length > 0) {
-          const cur = stateRef.current;
-          const legacy = extractLegacyDeletedArrays(cur.deletedRegistry);
-          const migrated = await supabaseRealtimeService.pushState({
-            version: Math.max(1, centralSyncService.getCurrentVersion()) + 1,
-            lastUpdated: new Date().toISOString(),
-            items: cur.items,
-            transactions: cur.transactions,
-            warehouses: cur.warehouses,
-            materialCategories: cur.materialCategories,
-            users: cur.users,
-            deletedRegistry: cur.deletedRegistry,
-            ...legacy,
-            clientId: clientIdRef.current,
-            source: 'auto-migrate-v2',
-          });
-          if (migrated) {
-            anySuccess = true;
-            v2MigrationTriggeredRef.current = true;
-            setSyncProvider('supabase');
-          }
-        }
-      }
-
-      if (anySuccess) {
-        setSyncStatus('synced');
-        setLastSyncedAt(new Date());
-      } else {
-        setSyncStatus(centralRes.error ? 'error' : 'offline');
-      }
-    } catch {
-      setSyncStatus('offline');
-    }
-  }, [applyRemotePayloadAdditive]);
-
-  // Silent background polling (uses sinceVersion + lightweight manifest_v2 check so 5,000+ rows are never re-downloaded when unchanged)
-  const pollBackgroundSync = useCallback(async () => {
-    if (isPollingRef.current || isPushingRef.current) return;
-    isPollingRef.current = true;
-
-    try {
-      let anySuccess = false;
-
-      const centralRes = await centralSyncService.fetchLatestData(
-        lastServerTimestampRef.current,
-        false
-      );
-      if (centralRes.success) {
-        anySuccess = true;
-        setSyncProvider(prev => (prev === centralRes.provider ? prev : centralRes.provider));
-        if (!centralRes.notModified && centralRes.payload) {
-          applyRemotePayloadAdditive(centralRes.payload);
-        }
-      }
-
-      if (supabaseRealtimeService.isConfigured() && !isPushingRef.current) {
-        const hasLocalRecords =
-          stateRef.current.items.length > 0 || stateRef.current.transactions.length > 0;
-        const directPayload = await supabaseRealtimeService.fetchLatestIfChanged({
-          skipLegacyFallback: hasLocalRecords,
-        });
-
-        if (directPayload) {
-          anySuccess = true;
-          if (directPayload.lastUpdated !== lastServerTimestampRef.current) {
-            applyRemotePayloadAdditive(directPayload);
-          }
-          setSyncProvider(prev => (prev === 'supabase' ? prev : 'supabase'));
-        } else if (supabaseRealtimeService.getConnectionState() === 'CONNECTED') {
-          anySuccess = true;
-        }
-
-        // One-time background migration of existing local dataset into Sharded V2 on Supabase
-        if (
-          !v2MigrationTriggeredRef.current &&
-          supabaseRealtimeService.needsV2Migration() &&
-          hasLocalRecords &&
-          !isPushingRef.current
-        ) {
-          v2MigrationTriggeredRef.current = true;
-          const cur = stateRef.current;
-          const legacy = extractLegacyDeletedArrays(cur.deletedRegistry);
-          supabaseRealtimeService
-            .pushState({
-              version: Math.max(1, centralSyncService.getCurrentVersion()) + 1,
-              lastUpdated: new Date().toISOString(),
-              items: cur.items,
-              transactions: cur.transactions,
-              warehouses: cur.warehouses,
-              materialCategories: cur.materialCategories,
-              users: cur.users,
-              deletedRegistry: cur.deletedRegistry,
-              ...legacy,
-              clientId: clientIdRef.current,
-              source: 'background-migrate-sharded-v2',
-            })
-            .then(migrated => {
-              if (migrated) {
-                setSyncProvider(prev => (prev === 'supabase' ? prev : 'supabase'));
-              } else {
-                v2MigrationTriggeredRef.current = false;
-              }
-            })
-            .catch(() => {
-              v2MigrationTriggeredRef.current = false;
-            });
-        }
-      }
-
-      if (anySuccess) {
-        setSyncStatus(prev => (prev === 'synced' ? prev : 'synced'));
-      } else {
-        const nextErr: SyncStatus = centralRes.error ? 'error' : 'offline';
-        setSyncStatus(prev => (prev === nextErr ? prev : nextErr));
-      }
-    } catch {
-      setSyncStatus(prev => (prev === 'offline' ? prev : 'offline'));
-    } finally {
-      isPollingRef.current = false;
-    }
-  }, [applyRemotePayloadAdditive]);
-
-  // Automatic 4-second polling as resilient fallback alongside SSE + WebSocket
-  useEffect(() => {
-    if (!autoSyncEnabled) return;
-
-    pollBackgroundSync();
-
-    const intervalId = setInterval(() => {
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
-        return;
-      }
-      pollBackgroundSync();
-    }, 4000);
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        pollBackgroundSync();
-      }
-    };
-    const handleWindowFocus = () => {
-      pollBackgroundSync();
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('focus', handleWindowFocus);
-
-    return () => {
-      clearInterval(intervalId);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('focus', handleWindowFocus);
-    };
-  }, [autoSyncEnabled, pollBackgroundSync]);
-
-  // Simulate Google AI generating new inventory numbers & broadcast instantly
-  const simulateGoogleAIUpdate = useCallback(async (): Promise<{ success: boolean; message: string }> => {
-    const cur = stateRef.current;
-    if (cur.items.length === 0) {
-      return { success: false, message: 'Chưa có danh mục vật tư để tạo số liệu AI' };
-    }
-
-    const targetIdx = Math.floor(Math.random() * cur.items.length);
-    const targetItem = cur.items[targetIdx];
-    const targetWarehouse = cur.warehouses[0] || INITIAL_WAREHOUSES[0];
-
-    const adjustmentQty = Math.floor(Math.random() * 25) + 5;
-    const nowIso = new Date().toISOString();
-
-    const aiCode = `AI-NHAP-${Date.now().toString().slice(-4)}`;
-    const lineAmount = adjustmentQty * (targetItem.unitPrice || 150000);
-    const newTx: Transaction = {
-      id: `TRX-AI-${Date.now()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
-      code: aiCode,
-      type: 'NHAP_KHO',
-      subtype: 'NHAP_DIEU_CHINH',
-      date: nowIso.replace('T', ' ').substring(0, 16),
-      warehouseId: targetItem.warehouseId || targetWarehouse.id,
-      partnerName: 'Google AI Optimization Engine',
-      departmentOrProject: 'Bộ Phận Dự Đoán Tự Động',
-      creatorName: 'Google AI Gemini',
-      notes: `[Google AI Auto-Analysis] Bổ sung +${adjustmentQty} ${targetItem.unit} cho vật tư "${targetItem.name}"`,
-      status: 'HOAN_THANH',
-      updatedAt: nowIso,
-      items: [
-        {
-          itemId: targetItem.id,
-          itemCode: targetItem.code,
-          itemName: targetItem.name,
-          unit: targetItem.unit,
-          quantity: adjustmentQty,
-          unitPrice: targetItem.unitPrice || 150000,
-          amount: lineAmount,
-          note: 'Google AI tự động tính toán và bổ sung lượng tồn kho tối ưu',
-        },
-      ],
-      totalAmount: lineAmount,
-    };
-
-    const newTransactions = [newTx, ...cur.transactions];
-    const rawItems = cur.items.map((it, idx) =>
-      idx === targetIdx ? { ...it, updatedAt: nowIso } : it
-    );
-    const newItems = recalculateAllItemsStocks(rawItems, cur.warehouses, newTransactions);
-
-    setTransactions(newTransactions);
-    setItems(newItems);
-
-    await pushCloudSyncImmediately(
-      newItems,
-      newTransactions,
-      cur.warehouses,
-      cur.users,
-      cur.deletedRegistry,
-      'google-ai'
-    );
-
-    const resultMessage = supabaseRealtimeService.isConfigured()
-      ? `⚡ Google AI vừa cập nhật +${adjustmentQty} ${targetItem.unit} cho "${targetItem.name}". Đã phát sóng Realtime đến toàn bộ người dùng ngay lập tức!`
-      : `Google AI vừa cập nhật +${adjustmentQty} ${targetItem.unit} cho "${targetItem.name}". Đã đồng bộ tức thì lên máy chủ trung tâm!`;
-
-    setLastRealtimeUpdateMessage(resultMessage);
-    return { success: true, message: resultMessage };
-  }, [pushCloudSyncImmediately]);
+    await syncWithFirestore();
+  }, [syncWithFirestore]);
 
   // Auth Operations (Multi-Device Single Session Enforcement)
   const login = async (
@@ -1448,22 +1079,14 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }> => {
     const trimmedUsername = username.trim().toLowerCase();
 
-    // 1. Always refresh full state from cloud immediately before login so user has latest catalog, vouchers & sessions
+    // 1. Luôn làm mới trạng thái người dùng từ Firebase Firestore trước khi đăng nhập
     try {
-      const syncRes = await centralSyncService.fetchLatestData();
-      if (syncRes.success && syncRes.payload) {
-        applyRemotePayloadAdditive(syncRes.payload);
-      }
-      if (supabaseRealtimeService.isConfigured()) {
-        const remoteSupa = await supabaseRealtimeService.fetchLatest({
-          skipLegacyFallback: stateRef.current.items.length > 120,
-        });
-        if (remoteSupa) {
-          applyRemotePayloadAdditive(remoteSupa);
-        }
+      const remotePayload = await firebaseFirestoreService.fetchPayload();
+      if (remotePayload) {
+        applyRemotePayloadAdditive(remotePayload);
       }
     } catch (err) {
-      console.warn('Could not refresh remote state during login:', err);
+      console.warn('Could not refresh remote state from Firestore during login:', err);
     }
 
     const currentUsersList = stateRef.current.users;
@@ -1557,20 +1180,12 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const trimmedUsername = username.trim().toLowerCase();
 
     try {
-      const syncRes = await centralSyncService.fetchLatestData();
-      if (syncRes.success && syncRes.payload) {
-        applyRemotePayloadAdditive(syncRes.payload);
-      }
-      if (supabaseRealtimeService.isConfigured()) {
-        const remoteSupa = await supabaseRealtimeService.fetchLatest({
-          skipLegacyFallback: stateRef.current.items.length > 120,
-        });
-        if (remoteSupa) {
-          applyRemotePayloadAdditive(remoteSupa);
-        }
+      const remotePayload = await firebaseFirestoreService.fetchPayload();
+      if (remotePayload) {
+        applyRemotePayloadAdditive(remotePayload);
       }
     } catch (err) {
-      console.warn('Could not refresh remote users before takeover:', err);
+      console.warn('Could not refresh remote users before takeover from Firestore:', err);
     }
 
     const cur = stateRef.current;
@@ -4014,7 +3629,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const cleanResetPayload: CentralDataPayload = {
       cleanReset: true,
       resetEpoch: RESET_EPOCH,
-      version: Math.max(1, centralSyncService.getCurrentVersion()) + 1,
+      version: Date.now(),
       lastUpdated: new Date().toISOString(),
       users: INITIAL_USERS,
       warehouses: INITIAL_WAREHOUSES,
@@ -4023,23 +3638,10 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       transactions: INITIAL_TRANSACTIONS,
       deletedRegistry: {},
       source: 'admin-clean-reset',
+      lastUpdatedBy: currentUser?.fullName || 'Quản trị viên',
     };
 
-    const clientManagesSupabase = supabaseRealtimeService.isConfigured();
-
-    fetch('/api/sync', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        cleanReset: true,
-        skipRemoteCloudSave: clientManagesSupabase,
-        payload: cleanResetPayload,
-      }),
-    }).catch(() => {});
-
-    if (clientManagesSupabase) {
-      supabaseRealtimeService.pushState(cleanResetPayload).catch(() => {});
-    }
+    firebaseFirestoreService.pushPayload(cleanResetPayload, currentUser?.fullName || 'Quản trị viên').catch(() => {});
   };
 
   return (
@@ -4098,14 +3700,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         triggerManualSync,
         isSyncModalOpen,
         setIsSyncModalOpen,
-        realtimeConnectionState,
-        lastRealtimeUpdateMessage,
-        clearRealtimeMessage,
-        simulateGoogleAIUpdate,
-        saveSupabaseCredentials,
-        supabaseCredentials,
         firestoreConnectionState,
         syncWithFirestore,
+        pullFromFirestore,
       }}
     >
       {children}

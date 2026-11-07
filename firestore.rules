@@ -15,9 +15,17 @@ service cloud.firestore {
       allow read, write: if isValidId(docId);
     }
 
-    // Realtime Central Sync payload documents
+    // Realtime Central Sync payload documents and shards
     match /sync/{syncId} {
       allow read, write: if isValidId(syncId);
+
+      match /shards/{shardId} {
+        allow read, write: if isValidId(shardId);
+      }
+    }
+
+    match /sync_shards/{shardId} {
+      allow read, write: if isValidId(shardId);
     }
 
     // Inventory items collection

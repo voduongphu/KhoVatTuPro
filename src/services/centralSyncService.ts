@@ -2,7 +2,7 @@ import { InventoryItem, MaterialCategory, Transaction, User, Warehouse } from '.
 import { DeletedRegistry } from '../utils/mergeSyncData';
 
 export type SyncStatus = 'synced' | 'syncing' | 'offline' | 'error';
-export type CloudProvider = 'vercel-edge-config' | 'vercel-kv' | 'supabase' | 'central-server' | 'local' | 'firestore';
+export type CloudProvider = 'firestore' | 'local';
 
 export interface CentralDataPayload {
   version: number;
@@ -41,7 +41,7 @@ export interface SyncResult {
 class CentralSyncService {
   private lastFetchedTimestamp: string | null = null;
   private currentVersion: number = 0;
-  private provider: CloudProvider = 'central-server';
+  private provider: CloudProvider = 'firestore';
   private eventSource: EventSource | null = null;
   private reconnectTimer: any = null;
 
@@ -50,14 +50,8 @@ class CentralSyncService {
   }
 
   public detectProvider(): CloudProvider {
-    if (typeof import.meta !== 'undefined' && import.meta.env) {
-      if (import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY) {
-        this.provider = 'supabase';
-        return 'supabase';
-      }
-    }
-    this.provider = 'central-server';
-    return 'central-server';
+    this.provider = 'firestore';
+    return 'firestore';
   }
 
   public getProvider(): CloudProvider {
