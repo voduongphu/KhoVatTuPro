@@ -9,12 +9,18 @@ import {
 import { db, handleFirestoreError, OperationType } from './firebase';
 import { CentralDataPayload } from './centralSyncService';
 
-export type FirestoreConnectionState = 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'ERROR';
+export type FirestoreConnectionState = 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'ERROR' | 'QUOTA_EXCEEDED';
+
+export interface FirestorePushResult {
+  success: boolean;
+  error?: string;
+  isQuotaExceeded?: boolean;
+}
 
 export type FirestoreSyncCallback = (payload: CentralDataPayload) => void;
 
-const ITEMS_CHUNK_SIZE = 250;
-const TRX_CHUNK_SIZE = 250;
+const ITEMS_CHUNK_SIZE = 1000;
+const TRX_CHUNK_SIZE = 1000;
 
 function sanitizeForFirestore<T>(val: T): T {
   if (val === undefined) return null as any;
@@ -187,8 +193,8 @@ class FirebaseFirestoreService {
    * Đẩy dữ liệu đồng bộ lên Firestore theo thời gian thực (tự động phân mảnh nếu >250 dòng tránh vượt 1MB,
    * triệt tiêu toàn bộ thuộc tính undefined để Firestore setDoc không bao giờ bị từ chối).
    */
-  public async pushPayload(payload: CentralDataPayload, authorName?: string): Promise<boolean> {
-    if (this.isPushing) return false;
+  public async pushPayload(payload: CentralDataPayload, authorName?: string): Promise<FirestorePushResult> {
+    if (this.isPushing) return { success: false, error: 'Đang có tiến trình đồng bộ khác chạy' };
     this.isPushing = true;
     const manifestRef = doc(db, this.syncCollection, this.manifestDocId);
 
@@ -202,7 +208,7 @@ class FirebaseFirestoreService {
       const itemShardCount = Math.ceil(items.length / ITEMS_CHUNK_SIZE);
       const trxShardCount = Math.ceil(transactions.length / TRX_CHUNK_SIZE);
 
-      // 1. Ghi song song các phân mảnh items (mỗi phân mảnh ~50KB - 80KB, an toàn tuyệt đối)
+      // 1. Ghi tuần tự hoặc theo nhóm phân mảnh items (1.000 mục/phân mảnh ~150KB - 200KB, tối ưu hạn ngạch ghi Firestore)
       const shardWritePromises: Promise<any>[] = [];
       for (let i = 0; i < itemShardCount; i++) {
         const slice = items.slice(i * ITEMS_CHUNK_SIZE, (i + 1) * ITEMS_CHUNK_SIZE);
@@ -218,7 +224,7 @@ class FirebaseFirestoreService {
         );
       }
 
-      // 2. Ghi song song các phân mảnh transactions
+      // 2. Ghi các phân mảnh transactions
       for (let i = 0; i < trxShardCount; i++) {
         const slice = transactions.slice(i * TRX_CHUNK_SIZE, (i + 1) * TRX_CHUNK_SIZE);
         const shardRef = doc(db, this.syncCollection, this.manifestDocId, 'shards', `trx_${i}`);
@@ -275,11 +281,25 @@ class FirebaseFirestoreService {
       }
 
       this.setConnectionState('CONNECTED');
-      return true;
-    } catch (error) {
+      return { success: true };
+    } catch (error: any) {
+      const errMsg = error?.message || String(error);
+      const isQuota =
+        errMsg.includes('RESOURCE_EXHAUSTED') ||
+        errMsg.includes('Quota exceeded') ||
+        errMsg.includes('quota metric') ||
+        errMsg.includes('Quota limit exceeded');
+
       console.error('[FirebaseFirestore] Error pushing payload:', error);
-      this.setConnectionState('ERROR');
-      return false;
+      this.setConnectionState(isQuota ? 'QUOTA_EXCEEDED' : 'ERROR');
+
+      return {
+        success: false,
+        isQuotaExceeded: isQuota,
+        error: isQuota
+          ? 'Hạn ngạch ghi miễn phí trong ngày của Firebase Firestore đã chạm mức giới hạn (RESOURCE_EXHAUSTED: Free daily write units per project). Dữ liệu trên thiết bị vẫn được bảo toàn 100%. Hạn ngạch miễn phí sẽ tự động được làm mới (reset) vào ngày mai theo giờ UTC.'
+          : `Lỗi kết nối Firestore: ${errMsg}`,
+      };
     } finally {
       this.isPushing = false;
     }
@@ -323,8 +343,15 @@ class FirebaseFirestoreService {
         }
       },
       (error) => {
-        console.warn('[FirebaseFirestore] onSnapshot notice:', error?.message);
-        this.setConnectionState('ERROR');
+        const errMsg = error?.message || String(error);
+        const isQuota =
+          errMsg.includes('RESOURCE_EXHAUSTED') ||
+          errMsg.includes('Quota exceeded') ||
+          errMsg.includes('quota metric') ||
+          errMsg.includes('Quota limit exceeded');
+
+        console.warn('[FirebaseFirestore] onSnapshot notice:', errMsg);
+        this.setConnectionState(isQuota ? 'QUOTA_EXCEEDED' : 'ERROR');
       }
     );
 

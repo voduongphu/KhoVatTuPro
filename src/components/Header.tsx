@@ -310,6 +310,8 @@ export const Header: React.FC<HeaderProps> = ({
               className={`inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-2.5 py-1.5 text-xs font-medium rounded-lg transition-all whitespace-nowrap shadow-2xs border ${
                 firestoreConnectionState === 'CONNECTED'
                   ? 'bg-amber-50 text-amber-900 border-amber-300 hover:bg-amber-100'
+                  : firestoreConnectionState === 'QUOTA_EXCEEDED'
+                  ? 'bg-amber-100 text-amber-950 border-amber-400 hover:bg-amber-200'
                   : firestoreConnectionState === 'CONNECTING' || syncStatus === 'syncing'
                   ? 'bg-blue-50 text-blue-900 border-blue-300 hover:bg-blue-100'
                   : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
@@ -321,6 +323,8 @@ export const Header: React.FC<HeaderProps> = ({
                   className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
                     firestoreConnectionState === 'CONNECTED'
                       ? 'bg-amber-400'
+                      : firestoreConnectionState === 'QUOTA_EXCEEDED'
+                      ? 'bg-amber-500'
                       : syncStatus === 'syncing' || firestoreConnectionState === 'CONNECTING'
                       ? 'bg-blue-400'
                       : 'bg-rose-400'
@@ -330,6 +334,8 @@ export const Header: React.FC<HeaderProps> = ({
                   className={`relative inline-flex rounded-full h-2 w-2 ${
                     firestoreConnectionState === 'CONNECTED'
                       ? 'bg-amber-500'
+                      : firestoreConnectionState === 'QUOTA_EXCEEDED'
+                      ? 'bg-amber-600'
                       : syncStatus === 'syncing' || firestoreConnectionState === 'CONNECTING'
                       ? 'bg-blue-500'
                       : 'bg-rose-500'
@@ -340,6 +346,8 @@ export const Header: React.FC<HeaderProps> = ({
               <span className="hidden sm:inline font-medium">
                 {firestoreConnectionState === 'CONNECTED'
                   ? 'Firestore 0s'
+                  : firestoreConnectionState === 'QUOTA_EXCEEDED'
+                  ? 'Hạn ngạch Firestore'
                   : syncStatus === 'syncing'
                   ? 'Đang đồng bộ...'
                   : 'Firestore'}

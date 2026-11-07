@@ -16,6 +16,9 @@ import {
   Building2,
   FolderTree,
   Users,
+  ExternalLink,
+  Download,
+  AlertTriangle,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
 
@@ -40,11 +43,16 @@ export const SyncStatusModal: React.FC = () => {
   const [isPushing, setIsPushing] = useState(false);
   const [isPulling, setIsPulling] = useState(false);
   const [feedbackMessage, setFeedbackMessage] = useState<{
-    type: 'success' | 'error' | 'info';
+    type: 'success' | 'error' | 'warning' | 'info';
     text: string;
+    isQuota?: boolean;
   } | null>(null);
 
   if (!isSyncModalOpen) return null;
+
+  const projectId = 'gen-lang-client-0950555318';
+  const databaseId = 'ai-studio-qunlvttthitbchuy-b591ef3a-721a-48b8-8773-cd0769691e0d';
+  const upgradeUrl = `https://console.firebase.google.com/project/${projectId}/firestore/databases/${databaseId}/data?openUpgradeDialog=true`;
 
   const handlePushToFirestore = async () => {
     setIsPushing(true);
@@ -54,18 +62,28 @@ export const SyncStatusModal: React.FC = () => {
       if (res.success) {
         setFeedbackMessage({
           type: 'success',
-          text: `Đã kết nối và đồng bộ thành công ${items.length} vật tư, ${transactions.length} phiếu, ${warehouses.length} kho và ${materialCategories.length} danh mục lên Firebase Firestore!`,
+          text: `Đã kết nối và đồng bộ thành công ${items.length.toLocaleString()} vật tư, ${transactions.length.toLocaleString()} phiếu, ${warehouses.length} kho và ${materialCategories.length} danh mục lên Firebase Firestore!`,
         });
       } else {
         setFeedbackMessage({
-          type: 'error',
-          text: `Lỗi đồng bộ Firestore: ${res.error || 'Vui lòng kiểm tra kết nối mạng'}`,
+          type: res.isQuotaExceeded ? 'warning' : 'error',
+          isQuota: res.isQuotaExceeded,
+          text: res.error || 'Không thể kết nối hoặc lưu dữ liệu lên Firestore',
         });
       }
     } catch (e: any) {
+      const errStr = e?.message || String(e);
+      const isQuota =
+        errStr.includes('RESOURCE_EXHAUSTED') ||
+        errStr.includes('Quota exceeded') ||
+        errStr.includes('quota metric') ||
+        errStr.includes('Quota limit exceeded');
       setFeedbackMessage({
-        type: 'error',
-        text: `Ngoại lệ: ${e?.message || String(e)}`,
+        type: isQuota ? 'warning' : 'error',
+        isQuota,
+        text: isQuota
+          ? 'Hạn ngạch ghi miễn phí trong ngày của Firebase Firestore đã chạm mức giới hạn (RESOURCE_EXHAUSTED: Free daily write units per project). Dữ liệu trên thiết bị vẫn được bảo toàn 100%. Hạn ngạch miễn phí sẽ tự động được làm mới (reset) vào ngày mai theo giờ UTC.'
+          : `Lỗi đồng bộ: ${errStr}`,
       });
     } finally {
       setIsPushing(false);
@@ -97,6 +115,36 @@ export const SyncStatusModal: React.FC = () => {
       setIsPulling(false);
     }
   };
+
+  // Sao lưu khẩn cấp dữ liệu cục bộ ra tệp JSON
+  const handleExportBackup = () => {
+    try {
+      const backupData = {
+        exportedAt: new Date().toISOString(),
+        items,
+        transactions,
+        warehouses,
+        materialCategories,
+        users,
+      };
+      const blob = new Blob([JSON.stringify(backupData, null, 2)], {
+        type: 'application/json',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `SaoLuu_KhoVatTu_${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Backup failed', err);
+    }
+  };
+
+  const isQuotaExceeded =
+    firestoreConnectionState === 'QUOTA_EXCEEDED' || Boolean(feedbackMessage?.isQuota);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-900/60 backdrop-blur-xs animate-in fade-in duration-200">
@@ -139,6 +187,8 @@ export const SyncStatusModal: React.FC = () => {
             className={`border rounded-xl p-4 transition-all ${
               firestoreConnectionState === 'CONNECTED'
                 ? 'bg-amber-50/70 border-amber-200'
+                : isQuotaExceeded
+                ? 'bg-amber-50 border-amber-300'
                 : firestoreConnectionState === 'CONNECTING'
                 ? 'bg-blue-50/70 border-blue-200'
                 : 'bg-rose-50/70 border-rose-200'
@@ -152,6 +202,8 @@ export const SyncStatusModal: React.FC = () => {
                       className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
                         firestoreConnectionState === 'CONNECTED'
                           ? 'bg-amber-400'
+                          : isQuotaExceeded
+                          ? 'bg-amber-500'
                           : firestoreConnectionState === 'CONNECTING'
                           ? 'bg-blue-400'
                           : 'bg-rose-400'
@@ -161,6 +213,8 @@ export const SyncStatusModal: React.FC = () => {
                       className={`relative inline-flex rounded-full h-3 w-3 ${
                         firestoreConnectionState === 'CONNECTED'
                           ? 'bg-amber-500'
+                          : isQuotaExceeded
+                          ? 'bg-amber-600'
                           : firestoreConnectionState === 'CONNECTING'
                           ? 'bg-blue-500'
                           : 'bg-rose-500'
@@ -172,6 +226,8 @@ export const SyncStatusModal: React.FC = () => {
                     <span>
                       {firestoreConnectionState === 'CONNECTED'
                         ? 'Firebase Firestore: Đã kết nối trực tiếp (0s Realtime)'
+                        : isQuotaExceeded
+                        ? 'Firebase Firestore: Đạt Hạn Ngạch Ghi Miễn Phí Trong Ngày'
                         : firestoreConnectionState === 'CONNECTING'
                         ? 'Firebase Firestore: Đang thiết lập kết nối...'
                         : 'Firebase Firestore: Lỗi kết nối'}
@@ -181,10 +237,16 @@ export const SyncStatusModal: React.FC = () => {
                     className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
                       firestoreConnectionState === 'CONNECTED'
                         ? 'bg-amber-100 text-amber-800 border-amber-300'
+                        : isQuotaExceeded
+                        ? 'bg-amber-200 text-amber-900 border-amber-400'
                         : 'bg-slate-100 text-slate-700 border-slate-300'
                     }`}
                   >
-                    {firestoreConnectionState === 'CONNECTED' ? 'Hoạt động 24/7' : 'Đang kết nối'}
+                    {firestoreConnectionState === 'CONNECTED'
+                      ? 'Hoạt động 24/7'
+                      : isQuotaExceeded
+                      ? 'Chờ Reset ngày mai'
+                      : 'Đang kết nối'}
                   </span>
                 </div>
                 <div className="text-xs text-slate-600 flex flex-wrap items-center gap-2 pt-0.5">
@@ -219,15 +281,57 @@ export const SyncStatusModal: React.FC = () => {
             </div>
           </div>
 
+          {/* Special Quota Exceeded Explanation Banner */}
+          {isQuotaExceeded && (
+            <div className="p-4 bg-amber-50 border border-amber-300 rounded-xl space-y-2 text-xs text-amber-950 animate-in fade-in duration-200 shadow-xs">
+              <div className="flex items-center gap-2 text-amber-800 font-bold text-sm">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                <span>Giải Thích: Hạn Ngạch Ghi Miễn Phí Trong Ngày Đã Chạm Mức Giới Hạn</span>
+              </div>
+              <p className="leading-relaxed text-slate-700">
+                Do kho dữ liệu hiện tại có tới <strong>{items.length.toLocaleString()} vật tư</strong> và quá trình đồng bộ trước đó đã sử dụng hết hạn mức ghi miễn phí trong ngày (20.000 lượt ghi/ngày trên gói Spark miễn phí của Firebase).
+              </p>
+              <div className="bg-white p-3 rounded-lg border border-amber-200 space-y-1.5 text-xs">
+                <div className="flex items-center gap-2 text-slate-800">
+                  <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                  <span><strong>Toàn bộ dữ liệu an toàn 100%:</strong> {items.length.toLocaleString()} vật tư và {transactions.length} phiếu trên thiết bị này hoàn toàn nguyên vẹn, bạn vẫn sử dụng ứng dụng bình thường.</span>
+                </div>
+                <div className="flex items-center gap-2 text-slate-800">
+                  <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                  <span><strong>Thời gian làm mới:</strong> Hạn mức miễn phí sẽ tự động được làm mới (reset) vào 00:00 UTC ngày mai.</span>
+                </div>
+              </div>
+              <div className="pt-1 flex flex-wrap items-center justify-between gap-2">
+                <a
+                  href={upgradeUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-bold text-xs shadow-2xs transition-colors"
+                >
+                  <span>Mở bảng điều khiển Firebase để nâng cấp / kiểm tra</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+                <button
+                  type="button"
+                  onClick={handleExportBackup}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 rounded-lg font-semibold text-xs transition-colors"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Tải tệp sao lưu (.JSON) về máy</span>
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Feedback Message (Success or Error) */}
-          {feedbackMessage && (
+          {feedbackMessage && !isQuotaExceeded && (
             <div
               className={`p-3 rounded-xl border flex items-start gap-2.5 text-xs animate-in fade-in duration-150 ${
                 feedbackMessage.type === 'success'
                   ? 'bg-emerald-50 text-emerald-900 border-emerald-300'
                   : feedbackMessage.type === 'error'
                   ? 'bg-rose-50 text-rose-900 border-rose-300'
-                  : 'bg-blue-50 text-blue-900 border-blue-300'
+                  : 'bg-amber-50 text-amber-900 border-amber-300'
               }`}
             >
               {feedbackMessage.type === 'success' ? (
@@ -246,9 +350,15 @@ export const SyncStatusModal: React.FC = () => {
                 <Database className="w-4 h-4 text-indigo-600" />
                 <span>Dữ Liệu Cục Bộ Trên Thiết Bị Sẵn Sàng Đồng Bộ:</span>
               </h4>
-              <span className="text-[11px] text-slate-500 font-medium">
-                Tự động lưu vào thiết bị &amp; đồng bộ đám mây
-              </span>
+              <button
+                type="button"
+                onClick={handleExportBackup}
+                className="text-[11px] text-indigo-600 hover:text-indigo-800 font-semibold flex items-center gap-1"
+                title="Tải tệp JSON chứa toàn bộ dữ liệu hiện có"
+              >
+                <Download className="w-3 h-3" />
+                <span>Sao lưu tệp (.JSON)</span>
+              </button>
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-center">
@@ -346,12 +456,12 @@ export const SyncStatusModal: React.FC = () => {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               <div className="p-2.5 bg-white rounded-lg border border-slate-200">
                 <span className="text-[10px] text-slate-400 uppercase font-bold block">Firebase Project ID</span>
-                <span className="font-mono font-bold text-slate-800">gen-lang-client-0950555318</span>
+                <span className="font-mono font-bold text-slate-800">{projectId}</span>
               </div>
               <div className="p-2.5 bg-white rounded-lg border border-slate-200">
                 <span className="text-[10px] text-slate-400 uppercase font-bold block">Firestore Database ID</span>
                 <span className="font-mono font-bold text-slate-800 truncate block">
-                  ai-studio-qunlvttthitbchuy-b591ef3a-721a-48b8-8773-cd0769691e0d
+                  {databaseId}
                 </span>
               </div>
               <div className="p-2.5 bg-white rounded-lg border border-slate-200">
@@ -361,7 +471,7 @@ export const SyncStatusModal: React.FC = () => {
                 </span>
                 <span className="font-semibold text-emerald-700 flex items-center gap-1">
                   <Check className="w-3.5 h-3.5" />
-                  Tự động chia 250 dòng/phân mảnh, an toàn &gt;50.000 dòng
+                  1.000 dòng/phân mảnh (tối ưu số lượt ghi &amp; dung lượng)
                 </span>
               </div>
               <div className="p-2.5 bg-white rounded-lg border border-slate-200">
@@ -382,7 +492,7 @@ export const SyncStatusModal: React.FC = () => {
         <div className="px-5 py-3.5 bg-slate-50 border-t border-slate-200 flex items-center justify-between shrink-0">
           <div className="text-xs text-slate-500 flex items-center gap-1.5">
             <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-            <span>Dữ liệu luôn được đồng bộ hai chiều tự động khi có kết nối mạng</span>
+            <span>Dữ liệu luôn được lưu an toàn trên thiết bị và đồng bộ khi có kết nối mạng</span>
           </div>
           <button
             type="button"

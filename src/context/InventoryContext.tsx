@@ -165,7 +165,7 @@ interface InventoryContextType {
 
   // Firebase Firestore Realtime Storage & Synchronization
   firestoreConnectionState: FirestoreConnectionState;
-  syncWithFirestore: () => Promise<{ success: boolean; error?: string }>;
+  syncWithFirestore: () => Promise<{ success: boolean; error?: string; isQuotaExceeded?: boolean }>;
   pullFromFirestore: () => Promise<{ success: boolean; count?: number; error?: string }>;
 }
 
@@ -903,7 +903,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   /**
    * Đồng bộ thủ công dữ liệu cục bộ trên thiết bị lên Firebase Firestore
    */
-  const syncWithFirestore = useCallback(async (): Promise<{ success: boolean; error?: string }> => {
+  const syncWithFirestore = useCallback(async (): Promise<{ success: boolean; error?: string; isQuotaExceeded?: boolean }> => {
     setSyncStatus('syncing');
     try {
       const snap = stateRef.current;
@@ -921,15 +921,15 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         source: 'firebase-firestore-manual',
         lastUpdatedBy: currentUser?.fullName || 'Quản trị viên',
       };
-      const ok = await firebaseFirestoreService.pushPayload(payload, currentUser?.fullName);
-      if (ok) {
+      const res = await firebaseFirestoreService.pushPayload(payload, currentUser?.fullName);
+      if (res.success) {
         setSyncStatus('synced');
         setLastSyncedAt(new Date());
         setSyncProvider('firestore');
         return { success: true };
       }
       setSyncStatus('error');
-      return { success: false, error: 'Không thể kết nối hoặc lưu dữ liệu lên Firestore' };
+      return { success: false, error: res.error, isQuotaExceeded: res.isQuotaExceeded };
     } catch (e: any) {
       setSyncStatus('error');
       return { success: false, error: e?.message || String(e) };
