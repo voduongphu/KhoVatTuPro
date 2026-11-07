@@ -2,7 +2,7 @@ import { InventoryItem, MaterialCategory, Transaction, User, Warehouse } from '.
 import { DeletedRegistry } from '../utils/mergeSyncData';
 
 export type SyncStatus = 'synced' | 'syncing' | 'offline' | 'error';
-export type CloudProvider = 'vercel-edge-config' | 'vercel-kv' | 'supabase' | 'central-server' | 'local';
+export type CloudProvider = 'vercel-edge-config' | 'vercel-kv' | 'supabase' | 'central-server' | 'local' | 'firestore';
 
 export interface CentralDataPayload {
   version: number;

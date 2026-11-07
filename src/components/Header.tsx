@@ -50,6 +50,7 @@ export const Header: React.FC<HeaderProps> = ({
     lastSyncedAt,
     setIsSyncModalOpen,
     realtimeConnectionState,
+    firestoreConnectionState,
     currentDeviceInfo,
   } = useInventory();
 
@@ -308,12 +309,14 @@ export const Header: React.FC<HeaderProps> = ({
               type="button"
               onClick={() => setIsSyncModalOpen(true)}
               className={`inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-2.5 py-1.5 text-xs font-medium rounded-lg transition-all whitespace-nowrap shadow-2xs border ${
-                realtimeConnectionState === 'CONNECTED'
+                firestoreConnectionState === 'CONNECTED' || realtimeConnectionState === 'CONNECTED'
                   ? 'bg-emerald-50 text-emerald-800 border-emerald-300 hover:bg-emerald-100'
                   : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
               }`}
               title={
-                realtimeConnectionState === 'CONNECTED'
+                firestoreConnectionState === 'CONNECTED'
+                  ? 'Firebase Firestore & Realtime WebSocket đang hoạt động (0s). Nhấn để xem trạng thái.'
+                  : realtimeConnectionState === 'CONNECTED'
                   ? 'Supabase Realtime WebSocket đang hoạt động (0s). Nhấn để xem trạng thái.'
                   : 'Đồng bộ tự động đám mây. Nhấn để xem trạng thái.'
               }
@@ -321,7 +324,7 @@ export const Header: React.FC<HeaderProps> = ({
               <span className="relative flex h-2 w-2">
                 <span
                   className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
-                    realtimeConnectionState === 'CONNECTED' || syncStatus === 'synced'
+                    firestoreConnectionState === 'CONNECTED' || realtimeConnectionState === 'CONNECTED' || syncStatus === 'synced'
                       ? 'bg-emerald-400'
                       : syncStatus === 'syncing'
                       ? 'bg-blue-400'
@@ -330,7 +333,7 @@ export const Header: React.FC<HeaderProps> = ({
                 />
                 <span
                   className={`relative inline-flex rounded-full h-2 w-2 ${
-                    realtimeConnectionState === 'CONNECTED' || syncStatus === 'synced'
+                    firestoreConnectionState === 'CONNECTED' || realtimeConnectionState === 'CONNECTED' || syncStatus === 'synced'
                       ? 'bg-emerald-500'
                       : syncStatus === 'syncing'
                       ? 'bg-blue-500'
@@ -340,7 +343,9 @@ export const Header: React.FC<HeaderProps> = ({
               </span>
               <Zap className="w-3 h-3 text-amber-500 fill-amber-400 shrink-0" />
               <span className="hidden sm:inline font-medium">
-                {realtimeConnectionState === 'CONNECTED'
+                {firestoreConnectionState === 'CONNECTED'
+                  ? 'Firestore'
+                  : realtimeConnectionState === 'CONNECTED'
                   ? 'Realtime'
                   : syncStatus === 'syncing'
                   ? 'Syncing'

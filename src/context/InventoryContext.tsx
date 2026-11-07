@@ -25,6 +25,7 @@ import {
 } from '../utils/formatters';
 import { SyncStatus, CloudProvider, CentralDataPayload, centralSyncService } from '../services/centralSyncService';
 import { supabaseRealtimeService, RealtimeConnectionState } from '../services/supabaseRealtimeService';
+import { firebaseFirestoreService, FirestoreConnectionState } from '../services/firebaseFirestoreService';
 import { DeviceInfo, getDeviceId, getDeviceInfo, getDeviceName } from '../utils/deviceHelper';
 import { sessionBus } from '../services/sessionBus';
 import {
@@ -170,6 +171,10 @@ interface InventoryContextType {
   simulateGoogleAIUpdate: () => Promise<{ success: boolean; message: string }>;
   saveSupabaseCredentials: (url: string, key: string) => boolean;
   supabaseCredentials: { url: string; key: string };
+
+  // Firebase Firestore Realtime Storage & Synchronization
+  firestoreConnectionState: FirestoreConnectionState;
+  syncWithFirestore: () => Promise<{ success: boolean; error?: string }>;
 }
 
 const defaultCriteria: MultiFilterCriteria = {
@@ -623,6 +628,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [realtimeConnectionState, setRealtimeConnectionState] = useState<RealtimeConnectionState>(() =>
     supabaseRealtimeService.getConnectionState()
   );
+  const [firestoreConnectionState, setFirestoreConnectionState] = useState<FirestoreConnectionState>(() =>
+    firebaseFirestoreService.getConnectionState()
+  );
   const [lastRealtimeUpdateMessage, setLastRealtimeUpdateMessage] = useState<string | null>(null);
   const [supabaseCredentials, setSupabaseCredentials] = useState<{ url: string; key: string }>(() =>
     supabaseRealtimeService.getCredentials()
@@ -958,6 +966,16 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         isPushingRef.current = false;
       }
 
+      // Đồng bộ dữ liệu hai chiều tự động lên Firebase Firestore
+      try {
+        await firebaseFirestoreService.pushPayload(
+          mergedFromServer || outboundPayload,
+          currentUser?.fullName || 'Người dùng'
+        );
+      } catch (fErr) {
+        console.warn('Firebase Firestore push failed:', fErr);
+      }
+
       if (mergedFromServer) {
         applyRemotePayloadAdditive(mergedFromServer);
       } else {
@@ -965,8 +983,39 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         setLastSyncedAt(new Date());
       }
     },
-    [applyRemotePayloadAdditive, persistSnapshotToLocalStorage]
+    [applyRemotePayloadAdditive, currentUser, persistSnapshotToLocalStorage]
   );
+
+  const syncWithFirestore = useCallback(async (): Promise<{ success: boolean; error?: string }> => {
+    setSyncStatus('syncing');
+    try {
+      const snap = stateRef.current;
+      const legacyArrays = extractLegacyDeletedArrays(snap.deletedRegistry);
+      const payload: CentralDataPayload = {
+        version: Date.now(),
+        lastUpdated: new Date().toISOString(),
+        items: snap.items,
+        transactions: snap.transactions,
+        warehouses: snap.warehouses,
+        materialCategories: snap.materialCategories,
+        users: snap.users,
+        deletedRegistry: snap.deletedRegistry,
+        ...legacyArrays,
+        source: 'firebase-firestore-manual',
+        lastUpdatedBy: currentUser?.fullName || 'Quản trị viên',
+      };
+      const ok = await firebaseFirestoreService.pushPayload(payload, currentUser?.fullName);
+      if (ok) {
+        setSyncStatus('synced');
+        setLastSyncedAt(new Date());
+        return { success: true };
+      }
+      return { success: false, error: 'Không thể kết nối hoặc ghi dữ liệu lên Firestore' };
+    } catch (e: any) {
+      setSyncStatus('error');
+      return { success: false, error: e?.message || String(e) };
+    }
+  }, [currentUser]);
 
   const saveSupabaseCredentials = useCallback(
     (url: string, key: string) => {
@@ -1037,6 +1086,38 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     return () => {
       unsubscribeStatus();
+    };
+  }, [applyRemotePayloadAdditive]);
+
+  // 3. Listen to Firebase Firestore Realtime WebSocket events (onSnapshot)
+  useEffect(() => {
+    const unsubscribeFirestore = firebaseFirestoreService.subscribeToChanges(payload => {
+      if (!payload) return;
+      applyRemotePayloadAdditive(payload);
+      setSyncProvider('firestore');
+
+      const msg = `⚡ Dữ liệu vừa được đồng bộ tự động theo thời gian thực qua Firebase Firestore!`;
+      setLastRealtimeUpdateMessage(msg);
+
+      setTimeout(() => {
+        setLastRealtimeUpdateMessage(prev => (prev === msg ? null : prev));
+      }, 6000);
+    });
+
+    const unsubscribeFirestoreStatus = firebaseFirestoreService.onConnectionStateChange(state => {
+      setFirestoreConnectionState(state);
+    });
+
+    // On mount, also check for remote state from Firestore
+    firebaseFirestoreService.fetchPayload().then(remotePayload => {
+      if (remotePayload) {
+        applyRemotePayloadAdditive(remotePayload);
+      }
+    }).catch(() => {});
+
+    return () => {
+      unsubscribeFirestore();
+      unsubscribeFirestoreStatus();
     };
   }, [applyRemotePayloadAdditive]);
 
@@ -4023,6 +4104,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         simulateGoogleAIUpdate,
         saveSupabaseCredentials,
         supabaseCredentials,
+        firestoreConnectionState,
+        syncWithFirestore,
       }}
     >
       {children}

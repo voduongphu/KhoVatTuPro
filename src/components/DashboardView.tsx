@@ -8,6 +8,9 @@ import {
   Layers,
   TableProperties,
   BarChart3,
+  Search,
+  X,
+  Filter,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
 import { MaterialCategory } from '../types/inventory';
@@ -35,10 +38,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [reportViewMode, setReportViewMode] = useState<'matrix' | 'nxt'>('matrix');
   const [reportPage, setReportPage] = useState<number>(1);
   const [reportPageSize, setReportPageSize] = useState<number>(50);
+  const [reportSearchQuery, setReportSearchQuery] = useState<string>('');
+  const [reportQuickFilter, setReportQuickFilter] = useState<'ALL' | 'LOW_STOCK' | 'IN_STOCK' | 'ACTIVE_MOVEMENTS'>('ALL');
 
   useEffect(() => {
     setReportPage(1);
-  }, [selectedReportWarehouse, reportViewMode]);
+  }, [selectedReportWarehouse, reportViewMode, reportSearchQuery, reportQuickFilter]);
 
   // Single-pass KPI Calculations in O(N + T)
   const kpiStats = useMemo(() => {
@@ -355,20 +360,76 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     return { openingStock, totalIn, totalOut, closingStock, closingValue };
   }, [nxtReportRows]);
 
+  // Chuẩn hóa chuỗi tìm kiếm không dấu, chữ thường
+  const normalizeForSearch = (str: string) => {
+    return (str || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/đ/g, 'd')
+      .trim();
+  };
+
+  // 3. Lọc danh sách ma trận tồn kho theo tìm kiếm thông minh & bộ lọc nhanh
+  const filteredWarehouseMatrixRows = useMemo(() => {
+    const q = normalizeForSearch(reportSearchQuery);
+    return warehouseMatrixRows.filter(row => {
+      // Bộ lọc nhanh trạng thái
+      if (reportQuickFilter === 'LOW_STOCK') {
+        if (row.status !== 'CANH_BAO_THAP' && row.status !== 'HET_HANG') return false;
+      } else if (reportQuickFilter === 'IN_STOCK') {
+        if (row.totalStock <= 0) return false;
+      }
+
+      // Từ khóa tìm kiếm thông minh
+      if (!q) return true;
+      const matchCode = normalizeForSearch(row.code).includes(q);
+      const matchName = normalizeForSearch(row.name).includes(q);
+      const matchCategory = normalizeForSearch(row.category).includes(q);
+      const matchLocation = normalizeForSearch(row.location).includes(q);
+      const matchUnit = normalizeForSearch(row.unit).includes(q);
+      return matchCode || matchName || matchCategory || matchLocation || matchUnit;
+    });
+  }, [warehouseMatrixRows, reportSearchQuery, reportQuickFilter]);
+
+  // 4. Lọc danh sách chi tiết NXT theo tìm kiếm thông minh & bộ lọc nhanh
+  const filteredNxtReportRows = useMemo(() => {
+    const q = normalizeForSearch(reportSearchQuery);
+    return nxtReportRows.filter(row => {
+      // Bộ lọc nhanh trạng thái
+      if (reportQuickFilter === 'LOW_STOCK') {
+        if (row.status !== 'CANH_BAO_THAP' && row.status !== 'HET_HANG') return false;
+      } else if (reportQuickFilter === 'IN_STOCK') {
+        if (row.closingStock <= 0) return false;
+      } else if (reportQuickFilter === 'ACTIVE_MOVEMENTS') {
+        if (row.totalIn <= 0 && row.totalOut <= 0) return false;
+      }
+
+      // Từ khóa tìm kiếm thông minh
+      if (!q) return true;
+      const matchCode = normalizeForSearch(row.code).includes(q);
+      const matchName = normalizeForSearch(row.name).includes(q);
+      const matchWarehouse = normalizeForSearch(row.warehouseName).includes(q);
+      const matchLocation = normalizeForSearch(row.location).includes(q);
+      const matchUnit = normalizeForSearch(row.unit).includes(q);
+      return matchCode || matchName || matchWarehouse || matchLocation || matchUnit;
+    });
+  }, [nxtReportRows, reportSearchQuery, reportQuickFilter]);
+
   const activeTotalRowsCount =
-    reportViewMode === 'matrix' ? warehouseMatrixRows.length : nxtReportRows.length;
+    reportViewMode === 'matrix' ? filteredWarehouseMatrixRows.length : filteredNxtReportRows.length;
   const totalReportPages = Math.max(1, Math.ceil(activeTotalRowsCount / reportPageSize));
   const safeReportPage = Math.min(Math.max(1, reportPage), totalReportPages);
   const pageOffset = (safeReportPage - 1) * reportPageSize;
 
   const paginatedMatrixRows = useMemo(
-    () => warehouseMatrixRows.slice(pageOffset, pageOffset + reportPageSize),
-    [warehouseMatrixRows, pageOffset, reportPageSize]
+    () => filteredWarehouseMatrixRows.slice(pageOffset, pageOffset + reportPageSize),
+    [filteredWarehouseMatrixRows, pageOffset, reportPageSize]
   );
 
   const paginatedNxtRows = useMemo(
-    () => nxtReportRows.slice(pageOffset, pageOffset + reportPageSize),
-    [nxtReportRows, pageOffset, reportPageSize]
+    () => filteredNxtReportRows.slice(pageOffset, pageOffset + reportPageSize),
+    [filteredNxtReportRows, pageOffset, reportPageSize]
   );
 
   const visibleWarehouses = useMemo(
@@ -387,8 +448,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
     const workbook = XLSX.utils.book_new();
 
-    // Sheet 1: Bảng tổng hợp số lượng tồn chia theo từng kho
-    const matrixSheetData = warehouseMatrixRows.map((row, idx) => {
+    // Sheet 1: Bảng tổng hợp số lượng tồn chia theo từng kho (dùng danh sách đã lọc thông minh)
+    const exportMatrixRows = filteredWarehouseMatrixRows.length > 0 ? filteredWarehouseMatrixRows : warehouseMatrixRows;
+    const matrixSheetData = exportMatrixRows.map((row, idx) => {
       const rowObj: Record<string, any> = {
         STT: idx + 1,
         'Mã SKU': row.code,
@@ -414,7 +476,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     const summaryMatrixRow: Record<string, any> = {
       STT: 'TỔNG CỘNG',
       'Mã SKU': '',
-      'Tên Vật Tư Thiết Bị': `Tổng ${warehouseMatrixRows.length} mặt hàng`,
+      'Tên Vật Tư Thiết Bị': `Tổng ${exportMatrixRows.length} mặt hàng`,
       'Phân Loại': '',
       'Nhóm Ngành': '',
       'ĐVT': '',
@@ -432,8 +494,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     const matrixWorksheet = XLSX.utils.json_to_sheet(matrixSheetData);
     XLSX.utils.book_append_sheet(workbook, matrixWorksheet, 'Ton_Kho_Tung_Kho');
 
-    // Sheet 2: Sổ NXT chi tiết
-    const nxtSheetData = nxtReportRows.map((row, idx) => ({
+    // Sheet 2: Sổ NXT chi tiết (dùng danh sách đã lọc thông minh)
+    const exportNxtRows = filteredNxtReportRows.length > 0 ? filteredNxtReportRows : nxtReportRows;
+    const nxtSheetData = exportNxtRows.map((row, idx) => ({
       STT: idx + 1,
       'Mã SKU': row.code,
       'Tên Vật Tư Thiết Bị': row.name,
@@ -737,6 +800,108 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
 
+        {/* SMART SEARCH BAR FOR PHÂN BỔ NHẬP - XUẤT - TỒN */}
+        <div className="px-4 py-3 bg-slate-50/90 border-b border-slate-200 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
+          {/* Search Input Box */}
+          <div className="relative flex-1 min-w-[280px]">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={reportSearchQuery}
+              onChange={e => setReportSearchQuery(e.target.value)}
+              placeholder="Tìm kiếm thông minh: mã SKU, tên vật tư, danh mục, vị trí kệ/ngăn..."
+              className="w-full pl-9 pr-9 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-600 shadow-2xs text-slate-900 placeholder-slate-400 transition-all font-medium"
+            />
+            {reportSearchQuery && (
+              <button
+                type="button"
+                onClick={() => setReportSearchQuery('')}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-600 rounded-md transition-colors"
+                title="Xóa tìm kiếm"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+
+          {/* Quick Filter Status Badges */}
+          <div className="flex flex-wrap items-center gap-1.5 shrink-0 text-xs">
+            <span className="text-slate-400 text-[11px] font-semibold flex items-center gap-1 mr-1">
+              <Filter className="w-3 h-3" />
+              Lọc nhanh:
+            </span>
+
+            <button
+              type="button"
+              onClick={() => setReportQuickFilter('ALL')}
+              className={`px-2.5 py-1 rounded-md font-semibold text-xs transition-all ${
+                reportQuickFilter === 'ALL'
+                  ? 'bg-slate-900 text-white shadow-2xs'
+                  : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
+              }`}
+            >
+              Tất cả
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setReportQuickFilter('LOW_STOCK')}
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md font-semibold text-xs transition-all ${
+                reportQuickFilter === 'LOW_STOCK'
+                  ? 'bg-rose-600 text-white shadow-2xs'
+                  : 'bg-white text-rose-700 hover:bg-rose-50 border border-rose-200'
+              }`}
+            >
+              <AlertTriangle className="w-3 h-3" />
+              <span>Cảnh báo tồn</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setReportQuickFilter('IN_STOCK')}
+              className={`px-2.5 py-1 rounded-md font-semibold text-xs transition-all ${
+                reportQuickFilter === 'IN_STOCK'
+                  ? 'bg-emerald-600 text-white shadow-2xs'
+                  : 'bg-white text-emerald-700 hover:bg-emerald-50 border border-emerald-200'
+              }`}
+            >
+              Còn hàng
+            </button>
+
+            {reportViewMode === 'nxt' && (
+              <button
+                type="button"
+                onClick={() => setReportQuickFilter('ACTIVE_MOVEMENTS')}
+                className={`px-2.5 py-1 rounded-md font-semibold text-xs transition-all ${
+                  reportQuickFilter === 'ACTIVE_MOVEMENTS'
+                    ? 'bg-indigo-600 text-white shadow-2xs'
+                    : 'bg-white text-indigo-700 hover:bg-indigo-50 border border-indigo-200'
+                }`}
+              >
+                Có phát sinh Nhập/Xuất
+              </button>
+            )}
+
+            {/* Matching Result Count Badge */}
+            <div className="pl-2 border-l border-slate-200 text-[11px] text-slate-500 font-semibold whitespace-nowrap">
+              Hiển thị: <strong className="text-slate-900 font-bold">{activeTotalRowsCount}</strong>{' '}
+              {reportViewMode === 'matrix' ? 'mặt hàng' : 'dòng chi tiết'}
+              {(reportSearchQuery || reportQuickFilter !== 'ALL') && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setReportSearchQuery('');
+                    setReportQuickFilter('ALL');
+                  }}
+                  className="ml-2 text-indigo-600 hover:text-indigo-800 underline font-semibold"
+                >
+                  Xóa lọc
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+
         {/* VIEW MODE 1: MATRIX TABLE */}
         {reportViewMode === 'matrix' && (
           <>
@@ -771,13 +936,32 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {warehouseMatrixRows.length === 0 ? (
+                  {paginatedMatrixRows.length === 0 ? (
                     <tr>
                       <td
                         colSpan={9 + visibleWarehouses.length}
-                        className="py-8 text-center text-slate-400 italic text-xs"
+                        className="py-12 text-center text-slate-500 text-xs"
                       >
-                        Không có mặt hàng nào có số lượng tồn tại kho đã chọn.
+                        <div className="flex flex-col items-center justify-center gap-1.5 max-w-sm mx-auto">
+                          <Search className="w-8 h-8 text-slate-300" />
+                          <span className="font-semibold text-slate-700 text-sm">
+                            {reportSearchQuery
+                              ? `Không tìm thấy mặt hàng nào khớp với "${reportSearchQuery}"`
+                              : 'Không có dữ liệu mặt hàng nào tại kho đã chọn.'}
+                          </span>
+                          {(reportSearchQuery || reportQuickFilter !== 'ALL') && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setReportSearchQuery('');
+                                setReportQuickFilter('ALL');
+                              }}
+                              className="text-xs text-indigo-600 hover:text-indigo-800 underline font-semibold mt-1"
+                            >
+                              Xóa bộ lọc tìm kiếm
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   ) : (
@@ -941,10 +1125,29 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {nxtReportRows.length === 0 ? (
+                  {paginatedNxtRows.length === 0 ? (
                     <tr>
-                      <td colSpan={13} className="py-8 text-center text-slate-400 italic text-xs">
-                        Không có phát sinh giao dịch hoặc số dư tại kho này.
+                      <td colSpan={13} className="py-12 text-center text-slate-500 text-xs">
+                        <div className="flex flex-col items-center justify-center gap-1.5 max-w-sm mx-auto">
+                          <Search className="w-8 h-8 text-slate-300" />
+                          <span className="font-semibold text-slate-700 text-sm">
+                            {reportSearchQuery
+                              ? `Không tìm thấy dòng phát sinh NXT nào khớp với "${reportSearchQuery}"`
+                              : 'Không có phát sinh giao dịch hoặc số dư tại kho này.'}
+                          </span>
+                          {(reportSearchQuery || reportQuickFilter !== 'ALL') && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setReportSearchQuery('');
+                                setReportQuickFilter('ALL');
+                              }}
+                              className="text-xs text-indigo-600 hover:text-indigo-800 underline font-semibold mt-1"
+                            >
+                              Xóa bộ lọc tìm kiếm
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   ) : (

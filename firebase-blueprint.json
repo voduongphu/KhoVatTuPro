@@ -1,0 +1,136 @@
+{
+  "entities": {
+    "InventoryItem": {
+      "title": "InventoryItem",
+      "description": "Vật tư, thiết bị, công cụ dụng cụ và phụ tùng trong kho",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "code": { "type": "string", "maxLength": 64 },
+        "name": { "type": "string", "maxLength": 256 },
+        "type": { "type": "string", "enum": ["VAT_TU", "THIET_BI", "CONG_CU", "PHU_TUNG"] },
+        "categoryId": { "type": "string", "maxLength": 128 },
+        "categoryCode": { "type": "string", "maxLength": 64 },
+        "category": { "type": "string", "maxLength": 256 },
+        "unit": { "type": "string", "maxLength": 32 },
+        "warehouseId": { "type": "string", "maxLength": 128 },
+        "location": { "type": "string", "maxLength": 128 },
+        "minStock": { "type": "number" },
+        "maxStock": { "type": "number" },
+        "currentStock": { "type": "number" },
+        "unitPrice": { "type": "number" },
+        "serialOrLot": { "type": "string", "maxLength": 128 },
+        "condition": { "type": "string", "enum": ["SAN_SANG", "DANG_MUON", "BAO_DUONG", "HONG_CHO_SUA"] },
+        "supplierDefault": { "type": "string", "maxLength": 256 },
+        "spec": { "type": "string", "maxLength": 512 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "code", "name", "type", "unit", "currentStock", "unitPrice", "updatedAt"]
+    },
+    "Warehouse": {
+      "title": "Warehouse",
+      "description": "Kho lưu trữ vật tư và thiết bị",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "code": { "type": "string", "maxLength": 64 },
+        "name": { "type": "string", "maxLength": 256 },
+        "address": { "type": "string", "maxLength": 512 },
+        "manager": { "type": "string", "maxLength": 128 },
+        "phone": { "type": "string", "maxLength": 64 },
+        "description": { "type": "string", "maxLength": 512 },
+        "status": { "type": "string", "enum": ["ACTIVE", "INACTIVE"] }
+      },
+      "required": ["id", "code", "name", "manager"]
+    },
+    "MaterialCategory": {
+      "title": "MaterialCategory",
+      "description": "Nhóm danh mục phân loại vật tư và thiết bị",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "code": { "type": "string", "maxLength": 64 },
+        "name": { "type": "string", "maxLength": 256 },
+        "description": { "type": "string", "maxLength": 512 },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "code", "name"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Phiếu nhập kho hoặc xuất kho",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "code": { "type": "string", "maxLength": 64 },
+        "type": { "type": "string", "enum": ["NHAP_KHO", "XUAT_KHO"] },
+        "subtype": { "type": "string", "maxLength": 64 },
+        "date": { "type": "string", "maxLength": 64 },
+        "warehouseId": { "type": "string", "maxLength": 128 },
+        "partnerName": { "type": "string", "maxLength": 256 },
+        "departmentOrProject": { "type": "string", "maxLength": 256 },
+        "creatorName": { "type": "string", "maxLength": 128 },
+        "totalAmount": { "type": "number" },
+        "status": { "type": "string", "enum": ["HOAN_THANH", "CHO_DUYET", "DA_HUY"] },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "code", "type", "date", "warehouseId", "status", "totalAmount"]
+    },
+    "User": {
+      "title": "User",
+      "description": "Tài khoản người dùng và quyền truy cập",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "username": { "type": "string", "maxLength": 64 },
+        "fullName": { "type": "string", "maxLength": 128 },
+        "role": { "type": "string", "enum": ["ADMIN", "THU_KHO", "NHAN_VIEN"] },
+        "email": { "type": "string", "maxLength": 128 },
+        "phone": { "type": "string", "maxLength": 32 },
+        "assignedWarehouseId": { "type": "string", "maxLength": 128 },
+        "status": { "type": "string", "enum": ["ACTIVE", "LOCKED"] },
+        "createdAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "username", "fullName", "role", "status"]
+    },
+    "SyncPayload": {
+      "title": "SyncPayload",
+      "description": "Bản ghi đồng bộ thời gian thực toàn hệ thống kho vật tư",
+      "type": "object",
+      "properties": {
+        "version": { "type": "number" },
+        "lastUpdated": { "type": "string", "maxLength": 64 },
+        "lastUpdatedBy": { "type": "string", "maxLength": 128 },
+        "source": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["version", "lastUpdated"]
+    }
+  },
+  "firestore": {
+    "/sync/{syncId}": {
+      "schema": { "$ref": "#/entities/SyncPayload" },
+      "description": "Tài liệu đồng bộ thời gian thực cho ứng dụng"
+    },
+    "/items/{itemId}": {
+      "schema": { "$ref": "#/entities/InventoryItem" },
+      "description": "Tập hợp danh mục vật tư trong kho"
+    },
+    "/warehouses/{warehouseId}": {
+      "schema": { "$ref": "#/entities/Warehouse" },
+      "description": "Tập hợp các kho lưu trữ"
+    },
+    "/categories/{categoryId}": {
+      "schema": { "$ref": "#/entities/MaterialCategory" },
+      "description": "Tập hợp các danh mục vật tư"
+    },
+    "/transactions/{transactionId}": {
+      "schema": { "$ref": "#/entities/Transaction" },
+      "description": "Tập hợp các phiếu nhập/xuất kho"
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "Tài khoản người dùng và phân quyền"
+    }
+  }
+}
