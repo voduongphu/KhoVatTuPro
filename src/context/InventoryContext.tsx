@@ -25,6 +25,7 @@ import {
 } from '../utils/formatters';
 import { SyncStatus, CloudProvider, CentralDataPayload } from '../services/centralSyncService';
 import { firebaseFirestoreService, FirestoreConnectionState } from '../services/firebaseFirestoreService';
+import { firestoreDiagnosticService, DiagnosticReport, DiagnosticStep } from '../services/firestoreDiagnosticService';
 import { DeviceInfo, getDeviceId, getDeviceInfo, getDeviceName } from '../utils/deviceHelper';
 import { sessionBus } from '../services/sessionBus';
 import {
@@ -167,6 +168,10 @@ interface InventoryContextType {
   firestoreConnectionState: FirestoreConnectionState;
   syncWithFirestore: () => Promise<{ success: boolean; error?: string; isQuotaExceeded?: boolean }>;
   pullFromFirestore: () => Promise<{ success: boolean; count?: number; error?: string }>;
+
+  // Firestore Diagnostics Utility
+  diagnosticReport: DiagnosticReport | null;
+  runFirestoreDiagnostics: (onStepUpdate?: (step: DiagnosticStep, allSteps: DiagnosticStep[]) => void) => Promise<DiagnosticReport>;
 }
 
 const defaultCriteria: MultiFilterCriteria = {
@@ -616,6 +621,18 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   // Firebase Firestore Realtime Connection State
   const [firestoreConnectionState, setFirestoreConnectionState] = useState<FirestoreConnectionState>(() =>
     firebaseFirestoreService.getConnectionState()
+  );
+
+  // Firestore Diagnostics Utility State
+  const [diagnosticReport, setDiagnosticReport] = useState<DiagnosticReport | null>(null);
+
+  const runFirestoreDiagnostics = useCallback(
+    async (onStepUpdate?: (step: DiagnosticStep, allSteps: DiagnosticStep[]) => void): Promise<DiagnosticReport> => {
+      const report = await firestoreDiagnosticService.runFullDiagnostics(onStepUpdate);
+      setDiagnosticReport(report);
+      return report;
+    },
+    []
   );
 
   const pendingSnapshotRef = useRef<{
@@ -3703,6 +3720,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         firestoreConnectionState,
         syncWithFirestore,
         pullFromFirestore,
+        diagnosticReport,
+        runFirestoreDiagnostics,
       }}
     >
       {children}
