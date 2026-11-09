@@ -60,15 +60,28 @@ export const INITIAL_TRANSACTIONS: Transaction[] = [];
 
 export const INITIAL_USERS: User[] = [
   {
-    id: 'USR-ADMIN',
-    username: 'admin',
-    password: 'admin123',
-    fullName: 'Quản Trị Viên',
+    id: 'USR-ADMIN-VODUONGPHU',
+    username: 'voduongphu@gmail.com',
+    fullName: 'Võ Dương Phú (Admin)',
     role: 'ADMIN',
-    email: 'admin@khovattu.pro',
+    email: 'voduongphu@gmail.com',
     phone: '0901.156.220',
     assignedWarehouseId: 'ALL',
     status: 'ACTIVE',
     createdAt: '2026-01-01 08:00',
+    authProvider: 'google',
+  },
+  {
+    id: 'USR-ADMIN',
+    username: 'admin',
+    password: 'admin123',
+    fullName: 'Quản Trị Viên (Dự phòng)',
+    role: 'ADMIN',
+    email: 'voduongphu@gmail.com',
+    phone: '0901.156.220',
+    assignedWarehouseId: 'ALL',
+    status: 'ACTIVE',
+    createdAt: '2026-01-01 08:00',
+    authProvider: 'local',
   },
 ];

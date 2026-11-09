@@ -16,6 +16,8 @@ import {
   TransactionLineItem,
   TransactionType,
   User,
+  UserRole,
+  UserRegistrationRequest,
   Warehouse,
 } from '../types/inventory';
 import {
@@ -28,6 +30,8 @@ import { firebaseFirestoreService, FirestoreConnectionState } from '../services/
 import { firestoreDiagnosticService, DiagnosticReport, DiagnosticStep } from '../services/firestoreDiagnosticService';
 import { DeviceInfo, getDeviceId, getDeviceInfo, getDeviceName } from '../utils/deviceHelper';
 import { sessionBus } from '../services/sessionBus';
+import { signInWithGoogle, signOutGoogle, isAdminEmail } from '../services/googleAuthService';
+import { sendRegistrationNotificationEmail, ADMIN_EMAIL } from '../services/gmailNotificationService';
 import {
   DeletedRegistry,
   generateCategoryCodeFromName,
@@ -74,6 +78,41 @@ interface InventoryContextType {
   addUser: (userData: Omit<User, 'id' | 'createdAt'>) => { success: boolean; error?: string };
   updateUser: (id: string, updates: Partial<User>) => { success: boolean; error?: string };
   deleteUser: (id: string) => { success: boolean; error?: string };
+
+  // Google Mail Management & User Registrations
+  userRegistrations: UserRegistrationRequest[];
+  pendingRegistrationsCount: number;
+  loginWithGoogle: () => Promise<{
+    success: boolean;
+    user?: User;
+    code?: 'SUCCESS' | 'NOT_REGISTERED' | 'PENDING_APPROVAL' | 'REJECTED' | 'ACCOUNT_LOCKED';
+    error?: string;
+    email?: string;
+    displayName?: string;
+    photoURL?: string | null;
+    accessToken?: string | null;
+  }>;
+  registerWithGoogle: (data: {
+    email: string;
+    fullName: string;
+    phone: string;
+    requestedRole: UserRole;
+    accessToken?: string | null;
+  }) => Promise<{
+    success: boolean;
+    error?: string;
+    emailSent: boolean;
+    emailError?: string;
+  }>;
+  approveUserRegistration: (
+    requestId: string,
+    role: UserRole,
+    assignedWarehouseId: string
+  ) => Promise<{ success: boolean; error?: string }>;
+  rejectUserRegistration: (
+    requestId: string,
+    reason?: string
+  ) => Promise<{ success: boolean; error?: string }>;
 
   // Warehouse Management
   addWarehouse: (data: Omit<Warehouse, 'id'>) => {

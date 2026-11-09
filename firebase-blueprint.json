@@ -94,6 +94,24 @@
       },
       "required": ["id", "username", "fullName", "role", "status"]
     },
+    "UserRegistration": {
+      "title": "UserRegistration",
+      "description": "Yêu cầu đăng ký tài khoản người dùng bằng Google Mail chờ phê duyệt",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "email": { "type": "string", "maxLength": 128 },
+        "fullName": { "type": "string", "maxLength": 128 },
+        "phone": { "type": "string", "maxLength": 32 },
+        "requestedRole": { "type": "string", "enum": ["ADMIN", "THU_KHO", "NHAN_VIEN"] },
+        "status": { "type": "string", "enum": ["PENDING", "APPROVED", "REJECTED"] },
+        "requestedAt": { "type": "string", "maxLength": 64 },
+        "reviewedAt": { "type": "string", "maxLength": 64 },
+        "reviewedBy": { "type": "string", "maxLength": 128 },
+        "rejectionReason": { "type": "string", "maxLength": 512 }
+      },
+      "required": ["id", "email", "fullName", "status", "requestedAt"]
+    },
     "SyncPayload": {
       "title": "SyncPayload",
       "description": "Bản ghi đồng bộ thời gian thực toàn hệ thống kho vật tư",
@@ -131,6 +149,10 @@
     "/users/{userId}": {
       "schema": { "$ref": "#/entities/User" },
       "description": "Tài khoản người dùng và phân quyền"
+    },
+    "/user_registrations/{registrationId}": {
+      "schema": { "$ref": "#/entities/UserRegistration" },
+      "description": "Danh sách yêu cầu đăng ký tài khoản người dùng"
     }
   }
 }

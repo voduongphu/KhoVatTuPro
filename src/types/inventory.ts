@@ -152,7 +152,7 @@ export type UserRole = 'ADMIN' | 'THU_KHO' | 'NHAN_VIEN';
 export interface User {
   id: string;
   username: string;
-  password: string; // in local storage for access control
+  password?: string; // Optional for Google Auth users
   fullName: string;
   role: UserRole;
   email: string;
@@ -161,11 +161,29 @@ export interface User {
   status: 'ACTIVE' | 'LOCKED';
   createdAt: string;
   lastLogin?: string;
+  authProvider?: 'google' | 'local';
+  googleUid?: string;
+  avatarUrl?: string;
   // Multi-device Single Session Tracking
   activeDeviceId?: string | null;
   activeDeviceName?: string | null;
   lastActiveAt?: string | null;
   updatedAt?: string;
+}
+
+export interface UserRegistrationRequest {
+  id: string;
+  email: string;
+  fullName: string;
+  phone: string;
+  requestedRole: UserRole;
+  status: 'PENDING' | 'APPROVED' | 'REJECTED';
+  requestedAt: string;
+  reviewedAt?: string;
+  reviewedBy?: string;
+  rejectionReason?: string;
+  assignedWarehouseId?: string;
+  googleUid?: string;
 }
 
 export interface ImportTransactionRow {

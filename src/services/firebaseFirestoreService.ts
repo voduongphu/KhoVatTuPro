@@ -4,10 +4,12 @@ import {
   setDoc,
   onSnapshot,
   Unsubscribe,
-  serverTimestamp,
+  collection,
+  getDocs,
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from './firebase';
 import { CentralDataPayload } from './centralSyncService';
+import { UserRegistrationRequest, UserRole } from '../types/inventory';
 
 export type FirestoreConnectionState = 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'ERROR' | 'QUOTA_EXCEEDED';
 
@@ -168,6 +170,7 @@ class FirebaseFirestoreService {
         warehouses: manifestData.warehouses || [],
         materialCategories: manifestData.materialCategories || [],
         users: manifestData.users || [],
+        userRegistrations: manifestData.userRegistrations || [],
         deletedRegistry: manifestData.deletedRegistry || {},
         deletedUserIds: manifestData.deletedUserIds || [],
         deletedTransactionIds: manifestData.deletedTransactionIds || [],
@@ -255,6 +258,7 @@ class FirebaseFirestoreService {
         warehouses: cleanInput.warehouses || [],
         materialCategories: cleanInput.materialCategories || [],
         users: cleanInput.users || [],
+        userRegistrations: cleanInput.userRegistrations || [],
         deletedRegistry: cleanInput.deletedRegistry || {},
         deletedUserIds: cleanInput.deletedUserIds || [],
         deletedTransactionIds: cleanInput.deletedTransactionIds || [],
@@ -263,7 +267,6 @@ class FirebaseFirestoreService {
         deletedCategoryIds: cleanInput.deletedCategoryIds || [],
         source: 'firebase-firestore',
         lastUpdatedBy: authorName || cleanInput.lastUpdatedBy || 'Firebase Sync Client',
-        serverTime: serverTimestamp(),
       });
 
       await setDoc(manifestRef, manifestPayload);
@@ -361,6 +364,50 @@ class FirebaseFirestoreService {
         this.unsubscribe = null;
       }
     };
+  }
+
+  /**
+   * Lưu hoặc cập nhật một yêu cầu đăng ký tài khoản vào Firestore (/user_registrations/{id})
+   */
+  public async saveRegistrationRequest(request: UserRegistrationRequest): Promise<boolean> {
+    try {
+      const regRef = doc(db, 'user_registrations', request.id);
+      await setDoc(
+        regRef,
+        sanitizeForFirestore({
+          ...request,
+          updatedAt: new Date().toISOString(),
+        }),
+        { merge: true }
+      );
+      return true;
+    } catch (e) {
+      console.warn('[FirebaseFirestore] saveRegistrationRequest error:', e);
+      return false;
+    }
+  }
+
+  /**
+   * Lắng nghe thời gian thực danh sách yêu cầu đăng ký người dùng từ Firestore (/user_registrations)
+   */
+  public subscribeToRegistrations(onUpdate: (requests: UserRegistrationRequest[]) => void): () => void {
+    const colRef = collection(db, 'user_registrations');
+    return onSnapshot(
+      colRef,
+      (snapshot) => {
+        const list: UserRegistrationRequest[] = [];
+        snapshot.forEach((d) => {
+          if (d.exists()) {
+            list.push(d.data() as UserRegistrationRequest);
+          }
+        });
+        list.sort((a, b) => new Date(b.requestedAt).getTime() - new Date(a.requestedAt).getTime());
+        onUpdate(list);
+      },
+      (error) => {
+        console.warn('[FirebaseFirestore] subscribeToRegistrations notice:', error);
+      }
+    );
   }
 }
 
