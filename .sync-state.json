@@ -3,19 +3,28 @@
   "lastUpdated": "2026-10-24T03:32:43.113Z",
   "users": [
     {
-      "id": "USR-PHUVO",
+      "id": "USR-ADMIN-VODUONGPHU",
       "role": "ADMIN",
-      "email": "phuvo@khovattu.pro",
+      "email": "voduongphu@gmail.com",
       "phone": "0901.156.220",
       "status": "ACTIVE",
-      "fullName": "Võ Dương Phú",
+      "fullName": "Võ Dương Phú (Admin)",
+      "password": "admin123",
+      "username": "voduongphu@gmail.com",
+      "createdAt": "2026-01-01 08:00",
+      "authProvider": "google",
+      "assignedWarehouseId": "ALL"
+    },
+    {
+      "id": "USR-PHUVO",
+      "role": "ADMIN",
+      "email": "voduongphu@gmail.com",
+      "phone": "0901.156.220",
+      "status": "ACTIVE",
+      "fullName": "Võ Dương Phú (phuvo)",
       "password": "abc123",
       "username": "phuvo",
       "createdAt": "2026-01-01 08:00",
-      "lastLogin": "2026-10-24 03:07",
-      "lastActiveAt": "2026-10-24T03:07:16.432Z",
-      "activeDeviceId": "DEV-MVGHC2DA-EGPRQU",
-      "activeDeviceName": "Google Chrome trên Windows 10/11",
       "assignedWarehouseId": "ALL"
     },
     {

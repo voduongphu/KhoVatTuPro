@@ -15,6 +15,7 @@ import {
   Laptop,
   CheckCircle2,
   Info,
+  Zap,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
 import { formatDate } from '../utils/formatters';
@@ -106,6 +107,37 @@ export const LoginView: React.FC = () => {
         if (res.code === 'SESSION_ACTIVE_ON_ANOTHER_DEVICE') {
           setConflictInfo({
             username: username.trim(),
+            otherDeviceName: res.otherDevice?.name || 'Thiết bị khác',
+            otherDeviceId: res.otherDevice?.id,
+            lastActiveAt: res.otherDevice?.lastActiveAt,
+          });
+        } else {
+          setError(res.error || 'Đăng nhập không thành công.');
+        }
+      }
+    } catch {
+      setIsLoading(false);
+      setError('Đăng nhập không thành công.');
+    }
+  };
+
+  const handleQuickAdminLogin = async (adminUser: string, adminPass: string) => {
+    setUsername(adminUser);
+    setPassword(adminPass);
+    setError('');
+    setGoogleNotice(null);
+    setConflictInfo(null);
+    setConflictFeedback(null);
+    setIsLoading(true);
+
+    try {
+      const res = await login(adminUser, adminPass);
+      setIsLoading(false);
+
+      if (!res.success) {
+        if (res.code === 'SESSION_ACTIVE_ON_ANOTHER_DEVICE') {
+          setConflictInfo({
+            username: adminUser.trim(),
             otherDeviceName: res.otherDevice?.name || 'Thiết bị khác',
             otherDeviceId: res.otherDevice?.id,
             lastActiveAt: res.otherDevice?.lastActiveAt,
@@ -278,14 +310,67 @@ export const LoginView: React.FC = () => {
 
               <div className="flex items-center justify-between text-[11px] text-slate-400 px-1">
                 <span>Quản trị viên: <strong className="text-amber-300">voduongphu@gmail.com</strong></span>
-                <span className="text-emerald-400 font-medium">Đồng bộ Cloud Firestore</span>
+                <span className="text-emerald-400 font-medium flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  Đồng bộ Cloud Supabase Realtime
+                </span>
+              </div>
+
+              {/* Quick 1-Click Admin Login Shortcut */}
+              <div className="mt-3.5 p-3 bg-gradient-to-r from-emerald-500/10 via-teal-500/10 to-indigo-500/10 border border-emerald-500/40 rounded-xl">
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-300">
+                    <Zap className="w-4 h-4 text-emerald-400 fill-emerald-400 shrink-0" />
+                    <span>Đăng nhập 1-Click Quản trị viên</span>
+                  </div>
+                  <span className="text-[10px] text-emerald-300 bg-emerald-950/80 px-2 py-0.5 rounded-full border border-emerald-500/30 font-medium">
+                    Toàn quyền
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    disabled={isLoading}
+                    onClick={() => handleQuickAdminLogin('voduongphu@gmail.com', 'admin123')}
+                    className="flex items-center justify-between p-2 bg-slate-900/90 hover:bg-slate-800 border border-emerald-500/50 hover:border-emerald-400 rounded-lg text-left transition-all group cursor-pointer"
+                    title="Đăng nhập ngay lập tức với tài khoản Quản trị viên chính voduongphu@gmail.com"
+                  >
+                    <div>
+                      <div className="text-xs font-bold text-white group-hover:text-emerald-300 truncate">
+                        voduongphu@gmail.com
+                      </div>
+                      <div className="text-[10px] text-slate-400">
+                        Mật khẩu: <span className="font-mono text-emerald-400 font-semibold">admin123</span>
+                      </div>
+                    </div>
+                    <ArrowRight className="w-4 h-4 text-emerald-400 group-hover:translate-x-0.5 transition-transform shrink-0 ml-1" />
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isLoading}
+                    onClick={() => handleQuickAdminLogin('phuvo', 'abc123')}
+                    className="flex items-center justify-between p-2 bg-slate-900/90 hover:bg-slate-800 border border-slate-700 hover:border-indigo-400 rounded-lg text-left transition-all group cursor-pointer"
+                    title="Đăng nhập với bí danh quản trị phuvo"
+                  >
+                    <div>
+                      <div className="text-xs font-bold text-white group-hover:text-indigo-300 truncate">
+                        phuvo (Admin bí danh)
+                      </div>
+                      <div className="text-[10px] text-slate-400">
+                        Mật khẩu: <span className="font-mono text-indigo-400 font-semibold">abc123</span>
+                      </div>
+                    </div>
+                    <ArrowRight className="w-4 h-4 text-indigo-400 group-hover:translate-x-0.5 transition-transform shrink-0 ml-1" />
+                  </button>
+                </div>
               </div>
 
               {/* Divider */}
-              <div className="relative my-4 pt-2 flex items-center justify-center">
+              <div className="relative my-4 pt-1 flex items-center justify-center">
                 <div className="border-t border-slate-700 w-full" />
                 <span className="bg-slate-800 px-3 text-[11px] text-slate-400 uppercase tracking-wider whitespace-nowrap">
-                  Hoặc đăng nhập mật khẩu nội bộ
+                  Hoặc tự nhập thông tin đăng nhập
                 </span>
               </div>
             </div>
@@ -303,7 +388,7 @@ export const LoginView: React.FC = () => {
 
               <div>
                 <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                  Tên đăng nhập nội bộ
+                  Tên đăng nhập hoặc Email
                 </label>
                 <div className="relative">
                   <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
@@ -314,7 +399,7 @@ export const LoginView: React.FC = () => {
                     required
                     value={username}
                     onChange={e => setUsername(e.target.value)}
-                    placeholder="Nhập tên đăng nhập..."
+                    placeholder="voduongphu@gmail.com hoặc tên đăng nhập..."
                     className="block w-full pl-10 pr-3.5 py-2.5 text-sm bg-slate-900/80 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-colors"
                   />
                 </div>
@@ -333,7 +418,7 @@ export const LoginView: React.FC = () => {
                     required
                     value={password}
                     onChange={e => setPassword(e.target.value)}
-                    placeholder="Nhập mật khẩu..."
+                    placeholder="Nhập mật khẩu (admin123 cho admin)..."
                     className="block w-full pl-10 pr-10 py-2.5 text-sm bg-slate-900/80 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-colors font-mono"
                   />
                   <button
@@ -364,6 +449,22 @@ export const LoginView: React.FC = () => {
                     </>
                   )}
                 </button>
+              </div>
+
+              {/* Helpful accounts reminder */}
+              <div className="p-3 bg-slate-900/60 rounded-xl border border-slate-700/60 text-[11px] text-slate-400 space-y-1">
+                <div className="flex items-center justify-between">
+                  <span>👑 Quản trị viên chính:</span>
+                  <strong className="text-emerald-400 font-mono">voduongphu@gmail.com / admin123</strong>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>🔑 Admin dự phòng:</span>
+                  <span className="text-slate-300 font-mono">phuvo / abc123</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>📦 Thủ kho:</span>
+                  <span className="text-slate-300 font-mono">cuongvo hoặc hieunl / 1234567</span>
+                </div>
               </div>
             </form>
           ) : (

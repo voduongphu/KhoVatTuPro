@@ -256,11 +256,11 @@ export const UserManagementView: React.FC = () => {
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
               </span>
-              Đồng bộ Cloud Firestore Realtime
+              Đồng bộ Cloud Supabase Realtime
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-1">
-            Quản trị viên chính: <strong className="text-indigo-600">voduongphu@gmail.com</strong>. Cấp quyền truy cập cho nhân viên bằng địa chỉ Google Mail của họ để đăng nhập nhanh không cần mật khẩu. Toàn bộ tài khoản và quyền hạn được lưu trữ và đồng bộ đám mây Cloud Firestore hai chiều.
+            Quản trị viên chính: <strong className="text-indigo-600">voduongphu@gmail.com</strong>. Cấp quyền truy cập cho nhân viên bằng địa chỉ Google Mail của họ để đăng nhập nhanh không cần mật khẩu. Toàn bộ tài khoản và quyền hạn được lưu trữ và đồng bộ đám mây Supabase hai chiều.
           </p>
         </div>
 
@@ -608,7 +608,7 @@ export const UserManagementView: React.FC = () => {
               <div className="p-3 bg-indigo-50/70 border border-indigo-100 rounded-xl text-xs text-indigo-900 flex items-start gap-2.5">
                 <ShieldCheck className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
                 <div className="leading-relaxed">
-                  Nhập địa chỉ <strong>Google Mail</strong> của người dùng để cấp quyền truy cập. Người dùng chỉ cần nhấn nút <em>&quot;Đăng nhập bằng Google Mail&quot;</em> trên màn hình đăng nhập là có thể truy cập hệ thống ngay lập tức. Dữ liệu được lưu trữ và đồng bộ đám mây Cloud Firestore.
+                  Nhập địa chỉ <strong>Google Mail</strong> của người dùng để cấp quyền truy cập. Người dùng chỉ cần nhấn nút <em>&quot;Đăng nhập bằng Google Mail&quot;</em> trên màn hình đăng nhập là có thể truy cập hệ thống ngay lập tức. Dữ liệu được lưu trữ và đồng bộ đám mây Supabase Realtime.
                 </div>
               </div>
 

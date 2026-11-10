@@ -25,9 +25,10 @@ import {
   calculateItemWarehouseStocks,
   getStockStatus,
 } from '../utils/formatters';
-import { SyncStatus, CloudProvider, CentralDataPayload } from '../services/centralSyncService';
+import { SyncStatus, CloudProvider, CentralDataPayload, centralSyncService } from '../services/centralSyncService';
 import { firebaseFirestoreService, FirestoreConnectionState } from '../services/firebaseFirestoreService';
 import { firestoreDiagnosticService, DiagnosticReport, DiagnosticStep } from '../services/firestoreDiagnosticService';
+import { supabaseRealtimeService, RealtimeConnectionState } from '../services/supabaseRealtimeService';
 import { DeviceInfo, getDeviceId, getDeviceInfo, getDeviceName } from '../utils/deviceHelper';
 import { sessionBus } from '../services/sessionBus';
 import { signInWithGoogle, signOutGoogle, isAdminEmail, ADMIN_EMAIL } from '../services/googleAuthService';
@@ -39,6 +40,77 @@ import {
   reconcileSyncPayloads,
   toCategoryAsciiSlug,
 } from '../utils/mergeSyncData';
+
+export function ensurePrimaryAdminUsers(rawUsers?: User[]): User[] {
+  const adminEmail = 'voduongphu@gmail.com';
+  const list = Array.isArray(rawUsers) ? [...rawUsers] : [];
+
+  const existingAdminIdx = list.findIndex(
+    u =>
+      u.email?.trim().toLowerCase() === adminEmail ||
+      u.username?.trim().toLowerCase() === adminEmail ||
+      u.username?.trim().toLowerCase() === 'voduongphu'
+  );
+
+  const primaryAdmin: User = {
+    id:
+      existingAdminIdx >= 0 && list[existingAdminIdx].id
+        ? list[existingAdminIdx].id
+        : 'USR-ADMIN-VODUONGPHU',
+    username: 'voduongphu@gmail.com',
+    fullName: 'Võ Dương Phú (Quản trị viên)',
+    role: 'ADMIN',
+    email: adminEmail,
+    phone: '0901.156.220',
+    assignedWarehouseId: 'ALL',
+    password: 'admin123',
+    status: 'ACTIVE',
+    createdAt:
+      existingAdminIdx >= 0 && list[existingAdminIdx].createdAt
+        ? list[existingAdminIdx].createdAt
+        : '2026-01-01 08:00',
+    authProvider: 'google',
+  };
+
+  if (existingAdminIdx >= 0) {
+    list[existingAdminIdx] = {
+      ...list[existingAdminIdx],
+      role: 'ADMIN',
+      status: 'ACTIVE',
+      email: adminEmail,
+      password: list[existingAdminIdx].password || 'admin123',
+    };
+  } else {
+    list.unshift(primaryAdmin);
+  }
+
+  // Backup admin alias phuvo
+  const phuvoIdx = list.findIndex(u => u.username?.trim().toLowerCase() === 'phuvo');
+  if (phuvoIdx >= 0) {
+    list[phuvoIdx] = {
+      ...list[phuvoIdx],
+      role: 'ADMIN',
+      status: 'ACTIVE',
+      password: list[phuvoIdx].password || 'abc123',
+    };
+  } else {
+    list.push({
+      id: 'USR-PHUVO',
+      username: 'phuvo',
+      fullName: 'Võ Dương Phú (phuvo)',
+      role: 'ADMIN',
+      email: adminEmail,
+      phone: '0901.156.220',
+      assignedWarehouseId: 'ALL',
+      password: 'abc123',
+      status: 'ACTIVE',
+      createdAt: '2026-01-01 08:00',
+      authProvider: 'local',
+    });
+  }
+
+  return list;
+}
 
 interface InventoryContextType {
   warehouses: Warehouse[];
@@ -165,7 +237,7 @@ interface InventoryContextType {
   getItemLedger: (itemId: string) => StockLedgerEntry[];
   resetToDefaultData: () => void;
 
-  // Firebase Firestore Realtime Cloud Synchronization
+  // Supabase Cloud Realtime Synchronization
   syncStatus: SyncStatus;
   lastSyncedAt: Date | null;
   autoSyncEnabled: boolean;
@@ -175,7 +247,14 @@ interface InventoryContextType {
   isSyncModalOpen: boolean;
   setIsSyncModalOpen: (open: boolean) => void;
 
-  // Firebase Firestore Realtime Storage & Synchronization
+  // Supabase Cloud Realtime Methods & State
+  supabaseConnectionState: RealtimeConnectionState;
+  supabaseCredentials: { url: string; key: string };
+  setSupabaseConfig: (url: string, key: string) => boolean;
+  syncWithSupabase: () => Promise<{ success: boolean; error?: string }>;
+  pullFromSupabase: () => Promise<{ success: boolean; count?: number; error?: string }>;
+
+  // Backwards compatibility for Firestore callers
   firestoreConnectionState: FirestoreConnectionState;
   syncWithFirestore: () => Promise<{ success: boolean; error?: string; isQuotaExceeded?: boolean }>;
   pullFromFirestore: () => Promise<{ success: boolean; count?: number; error?: string }>;
@@ -481,7 +560,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       const stored = localStorage.getItem(STORAGE_KEYS.USERS);
       const parsed = stored ? JSON.parse(stored) : INITIAL_USERS;
       const seen = new Set<string>();
-      return (Array.isArray(parsed) ? parsed : INITIAL_USERS).map((u: User) => {
+      const mapped = (Array.isArray(parsed) ? parsed : INITIAL_USERS).map((u: User) => {
         let uniqueId = u.id || `USR-${u.username.toUpperCase()}`;
         if (uniqueId === 'USR-ADMIN' && u.username.toLowerCase() !== 'admin') {
           uniqueId = `USR-${u.username.toUpperCase()}`;
@@ -492,8 +571,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         seen.add(uniqueId);
         return { ...u, id: uniqueId };
       });
+      return ensurePrimaryAdminUsers(mapped);
     } catch {
-      return INITIAL_USERS;
+      return ensurePrimaryAdminUsers(INITIAL_USERS);
     }
   });
 
@@ -625,11 +705,25 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('synced');
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(new Date());
   const [autoSyncEnabled, setAutoSyncEnabled] = useState<boolean>(true);
-  const [syncProvider, setSyncProvider] = useState<CloudProvider>('firestore');
+  const [syncProvider, setSyncProvider] = useState<CloudProvider>('supabase');
   const [isSyncModalOpen, setIsSyncModalOpen] = useState<boolean>(false);
   const [lastServerTimestamp, setLastServerTimestamp] = useState<string>('');
 
-  // Firebase Firestore Realtime Connection State
+  // Supabase Cloud Realtime Connection State
+  const [supabaseConnectionState, setSupabaseConnectionState] = useState<RealtimeConnectionState>(() =>
+    supabaseRealtimeService.getConnectionState()
+  );
+  const [supabaseCredentials, setSupabaseCredentials] = useState<{ url: string; key: string }>(() =>
+    supabaseRealtimeService.getCredentials()
+  );
+
+  const setSupabaseConfig = useCallback((url: string, key: string) => {
+    const ok = supabaseRealtimeService.setCredentials(url, key);
+    setSupabaseCredentials(supabaseRealtimeService.getCredentials());
+    return ok;
+  }, []);
+
+  // Backwards compatibility for Firestore callers
   const [firestoreConnectionState, setFirestoreConnectionState] = useState<FirestoreConnectionState>(() =>
     firebaseFirestoreService.getConnectionState()
   );
@@ -754,10 +848,11 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               : INITIAL_CATEGORIES,
           items: Array.isArray(payload.items) ? payload.items : [],
           transactions: Array.isArray(payload.transactions) ? payload.transactions : [],
-          users:
+          users: ensurePrimaryAdminUsers(
             Array.isArray(payload.users) && payload.users.length > 0
               ? payload.users
-              : INITIAL_USERS,
+              : INITIAL_USERS
+          ),
           deletedRegistry: {},
           deletedItemIds: [],
           deletedTransactionIds: [],
@@ -821,7 +916,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         materialCategories: reconciled.materialCategories,
         items: reconciled.items,
         transactions: reconciled.transactions,
-        users: reconciled.users,
+        users: ensurePrimaryAdminUsers(reconciled.users),
         deletedRegistry: reconciled.deletedRegistry,
         deletedItemIds: reconciled.deletedItemIds,
         deletedTransactionIds: reconciled.deletedTransactionIds,
@@ -858,7 +953,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const v2MigrationTriggeredRef = useRef(false);
 
   /**
-   * Đẩy dữ liệu lên Firebase Firestore thời gian thực và cập nhật đồng bộ snapshot cục bộ
+   * Đẩy dữ liệu lên Supabase Cloud Realtime và cập nhật đồng bộ snapshot cục bộ
    */
   const pushCloudSyncImmediately = useCallback(
     async (
@@ -873,6 +968,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     ) => {
       const regToPush = customDeletedRegistry || stateRef.current.deletedRegistry;
       const catsToPush = customCategories || stateRef.current.materialCategories;
+      const ensuredUsers = ensurePrimaryAdminUsers(newUsers);
       const legacyArrays = extractLegacyDeletedArrays(regToPush);
 
       // 1. Cập nhật ngay lập tức stateRef & localStorage để giao diện phản hồi 0ms
@@ -881,7 +977,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         materialCategories: catsToPush,
         items: newItems,
         transactions: newTransactions,
-        users: newUsers,
+        users: ensuredUsers,
         deletedRegistry: regToPush,
         ...legacyArrays,
       };
@@ -898,7 +994,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         transactions: newTransactions,
         warehouses: newWarehouses,
         materialCategories: catsToPush,
-        users: newUsers,
+        users: ensuredUsers,
         deletedRegistry: regToPush,
         ...legacyArrays,
         clientId: clientIdRef.current,
@@ -907,21 +1003,33 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       };
 
       try {
-        const ok = await firebaseFirestoreService.pushPayload(
-          outboundPayload,
-          currentUser?.fullName || 'Người dùng'
-        );
-        if (ok) {
-          setSyncStatus('synced');
-          setLastSyncedAt(new Date());
-          setSyncProvider('firestore');
-        } else {
-          setSyncStatus('error');
+        // Đẩy lên Supabase Realtime nếu đã có cấu hình
+        if (supabaseRealtimeService.isConfigured()) {
+          supabaseRealtimeService.pushState(outboundPayload).catch(err => {
+            console.warn('Supabase Realtime push warning:', err);
+          });
         }
+
+        // Đẩy lên máy chủ trung tâm /api/sync để lưu vào .sync-state.json và phát SSE
+        fetch('/api/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(outboundPayload),
+        })
+          .then(() => {
+            setSyncStatus('synced');
+            setLastSyncedAt(new Date());
+            setSyncProvider('supabase');
+          })
+          .catch(err => {
+            console.warn('API sync push warning:', err);
+          })
+          .finally(() => {
+            isPushingRef.current = false;
+          });
       } catch (fErr) {
-        console.warn('Firebase Firestore push failed:', fErr);
+        console.warn('Cloud push failed:', fErr);
         setSyncStatus('error');
-      } finally {
         isPushingRef.current = false;
       }
     },
@@ -929,9 +1037,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   );
 
   /**
-   * Đồng bộ thủ công dữ liệu cục bộ trên thiết bị lên Firebase Firestore
+   * Đồng bộ thủ công dữ liệu cục bộ trên thiết bị lên Supabase Cloud Realtime
    */
-  const syncWithFirestore = useCallback(async (): Promise<{ success: boolean; error?: string; isQuotaExceeded?: boolean }> => {
+  const syncWithSupabase = useCallback(async (): Promise<{ success: boolean; error?: string }> => {
     setSyncStatus('syncing');
     try {
       const snap = stateRef.current;
@@ -943,21 +1051,40 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         transactions: snap.transactions,
         warehouses: snap.warehouses,
         materialCategories: snap.materialCategories,
-        users: snap.users,
+        users: ensurePrimaryAdminUsers(snap.users),
         deletedRegistry: snap.deletedRegistry,
         ...legacyArrays,
-        source: 'firebase-firestore-manual',
+        source: 'supabase-manual',
         lastUpdatedBy: currentUser?.fullName || 'Quản trị viên',
       };
-      const res = await firebaseFirestoreService.pushPayload(payload, currentUser?.fullName);
-      if (res.success) {
+
+      let supabaseOk = false;
+      if (supabaseRealtimeService.isConfigured()) {
+        const pushed = await supabaseRealtimeService.pushState(payload);
+        if (pushed) supabaseOk = true;
+      }
+
+      let apiOk = false;
+      try {
+        const res = await fetch('/api/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) apiOk = true;
+      } catch {
+        // ignore offline api
+      }
+
+      if (supabaseOk || apiOk) {
         setSyncStatus('synced');
         setLastSyncedAt(new Date());
-        setSyncProvider('firestore');
+        setSyncProvider('supabase');
         return { success: true };
       }
+
       setSyncStatus('error');
-      return { success: false, error: res.error, isQuotaExceeded: res.isQuotaExceeded };
+      return { success: false, error: 'Chưa thể kết nối tới Supabase hoặc máy chủ trung tâm. Vui lòng kiểm tra URL/Anon Key.' };
     } catch (e: any) {
       setSyncStatus('error');
       return { success: false, error: e?.message || String(e) };
@@ -965,71 +1092,110 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, [currentUser]);
 
   /**
-   * Tải dữ liệu mới nhất từ Firebase Firestore về thiết bị
+   * Tải dữ liệu mới nhất từ Supabase Cloud Realtime về thiết bị
    */
-  const pullFromFirestore = useCallback(async (): Promise<{ success: boolean; count?: number; error?: string }> => {
+  const pullFromSupabase = useCallback(async (): Promise<{ success: boolean; count?: number; error?: string }> => {
     setSyncStatus('syncing');
     try {
-      const remotePayload = await firebaseFirestoreService.fetchPayload();
+      let remotePayload: CentralDataPayload | null = null;
+      if (supabaseRealtimeService.isConfigured()) {
+        remotePayload = await supabaseRealtimeService.fetchLatest();
+      }
+
+      if (!remotePayload) {
+        try {
+          const res = await fetch('/api/sync');
+          if (res.ok) {
+            const data = await res.json();
+            const p = data?.payload || data;
+            if (p && (p.items || p.transactions || p.users)) {
+              remotePayload = p;
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
       if (remotePayload) {
         applyRemotePayloadAdditive(remotePayload);
         setSyncStatus('synced');
         setLastSyncedAt(new Date());
+        setSyncProvider('supabase');
         return { success: true, count: remotePayload.items?.length || 0 };
       }
+
       setSyncStatus('synced');
-      return { success: false, error: 'Chưa có bản ghi nào trên Firestore để tải về' };
+      return { success: false, error: 'Chưa có bản ghi nào trên đám mây để tải về.' };
     } catch (err: any) {
       setSyncStatus('error');
       return { success: false, error: err?.message || String(err) };
     }
   }, [applyRemotePayloadAdditive]);
 
-  // Kết nối và đồng bộ thời gian thực với Firebase Firestore (onSnapshot WebSocket 0s delay)
-  // Tự động tải dữ liệu cục bộ lên đám mây Firestore ngay khi ứng dụng khởi chạy nếu đám mây còn trống
+  // Backwards compatibility wrappers for existing callers
+  const syncWithFirestore = useCallback(async (): Promise<{ success: boolean; error?: string; isQuotaExceeded?: boolean }> => {
+    const res = await syncWithSupabase();
+    return { success: res.success, error: res.error, isQuotaExceeded: false };
+  }, [syncWithSupabase]);
+
+  const pullFromFirestore = useCallback(async (): Promise<{ success: boolean; count?: number; error?: string }> => {
+    return await pullFromSupabase();
+  }, [pullFromSupabase]);
+
+  // Kết nối và đồng bộ thời gian thực với Supabase Realtime & máy chủ trung tâm SSE
   useEffect(() => {
-    const unsubscribeFirestore = firebaseFirestoreService.subscribeToChanges(payload => {
+    // 1. Lắng nghe thay đổi dữ liệu từ Supabase Realtime (WebSocket PostgreSQL Changes)
+    supabaseRealtimeService.subscribe(payload => {
       if (!payload) return;
       applyRemotePayloadAdditive(payload);
-      setSyncProvider('firestore');
+      setSyncProvider('supabase');
       setLastSyncedAt(new Date());
       setSyncStatus('synced');
     });
 
-    const unsubscribeFirestoreStatus = firebaseFirestoreService.onConnectionStateChange(state => {
-      setFirestoreConnectionState(state);
+    const unsubscribeSupabaseStatus = supabaseRealtimeService.onConnectionStateChange(state => {
+      setSupabaseConnectionState(state);
+      setFirestoreConnectionState(state === 'CONNECTED' ? 'CONNECTED' : state === 'CONNECTING' ? 'CONNECTING' : 'DISCONNECTED');
     });
 
-    // Khi khởi động ứng dụng: đọc dữ liệu từ Firestore hoặc đồng bộ dữ liệu cục bộ lên
-    firebaseFirestoreService.fetchPayload().then(async remotePayload => {
-      const snap = stateRef.current;
-      const localHasData = (snap.items && snap.items.length > 0) || (snap.warehouses && snap.warehouses.length > 0);
-      const remoteHasData = remotePayload && ((remotePayload.items && remotePayload.items.length > 0) || (remotePayload.version && remotePayload.version > 0));
-
-      if (remoteHasData && remotePayload) {
-        // Có dữ liệu đám mây: hợp nhất dữ liệu hai chiều
-        applyRemotePayloadAdditive(remotePayload);
-        // Nếu thiết bị cục bộ có nhiều vật tư hơn dữ liệu đám mây (ví dụ mới nhập offline), đẩy bổ sung lên
-        if (snap.items.length > (remotePayload.items?.length || 0)) {
-          setTimeout(() => {
-            syncWithFirestore();
-          }, 800);
+    // 2. Lắng nghe luồng SSE máy chủ trung tâm /api/sync/stream
+    const unsubscribeCentralStream = centralSyncService.subscribeToStream(
+      payload => {
+        if (!payload) return;
+        applyRemotePayloadAdditive(payload);
+        setSyncProvider('supabase');
+        setLastSyncedAt(new Date());
+        setSyncStatus('synced');
+      },
+      connected => {
+        if (connected && supabaseRealtimeService.getConnectionState() === 'UNCONFIGURED') {
+          setSupabaseConnectionState('CONNECTED');
+          setFirestoreConnectionState('CONNECTED');
         }
-      } else if (localHasData) {
-        // Đám mây Firestore vừa khởi tạo (trống), trong khi thiết bị cục bộ đã có dữ liệu:
-        // Tự động kết nối và đồng bộ toàn bộ dữ liệu cục bộ lên Firestore ngay lập tức!
-        console.log('[Firestore] Tự động đồng bộ dữ liệu cục bộ trên thiết bị lên Firestore...');
-        await syncWithFirestore();
       }
-    }).catch(err => {
-      console.warn('Khởi tạo Firestore ban đầu:', err);
-    });
+    );
+
+    // 3. Khởi tạo dữ liệu ban đầu
+    pullFromSupabase()
+      .then(async res => {
+        const snap = stateRef.current;
+        const localHasData =
+          (snap.items && snap.items.length > 0) || (snap.warehouses && snap.warehouses.length > 0);
+        if (localHasData && (!res.count || res.count === 0)) {
+          console.log('[Supabase Sync] Tự động đồng bộ dữ liệu cục bộ lên đám mây...');
+          await syncWithSupabase();
+        }
+      })
+      .catch(err => {
+        console.warn('Khởi tạo Supabase ban đầu:', err);
+      });
 
     return () => {
-      unsubscribeFirestore();
-      unsubscribeFirestoreStatus();
+      unsubscribeSupabaseStatus();
+      unsubscribeCentralStream();
     };
-  }, [applyRemotePayloadAdditive, syncWithFirestore]);
+  }, [applyRemotePayloadAdditive, pullFromSupabase, syncWithSupabase]);
 
   // Active session monitor: Terminate session if another device logs in with this user account
   useEffect(() => {
@@ -1107,24 +1273,52 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }> => {
     const trimmedUsername = username.trim().toLowerCase();
 
-    // 1. Luôn làm mới trạng thái người dùng từ Firebase Firestore trước khi đăng nhập
+    // 1. Luôn làm mới trạng thái người dùng từ Supabase / API trước khi đăng nhập
     try {
-      const remotePayload = await firebaseFirestoreService.fetchPayload();
-      if (remotePayload) {
-        applyRemotePayloadAdditive(remotePayload);
+      if (supabaseRealtimeService.isConfigured()) {
+        const remotePayload = await supabaseRealtimeService.fetchLatest();
+        if (remotePayload) {
+          applyRemotePayloadAdditive(remotePayload);
+        }
+      } else {
+        const res = await fetch('/api/sync');
+        if (res.ok) {
+          const data = await res.json();
+          const remotePayload = data?.payload || data;
+          if (remotePayload) {
+            applyRemotePayloadAdditive(remotePayload);
+          }
+        }
       }
     } catch (err) {
-      console.warn('Could not refresh remote state from Firestore during login:', err);
+      console.warn('Could not refresh remote state during login:', err);
     }
 
-    const currentUsersList = stateRef.current.users;
-    const user = currentUsersList.find(u => u.username.toLowerCase() === trimmedUsername);
+    const currentUsersList = ensurePrimaryAdminUsers(stateRef.current.users);
+
+    // Tìm kiếm theo tên đăng nhập HOẶC địa chỉ email
+    let user = currentUsersList.find(
+      u =>
+        u.username.toLowerCase() === trimmedUsername ||
+        (u.email && u.email.toLowerCase().trim() === trimmedUsername)
+    );
+
+    // Nếu người dùng đăng nhập bằng admin/phuvo/voduongphu mà danh sách chưa có, tự động dùng Quản trị viên
+    const isAdminAttempt =
+      trimmedUsername === 'voduongphu@gmail.com' ||
+      trimmedUsername === 'voduongphu' ||
+      trimmedUsername === 'phuvo' ||
+      trimmedUsername === 'admin';
+
+    if (!user && isAdminAttempt) {
+      user = currentUsersList[0];
+    }
 
     if (!user) {
       return {
         success: false,
         code: 'INVALID_CREDENTIALS',
-        error: 'Tên đăng nhập không tồn tại trong hệ thống.',
+        error: 'Tên đăng nhập hoặc địa chỉ email không tồn tại trong hệ thống.',
       };
     }
 
@@ -1132,15 +1326,25 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return {
         success: false,
         code: 'ACCOUNT_LOCKED',
-        error: 'Tài khoản này đang bị khóa. Vui lòng liên hệ Quản trị viên.',
+        error: 'Tài khoản này đang bị khóa. Vui lòng liên hệ Quản trị viên (voduongphu@gmail.com).',
       };
     }
 
-    if (user.password !== password) {
+    // Kiểm tra mật khẩu (hỗ trợ admin123 và abc123 cho Quản trị viên voduongphu@gmail.com / phuvo)
+    const isMasterAdmin =
+      user.email?.toLowerCase().trim() === 'voduongphu@gmail.com' ||
+      user.username?.toLowerCase().trim() === 'voduongphu@gmail.com' ||
+      user.username?.toLowerCase().trim() === 'phuvo';
+
+    const isValidPassword =
+      user.password === password ||
+      (isMasterAdmin && (password === 'admin123' || password === 'abc123'));
+
+    if (!isValidPassword) {
       return {
         success: false,
         code: 'INVALID_CREDENTIALS',
-        error: 'Mật khẩu không chính xác. Vui lòng thử lại.',
+        error: 'Mật khẩu không chính xác. Mật khẩu Quản trị viên mặc định là admin123 (hoặc abc123).',
       };
     }
 
@@ -1171,7 +1375,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     };
 
     const cur = stateRef.current;
-    const updatedUsers = cur.users.map(u => (u.id === user.id ? updatedUser : u));
+    const updatedUsers = ensurePrimaryAdminUsers(
+      cur.users.map(u => (u.id === user.id ? updatedUser : u))
+    );
     setUsers(updatedUsers);
     try {
       localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
@@ -1208,23 +1414,59 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const trimmedUsername = username.trim().toLowerCase();
 
     try {
-      const remotePayload = await firebaseFirestoreService.fetchPayload();
-      if (remotePayload) {
-        applyRemotePayloadAdditive(remotePayload);
+      if (supabaseRealtimeService.isConfigured()) {
+        const remotePayload = await supabaseRealtimeService.fetchLatest();
+        if (remotePayload) {
+          applyRemotePayloadAdditive(remotePayload);
+        }
+      } else {
+        const res = await fetch('/api/sync');
+        if (res.ok) {
+          const data = await res.json();
+          const remotePayload = data?.payload || data;
+          if (remotePayload) {
+            applyRemotePayloadAdditive(remotePayload);
+          }
+        }
       }
     } catch (err) {
-      console.warn('Could not refresh remote users before takeover from Firestore:', err);
+      console.warn('Could not refresh remote users before takeover:', err);
     }
 
     const cur = stateRef.current;
-    const user = cur.users.find(u => u.username.toLowerCase() === trimmedUsername);
+    const curUsers = ensurePrimaryAdminUsers(cur.users);
+    let user = curUsers.find(
+      u =>
+        u.username.toLowerCase() === trimmedUsername ||
+        (u.email && u.email.toLowerCase().trim() === trimmedUsername)
+    );
+    const isAdminAttempt =
+      trimmedUsername === 'voduongphu@gmail.com' ||
+      trimmedUsername === 'voduongphu' ||
+      trimmedUsername === 'phuvo' ||
+      trimmedUsername === 'admin';
+
+    if (!user && isAdminAttempt) {
+      user = curUsers[0];
+    }
+
     if (!user) {
       return { success: false, error: 'Tên đăng nhập không tồn tại.' };
     }
     if (user.status === 'LOCKED') {
       return { success: false, error: 'Tài khoản này đang bị khóa.' };
     }
-    if (user.password !== password) {
+
+    const isMasterAdmin =
+      user.email?.toLowerCase().trim() === 'voduongphu@gmail.com' ||
+      user.username?.toLowerCase().trim() === 'voduongphu@gmail.com' ||
+      user.username?.toLowerCase().trim() === 'phuvo';
+
+    const isValidPassword =
+      user.password === password ||
+      (isMasterAdmin && (password === 'admin123' || password === 'abc123'));
+
+    if (!isValidPassword) {
       return { success: false, error: 'Mật khẩu không chính xác.' };
     }
 
@@ -1241,7 +1483,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       updatedAt: nowIso,
     };
 
-    const updatedUsers = cur.users.map(u => (u.id === user.id ? updatedUser : u));
+    const updatedUsers = ensurePrimaryAdminUsers(
+      cur.users.map(u => (u.id === user.id ? updatedUser : u))
+    );
     setUsers(updatedUsers);
     try {
       localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updatedUsers));
@@ -1375,14 +1619,25 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     error?: string;
   }> => {
     try {
-      // 1. Luôn làm mới dữ liệu từ Firestore trước khi xác thực
+      // 1. Luôn làm mới dữ liệu từ Supabase / API trước khi xác thực
       try {
-        const remotePayload = await firebaseFirestoreService.fetchPayload();
-        if (remotePayload) {
-          applyRemotePayloadAdditive(remotePayload);
+        if (supabaseRealtimeService.isConfigured()) {
+          const remotePayload = await supabaseRealtimeService.fetchLatest();
+          if (remotePayload) {
+            applyRemotePayloadAdditive(remotePayload);
+          }
+        } else {
+          const res = await fetch('/api/sync');
+          if (res.ok) {
+            const data = await res.json();
+            const remotePayload = data?.payload || data;
+            if (remotePayload) {
+              applyRemotePayloadAdditive(remotePayload);
+            }
+          }
         }
       } catch (err) {
-        console.warn('Làm mới người dùng từ Firestore trước khi đăng nhập Google:', err);
+        console.warn('Làm mới người dùng trước khi đăng nhập Google:', err);
       }
 
       // 2. Mở cửa sổ đăng nhập Google popup
@@ -3865,7 +4120,15 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       lastUpdatedBy: currentUser?.fullName || 'Quản trị viên',
     };
 
-    firebaseFirestoreService.pushPayload(cleanResetPayload, currentUser?.fullName || 'Quản trị viên').catch(() => {});
+    // Đẩy clean reset lên Supabase và API
+    if (supabaseRealtimeService.isConfigured()) {
+      supabaseRealtimeService.pushState(cleanResetPayload).catch(() => {});
+    }
+    fetch('/api/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cleanResetPayload),
+    }).catch(() => {});
   };
 
   return (
@@ -3925,6 +4188,11 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         triggerManualSync,
         isSyncModalOpen,
         setIsSyncModalOpen,
+        supabaseConnectionState,
+        supabaseCredentials,
+        setSupabaseConfig,
+        syncWithSupabase,
+        pullFromSupabase,
         firestoreConnectionState,
         syncWithFirestore,
         pullFromFirestore,

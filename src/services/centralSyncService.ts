@@ -9,7 +9,7 @@ import {
 import { DeletedRegistry } from '../utils/mergeSyncData';
 
 export type SyncStatus = 'synced' | 'syncing' | 'offline' | 'error';
-export type CloudProvider = 'firestore' | 'local';
+export type CloudProvider = 'supabase' | 'firestore' | 'central-server' | 'local';
 
 export interface CentralDataPayload {
   version: number;
@@ -49,7 +49,7 @@ export interface SyncResult {
 class CentralSyncService {
   private lastFetchedTimestamp: string | null = null;
   private currentVersion: number = 0;
-  private provider: CloudProvider = 'firestore';
+  private provider: CloudProvider = 'supabase';
   private eventSource: EventSource | null = null;
   private reconnectTimer: any = null;
 
@@ -58,8 +58,8 @@ class CentralSyncService {
   }
 
   public detectProvider(): CloudProvider {
-    this.provider = 'firestore';
-    return 'firestore';
+    this.provider = 'supabase';
+    return 'supabase';
   }
 
   public getProvider(): CloudProvider {

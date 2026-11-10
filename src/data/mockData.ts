@@ -62,6 +62,7 @@ export const INITIAL_USERS: User[] = [
   {
     id: 'USR-ADMIN-VODUONGPHU',
     username: 'voduongphu@gmail.com',
+    password: 'admin123',
     fullName: 'Võ Dương Phú (Admin)',
     role: 'ADMIN',
     email: 'voduongphu@gmail.com',
@@ -70,6 +71,19 @@ export const INITIAL_USERS: User[] = [
     status: 'ACTIVE',
     createdAt: '2026-01-01 08:00',
     authProvider: 'google',
+  },
+  {
+    id: 'USR-PHUVO',
+    username: 'phuvo',
+    password: 'abc123',
+    fullName: 'Võ Dương Phú (phuvo)',
+    role: 'ADMIN',
+    email: 'voduongphu@gmail.com',
+    phone: '0901.156.220',
+    assignedWarehouseId: 'ALL',
+    status: 'ACTIVE',
+    createdAt: '2026-01-01 08:00',
+    authProvider: 'local',
   },
   {
     id: 'USR-ADMIN',
