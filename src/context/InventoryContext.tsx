@@ -42,74 +42,36 @@ import {
 } from '../utils/mergeSyncData';
 
 export function ensurePrimaryAdminUsers(rawUsers?: User[]): User[] {
-  const adminEmail = 'voduongphu@gmail.com';
   const list = Array.isArray(rawUsers) ? [...rawUsers] : [];
 
-  const existingAdminIdx = list.findIndex(
-    u =>
-      u.email?.trim().toLowerCase() === adminEmail ||
-      u.username?.trim().toLowerCase() === adminEmail ||
-      u.username?.trim().toLowerCase() === 'voduongphu'
-  );
+  // Xóa bỏ tất cả các tài khoản Admin khác, chỉ giữ lại DUY NHẤT 1 tài khoản Admin là 'phuvo'
+  const nonAdminUsers = list.filter(u => {
+    const normUsername = u.username?.trim().toLowerCase();
+    // Bỏ qua tài khoản phuvo (sẽ xử lý ở bên dưới)
+    if (normUsername === 'phuvo') return false;
+    // Loại bỏ tất cả tài khoản có role ADMIN khác và các tài khoản admin cũ
+    if (u.role === 'ADMIN') return false;
+    if (normUsername === 'voduongphu@gmail.com' || normUsername === 'admin' || normUsername === 'voduongphu') return false;
+    return true;
+  });
 
-  const primaryAdmin: User = {
-    id:
-      existingAdminIdx >= 0 && list[existingAdminIdx].id
-        ? list[existingAdminIdx].id
-        : 'USR-ADMIN-VODUONGPHU',
-    username: 'voduongphu@gmail.com',
-    fullName: 'Võ Dương Phú (Quản trị viên)',
+  const existingPhuvo = list.find(u => u.username?.trim().toLowerCase() === 'phuvo');
+
+  const phuvoAdmin: User = {
+    id: existingPhuvo?.id || 'USR-PHUVO',
+    username: 'phuvo',
+    fullName: existingPhuvo?.fullName || 'Võ Dương Phú (phuvo)',
     role: 'ADMIN',
-    email: adminEmail,
-    phone: '0901.156.220',
+    email: existingPhuvo?.email || 'voduongphu@gmail.com',
+    phone: existingPhuvo?.phone || '0901.156.220',
     assignedWarehouseId: 'ALL',
-    password: 'admin123',
+    password: 'abc123',
     status: 'ACTIVE',
-    createdAt:
-      existingAdminIdx >= 0 && list[existingAdminIdx].createdAt
-        ? list[existingAdminIdx].createdAt
-        : '2026-01-01 08:00',
-    authProvider: 'google',
+    createdAt: existingPhuvo?.createdAt || '2026-01-01 08:00',
+    authProvider: 'local',
   };
 
-  if (existingAdminIdx >= 0) {
-    list[existingAdminIdx] = {
-      ...list[existingAdminIdx],
-      role: 'ADMIN',
-      status: 'ACTIVE',
-      email: adminEmail,
-      password: list[existingAdminIdx].password || 'admin123',
-    };
-  } else {
-    list.unshift(primaryAdmin);
-  }
-
-  // Backup admin alias phuvo
-  const phuvoIdx = list.findIndex(u => u.username?.trim().toLowerCase() === 'phuvo');
-  if (phuvoIdx >= 0) {
-    list[phuvoIdx] = {
-      ...list[phuvoIdx],
-      role: 'ADMIN',
-      status: 'ACTIVE',
-      password: list[phuvoIdx].password || 'abc123',
-    };
-  } else {
-    list.push({
-      id: 'USR-PHUVO',
-      username: 'phuvo',
-      fullName: 'Võ Dương Phú (phuvo)',
-      role: 'ADMIN',
-      email: adminEmail,
-      phone: '0901.156.220',
-      assignedWarehouseId: 'ALL',
-      password: 'abc123',
-      status: 'ACTIVE',
-      createdAt: '2026-01-01 08:00',
-      authProvider: 'local',
-    });
-  }
-
-  return list;
+  return [phuvoAdmin, ...nonAdminUsers];
 }
 
 interface InventoryContextType {
@@ -1303,15 +1265,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         (u.email && u.email.toLowerCase().trim() === trimmedUsername)
     );
 
-    // Nếu người dùng đăng nhập bằng admin/phuvo/voduongphu mà danh sách chưa có, tự động dùng Quản trị viên
-    const isAdminAttempt =
-      trimmedUsername === 'voduongphu@gmail.com' ||
-      trimmedUsername === 'voduongphu' ||
-      trimmedUsername === 'phuvo' ||
-      trimmedUsername === 'admin';
-
-    if (!user && isAdminAttempt) {
-      user = currentUsersList[0];
+    // Nếu người dùng đăng nhập bằng phuvo mà danh sách chưa có, tự động dùng Quản trị viên phuvo
+    if (!user && trimmedUsername === 'phuvo') {
+      user = currentUsersList.find(u => u.username?.toLowerCase() === 'phuvo') || currentUsersList[0];
     }
 
     if (!user) {
@@ -1326,19 +1282,15 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return {
         success: false,
         code: 'ACCOUNT_LOCKED',
-        error: 'Tài khoản này đang bị khóa. Vui lòng liên hệ Quản trị viên (voduongphu@gmail.com).',
+        error: 'Tài khoản này đang bị khóa. Vui lòng liên hệ Quản trị viên (phuvo).',
       };
     }
 
-    // Kiểm tra mật khẩu (hỗ trợ admin123 và abc123 cho Quản trị viên voduongphu@gmail.com / phuvo)
-    const isMasterAdmin =
-      user.email?.toLowerCase().trim() === 'voduongphu@gmail.com' ||
-      user.username?.toLowerCase().trim() === 'voduongphu@gmail.com' ||
-      user.username?.toLowerCase().trim() === 'phuvo';
-
+    // Kiểm tra mật khẩu (hỗ trợ abc123 cho Quản trị viên duy nhất phuvo)
+    const isPhuvoAdmin = user.username?.toLowerCase().trim() === 'phuvo';
     const isValidPassword =
       user.password === password ||
-      (isMasterAdmin && (password === 'admin123' || password === 'abc123'));
+      (isPhuvoAdmin && password === 'abc123');
 
     if (!isValidPassword) {
       return {
@@ -1440,14 +1392,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         u.username.toLowerCase() === trimmedUsername ||
         (u.email && u.email.toLowerCase().trim() === trimmedUsername)
     );
-    const isAdminAttempt =
-      trimmedUsername === 'voduongphu@gmail.com' ||
-      trimmedUsername === 'voduongphu' ||
-      trimmedUsername === 'phuvo' ||
-      trimmedUsername === 'admin';
-
-    if (!user && isAdminAttempt) {
-      user = curUsers[0];
+    if (!user && trimmedUsername === 'phuvo') {
+      user = curUsers.find(u => u.username?.toLowerCase() === 'phuvo') || curUsers[0];
     }
 
     if (!user) {
@@ -1457,14 +1403,10 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Tài khoản này đang bị khóa.' };
     }
 
-    const isMasterAdmin =
-      user.email?.toLowerCase().trim() === 'voduongphu@gmail.com' ||
-      user.username?.toLowerCase().trim() === 'voduongphu@gmail.com' ||
-      user.username?.toLowerCase().trim() === 'phuvo';
-
+    const isPhuvoAdmin = user.username?.toLowerCase().trim() === 'phuvo';
     const isValidPassword =
       user.password === password ||
-      (isMasterAdmin && (password === 'admin123' || password === 'abc123'));
+      (isPhuvoAdmin && password === 'abc123');
 
     if (!isValidPassword) {
       return { success: false, error: 'Mật khẩu không chính xác.' };
@@ -1846,17 +1788,15 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Không tìm thấy tài khoản người dùng.' };
     }
 
-    // Bảo vệ Quản trị viên tối cao: voduongphu@gmail.com
-    const isVoduongphu =
-      existingUser.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase() ||
-      existingUser.username?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase();
+    // Bảo vệ Quản trị viên duy nhất: phuvo
+    const isPhuvo = existingUser.username?.toLowerCase().trim() === 'phuvo';
 
-    if (isVoduongphu) {
+    if (isPhuvo) {
       if (updates.role && updates.role !== 'ADMIN') {
-        return { success: false, error: 'Không thể hạ quyền Quản trị viên Hệ thống chính (voduongphu@gmail.com)!' };
+        return { success: false, error: 'Không thể hạ quyền Quản trị viên duy nhất (phuvo)!' };
       }
       if (updates.status && updates.status !== 'ACTIVE') {
-        return { success: false, error: 'Không thể khóa Quản trị viên Hệ thống chính (voduongphu@gmail.com)!' };
+        return { success: false, error: 'Không thể khóa Quản trị viên duy nhất (phuvo)!' };
       }
     }
 
@@ -1930,13 +1870,11 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Không tìm thấy tài khoản cần xóa.' };
     }
 
-    // Bảo vệ Quản trị viên tối cao: voduongphu@gmail.com
-    const isVoduongphu =
-      targetUser.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase() ||
-      targetUser.username?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase();
+    // Bảo vệ Quản trị viên duy nhất: phuvo
+    const isPhuvo = targetUser.username?.toLowerCase().trim() === 'phuvo';
 
-    if (isVoduongphu) {
-      return { success: false, error: 'Không thể xóa tài khoản Quản trị viên Hệ thống chính (voduongphu@gmail.com)!' };
+    if (isPhuvo) {
+      return { success: false, error: 'Không thể xóa tài khoản Quản trị viên duy nhất (phuvo)!' };
     }
 
     const targetNormUsername = targetUser.username?.trim().toLowerCase();

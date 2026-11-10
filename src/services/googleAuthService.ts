@@ -7,6 +7,7 @@ import {
 } from 'firebase/auth';
 import { auth } from './firebase';
 
+export const ADMIN_USERNAME = 'phuvo';
 export const ADMIN_EMAIL = 'voduongphu@gmail.com';
 
 // Cấu hình Google Auth Provider đơn giản và nhanh chóng
@@ -26,11 +27,12 @@ export interface GoogleAuthResult {
 }
 
 /**
- * Kiểm tra xem email có phải là quản trị viên hệ thống (voduongphu@gmail.com) không
+ * Kiểm tra xem tài khoản có phải là quản trị viên hệ thống duy nhất (phuvo) không
  */
-export function isAdminEmail(email: string | null | undefined): boolean {
-  if (!email) return false;
-  return email.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase();
+export function isAdminEmail(identifier: string | null | undefined): boolean {
+  if (!identifier) return false;
+  const clean = identifier.trim().toLowerCase();
+  return clean === ADMIN_USERNAME.toLowerCase();
 }
 
 /**
