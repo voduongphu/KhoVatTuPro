@@ -21,6 +21,7 @@ import { useInventory } from '../context/InventoryContext';
 import { User, UserRole } from '../types/inventory';
 import { formatDate, getUserRoleLabel } from '../utils/formatters';
 import { ConfirmDeleteModal } from './ConfirmDeleteModal';
+import { ADMIN_EMAIL, isAdminEmail } from '../services/googleAuthService';
 
 export const UserManagementView: React.FC = () => {
   const {
@@ -92,11 +93,11 @@ export const UserManagementView: React.FC = () => {
   const handleOpenEdit = (user: User) => {
     setEditingUser(user);
     setUsername(user.username);
-    setPassword(user.password);
+    setPassword(user.password || '');
     setFullName(user.fullName);
     setRole(user.role);
-    setEmail(user.email);
-    setPhone(user.phone);
+    setEmail(user.email || '');
+    setPhone(user.phone || '');
     setAssignedWarehouseId(user.assignedWarehouseId);
     setStatus(user.status);
     setFormError('');
@@ -107,29 +108,36 @@ export const UserManagementView: React.FC = () => {
     e.preventDefault();
     setFormError('');
 
-    if (!username.trim()) {
-      setFormError('Vui lòng nhập tên đăng nhập.');
-      return;
-    }
-    if (!password.trim()) {
-      setFormError('Vui lòng nhập mật khẩu.');
+    const finalEmail = email.trim().toLowerCase();
+    const finalUsername = (username.trim() || finalEmail).toLowerCase();
+    const finalPassword = password.trim() || 'google-auth-user';
+
+    if (!finalEmail && !finalUsername) {
+      setFormError('Vui lòng nhập địa chỉ Google Mail hoặc Tên đăng nhập.');
       return;
     }
     if (!fullName.trim()) {
-      setFormError('Vui lòng nhập họ và tên.');
+      setFormError('Vui lòng nhập họ và tên người sử dụng.');
       return;
     }
 
     if (editingUser) {
+      const isMainAdmin = isAdminEmail(editingUser.email) || isAdminEmail(editingUser.username);
+      if (isMainAdmin && role !== 'ADMIN') {
+        setFormError('Không thể hạ quyền Quản trị viên Hệ thống chính (voduongphu@gmail.com)!');
+        return;
+      }
+
       const res = updateUser(editingUser.id, {
-        username: username.trim(),
-        password: password.trim(),
+        username: finalUsername,
+        password: finalPassword,
         fullName: fullName.trim(),
-        role,
-        email: email.trim(),
+        role: isMainAdmin ? 'ADMIN' : role,
+        email: finalEmail,
         phone: phone.trim(),
         assignedWarehouseId,
-        status,
+        status: isMainAdmin ? 'ACTIVE' : status,
+        authProvider: finalEmail.includes('@') ? 'google' : 'local',
       });
 
       if (!res.success) {
@@ -138,14 +146,15 @@ export const UserManagementView: React.FC = () => {
       }
     } else {
       const res = addUser({
-        username: username.trim(),
-        password: password.trim(),
+        username: finalUsername,
+        password: finalPassword,
         fullName: fullName.trim(),
         role,
-        email: email.trim(),
+        email: finalEmail,
         phone: phone.trim(),
         assignedWarehouseId,
         status,
+        authProvider: finalEmail.includes('@') ? 'google' : 'local',
       });
 
       if (!res.success) {
@@ -161,6 +170,13 @@ export const UserManagementView: React.FC = () => {
   const [notification, setNotification] = useState<{ text: string; type: 'error' | 'success' } | null>(null);
 
   const handleToggleLock = (user: User) => {
+    if (isAdminEmail(user.email) || isAdminEmail(user.username)) {
+      setNotification({
+        text: 'Không thể khóa tài khoản Quản trị viên Hệ thống chính (voduongphu@gmail.com)!',
+        type: 'error',
+      });
+      return;
+    }
     if (user.id === currentUser?.id) {
       setNotification({
         text: 'Không thể khóa chính tài khoản bạn đang đăng nhập!',
@@ -184,6 +200,13 @@ export const UserManagementView: React.FC = () => {
   };
 
   const handleDelete = (user: User) => {
+    if (isAdminEmail(user.email) || isAdminEmail(user.username)) {
+      setNotification({
+        text: 'Không thể xóa tài khoản Quản trị viên Hệ thống chính (voduongphu@gmail.com)!',
+        type: 'error',
+      });
+      return;
+    }
     if (user.id === currentUser?.id) {
       setNotification({
         text: 'Không thể xóa chính tài khoản bạn đang đăng nhập!',
@@ -226,18 +249,18 @@ export const UserManagementView: React.FC = () => {
           <div className="flex items-center gap-2 flex-wrap">
             <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
               <Users className="w-5 h-5 text-indigo-600" />
-              <span>Quản Lý Người Sử Dụng &amp; Phân Quyền</span>
+              <span>Quản Lý Người Sử Dụng &amp; Google Mail</span>
             </h2>
             <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-50 border border-emerald-200 text-emerald-700 shadow-2xs">
               <span className="relative flex h-2 w-2">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
               </span>
-              Đồng bộ Realtime đa thiết bị
+              Đồng bộ Cloud Firestore Realtime
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-1">
-            Phân quyền nghiệp vụ: Quản trị viên (Admin), Thủ kho và Nhân viên kỹ thuật. Mọi thay đổi tài khoản tự động đồng bộ ngay lập tức tới các thiết bị khác.
+            Quản trị viên chính: <strong className="text-indigo-600">voduongphu@gmail.com</strong>. Cấp quyền truy cập cho nhân viên bằng địa chỉ Google Mail của họ để đăng nhập nhanh không cần mật khẩu. Toàn bộ tài khoản và quyền hạn được lưu trữ và đồng bộ đám mây Cloud Firestore hai chiều.
           </p>
         </div>
 
@@ -346,6 +369,7 @@ export const UserManagementView: React.FC = () => {
               {users.map(u => {
                 const assignedWh = warehouses.find(w => w.id === u.assignedWarehouseId);
                 const isCurrent = u.id === currentUser?.id;
+                const isMainAdmin = isAdminEmail(u.email) || isAdminEmail(u.username);
                 const isOnlyActiveAdmin =
                   u.role === 'ADMIN' && u.status === 'ACTIVE' && activeAdminCount <= 1;
 
@@ -356,7 +380,9 @@ export const UserManagementView: React.FC = () => {
                       <div className="flex items-center gap-3">
                         <div
                           className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs text-white ${
-                            u.role === 'ADMIN'
+                            isMainAdmin
+                              ? 'bg-amber-600 ring-2 ring-amber-300'
+                              : u.role === 'ADMIN'
                               ? 'bg-indigo-600'
                               : u.role === 'THU_KHO'
                               ? 'bg-emerald-600'
@@ -366,8 +392,14 @@ export const UserManagementView: React.FC = () => {
                           {u.fullName.charAt(0).toUpperCase()}
                         </div>
                         <div>
-                          <div className="font-semibold text-slate-900 flex items-center gap-1.5">
+                          <div className="font-semibold text-slate-900 flex items-center gap-1.5 flex-wrap">
                             <span>{u.fullName}</span>
+                            {isMainAdmin && (
+                              <span className="text-[10px] bg-amber-50 text-amber-800 border border-amber-300 px-1.5 py-0.5 rounded font-bold flex items-center gap-1 shadow-2xs">
+                                <ShieldCheck className="w-3 h-3 text-amber-600 inline shrink-0" />
+                                Admin Chính
+                              </span>
+                            )}
                             {isCurrent && (
                               <span className="text-[10px] bg-indigo-50 text-indigo-700 border border-indigo-200 px-1.5 py-0.2 rounded font-medium">
                                 Bạn
@@ -385,14 +417,16 @@ export const UserManagementView: React.FC = () => {
                     <td className="py-3.5 px-3 whitespace-nowrap">
                       <span
                         className={`inline-block px-2.5 py-1 rounded text-[11px] font-semibold ${
-                          u.role === 'ADMIN'
+                          isMainAdmin
+                            ? 'bg-amber-50 text-amber-800 border border-amber-300'
+                            : u.role === 'ADMIN'
                             ? 'bg-indigo-50 text-indigo-700 border border-indigo-200'
                             : u.role === 'THU_KHO'
                             ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                             : 'bg-blue-50 text-blue-700 border border-blue-200'
                         }`}
                       >
-                        {getUserRoleLabel(u.role)}
+                        {isMainAdmin ? 'Quản trị viên Hệ thống' : getUserRoleLabel(u.role)}
                       </span>
                     </td>
 
@@ -405,7 +439,19 @@ export const UserManagementView: React.FC = () => {
 
                     {/* Contact */}
                     <td className="py-3.5 px-3 text-slate-500 whitespace-nowrap">
-                      <div>{u.email || '-'}</div>
+                      <div className="flex items-center gap-1.5">
+                        {u.authProvider === 'google' || (u.email && u.email.includes('@')) ? (
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-red-50 text-red-700 border border-red-200 font-semibold">
+                            <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
+                            Google Mail
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-slate-100 text-slate-600 border border-slate-200">
+                            Nội bộ
+                          </span>
+                        )}
+                        <span className="text-slate-800 font-medium">{u.email || u.username}</span>
+                      </div>
                       <div className="text-[11px] text-slate-400">{u.phone || ''}</div>
                     </td>
 
@@ -468,23 +514,25 @@ export const UserManagementView: React.FC = () => {
                           <button
                             onClick={() => handleOpenEdit(u)}
                             className="p-1.5 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors"
-                            title="Sửa thông tin / Đổi mật khẩu"
+                            title="Sửa thông tin tài khoản"
                           >
                             <Edit2 className="w-4 h-4" />
                           </button>
 
                           <button
                             onClick={() => handleToggleLock(u)}
-                            disabled={isCurrent || isOnlyActiveAdmin}
+                            disabled={isCurrent || isOnlyActiveAdmin || isMainAdmin}
                             className={`p-1.5 rounded transition-colors ${
-                              isCurrent || isOnlyActiveAdmin
+                              isCurrent || isOnlyActiveAdmin || isMainAdmin
                                 ? 'text-slate-200 cursor-not-allowed'
                                 : u.status === 'ACTIVE'
                                 ? 'text-slate-400 hover:text-amber-600 hover:bg-amber-50'
                                 : 'text-amber-600 hover:bg-amber-100'
                             }`}
                             title={
-                              isCurrent
+                              isMainAdmin
+                                ? 'Không thể khóa Quản trị viên Hệ thống chính (voduongphu@gmail.com)'
+                                : isCurrent
                                 ? 'Không thể khóa tài khoản đang đăng nhập'
                                 : isOnlyActiveAdmin
                                 ? 'Không thể khóa Quản trị viên hoạt động duy nhất'
@@ -502,14 +550,16 @@ export const UserManagementView: React.FC = () => {
 
                           <button
                             onClick={() => handleDelete(u)}
-                            disabled={isCurrent || isOnlyActiveAdmin}
+                            disabled={isCurrent || isOnlyActiveAdmin || isMainAdmin}
                             className={`p-1.5 rounded transition-colors ${
-                              isCurrent || isOnlyActiveAdmin
+                              isCurrent || isOnlyActiveAdmin || isMainAdmin
                                 ? 'text-slate-200 cursor-not-allowed'
                                 : 'text-slate-400 hover:text-rose-600 hover:bg-rose-50'
                             }`}
                             title={
-                              isCurrent
+                              isMainAdmin
+                                ? 'Không thể xóa tài khoản Quản trị viên Hệ thống chính (voduongphu@gmail.com)'
+                                : isCurrent
                                 ? 'Không thể xóa tài khoản đang đăng nhập'
                                 : isOnlyActiveAdmin
                                 ? 'Không thể xóa Quản trị viên hoạt động duy nhất'
@@ -555,34 +605,31 @@ export const UserManagementView: React.FC = () => {
                 </div>
               )}
 
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">
-                    Tên đăng nhập (Username) *
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={username}
-                    onChange={e => setUsername(e.target.value)}
-                    placeholder="VD: thukho_2..."
-                    className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none font-mono"
-                  />
+              <div className="p-3 bg-indigo-50/70 border border-indigo-100 rounded-xl text-xs text-indigo-900 flex items-start gap-2.5">
+                <ShieldCheck className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
+                <div className="leading-relaxed">
+                  Nhập địa chỉ <strong>Google Mail</strong> của người dùng để cấp quyền truy cập. Người dùng chỉ cần nhấn nút <em>&quot;Đăng nhập bằng Google Mail&quot;</em> trên màn hình đăng nhập là có thể truy cập hệ thống ngay lập tức. Dữ liệu được lưu trữ và đồng bộ đám mây Cloud Firestore.
                 </div>
+              </div>
 
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">
-                    Mật khẩu truy cập *
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={password}
-                    onChange={e => setPassword(e.target.value)}
-                    placeholder="Mật khẩu..."
-                    className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none font-mono"
-                  />
-                </div>
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">
+                  Địa chỉ Google Mail của người dùng *
+                </label>
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={e => {
+                    const val = e.target.value;
+                    setEmail(val);
+                    if (!username || username === email) {
+                      setUsername(val);
+                    }
+                  }}
+                  placeholder="VD: thukho.ptsc@gmail.com..."
+                  className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none text-slate-800"
+                />
               </div>
 
               <div>
@@ -595,7 +642,7 @@ export const UserManagementView: React.FC = () => {
                   value={fullName}
                   onChange={e => setFullName(e.target.value)}
                   placeholder="VD: Nguyễn Văn A..."
-                  className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none"
+                  className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none text-slate-800"
                 />
               </div>
 
@@ -607,7 +654,8 @@ export const UserManagementView: React.FC = () => {
                   <select
                     value={role}
                     onChange={e => setRole(e.target.value as UserRole)}
-                    className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none bg-white font-medium"
+                    disabled={editingUser ? isAdminEmail(editingUser.email) || isAdminEmail(editingUser.username) : false}
+                    className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none bg-white font-medium disabled:bg-slate-100"
                   >
                     <option value="ADMIN">Quản trị viên (Toàn quyền)</option>
                     <option value="THU_KHO">Thủ kho (Nhập / Xuất)</option>
@@ -637,19 +685,6 @@ export const UserManagementView: React.FC = () => {
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block font-medium text-slate-700 mb-1">
-                    Email
-                  </label>
-                  <input
-                    type="email"
-                    value={email}
-                    onChange={e => setEmail(e.target.value)}
-                    placeholder="email@khovattu.pro..."
-                    className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="block font-medium text-slate-700 mb-1">
                     Số điện thoại
                   </label>
                   <input
@@ -657,9 +692,38 @@ export const UserManagementView: React.FC = () => {
                     value={phone}
                     onChange={e => setPhone(e.target.value)}
                     placeholder="09xx.xxx.xxx..."
-                    className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none"
+                    className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none text-slate-800"
                   />
                 </div>
+
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">
+                    Tên đăng nhập nội bộ
+                  </label>
+                  <input
+                    type="text"
+                    value={username}
+                    onChange={e => setUsername(e.target.value)}
+                    placeholder={email ? email.split('@')[0] : 'thukho_01'}
+                    className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none font-mono text-slate-800"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block font-medium text-slate-700 mb-1">
+                  Mật khẩu đăng nhập nội bộ dự phòng (tùy chọn)
+                </label>
+                <input
+                  type="text"
+                  value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  placeholder="Để trống nếu người dùng chỉ đăng nhập bằng Google Mail..."
+                  className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none font-mono text-slate-800"
+                />
+                <span className="text-[11px] text-slate-400 mt-1 block">
+                  Người dùng có thể đăng nhập bằng Google Mail trực tiếp mà không cần nhớ mật khẩu này.
+                </span>
               </div>
 
               <div>
@@ -753,18 +817,18 @@ export const UserManagementView: React.FC = () => {
           title="Xác nhận xóa toàn bộ dữ liệu & người dùng"
           message="Bạn có chắc chắn muốn xóa TOÀN BỘ dữ liệu hiện tại (bao gồm tất cả người dùng, vật tư và giao dịch) để bắt đầu lại từ đầu?"
           itemDetails={[
-            { label: 'Tài khoản admin mặc định', value: 'admin' },
-            { label: 'Mật khẩu mặc định', value: 'admin123' },
+            { label: 'Quản trị viên chính', value: 'voduongphu@gmail.com (Google Mail)' },
+            { label: 'Tài khoản nội bộ dự phòng', value: 'admin / admin123' },
             { label: 'Dữ liệu vật tư & giao dịch', value: 'Xóa hoàn toàn về 0' },
             { label: 'Danh sách người dùng khác', value: 'Xóa toàn bộ' },
           ]}
-          warningNote="Hành động này sẽ xóa sạch dữ liệu trên toàn bộ hệ thống và thiết bị đồng bộ. Chỉ giữ lại duy nhất tài khoản admin (admin/admin123)."
+          warningNote="Hành động này sẽ xóa sạch dữ liệu trên toàn bộ hệ thống và thiết bị đồng bộ. Giữ lại Quản trị viên chính voduongphu@gmail.com và tài khoản admin nội bộ dự phòng."
           confirmLabel="Xác nhận xóa sạch & Bắt đầu lại"
           onConfirm={() => {
             resetToDefaultData();
             setShowResetAllModal(false);
             setNotification({
-              text: 'Đã xóa toàn bộ dữ liệu thành công. Tài khoản admin duy nhất hiện tại: admin / admin123',
+              text: 'Đã xóa toàn bộ dữ liệu thành công. Quản trị viên chính: voduongphu@gmail.com (đăng nhập Google Mail).',
               type: 'success',
             });
           }}

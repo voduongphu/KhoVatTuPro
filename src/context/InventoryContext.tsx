@@ -30,8 +30,7 @@ import { firebaseFirestoreService, FirestoreConnectionState } from '../services/
 import { firestoreDiagnosticService, DiagnosticReport, DiagnosticStep } from '../services/firestoreDiagnosticService';
 import { DeviceInfo, getDeviceId, getDeviceInfo, getDeviceName } from '../utils/deviceHelper';
 import { sessionBus } from '../services/sessionBus';
-import { signInWithGoogle, signOutGoogle, isAdminEmail } from '../services/googleAuthService';
-import { sendRegistrationNotificationEmail, ADMIN_EMAIL } from '../services/gmailNotificationService';
+import { signInWithGoogle, signOutGoogle, isAdminEmail, ADMIN_EMAIL } from '../services/googleAuthService';
 import {
   DeletedRegistry,
   generateCategoryCodeFromName,
@@ -79,40 +78,13 @@ interface InventoryContextType {
   updateUser: (id: string, updates: Partial<User>) => { success: boolean; error?: string };
   deleteUser: (id: string) => { success: boolean; error?: string };
 
-  // Google Mail Management & User Registrations
-  userRegistrations: UserRegistrationRequest[];
-  pendingRegistrationsCount: number;
+  // Google Mail Authentication & User Management
   loginWithGoogle: () => Promise<{
     success: boolean;
     user?: User;
-    code?: 'SUCCESS' | 'NOT_REGISTERED' | 'PENDING_APPROVAL' | 'REJECTED' | 'ACCOUNT_LOCKED';
+    code?: 'SUCCESS' | 'NOT_AUTHORIZED' | 'ACCOUNT_LOCKED';
     error?: string;
-    email?: string;
-    displayName?: string;
-    photoURL?: string | null;
-    accessToken?: string | null;
   }>;
-  registerWithGoogle: (data: {
-    email: string;
-    fullName: string;
-    phone: string;
-    requestedRole: UserRole;
-    accessToken?: string | null;
-  }) => Promise<{
-    success: boolean;
-    error?: string;
-    emailSent: boolean;
-    emailError?: string;
-  }>;
-  approveUserRegistration: (
-    requestId: string,
-    role: UserRole,
-    assignedWarehouseId: string
-  ) => Promise<{ success: boolean; error?: string }>;
-  rejectUserRegistration: (
-    requestId: string,
-    reason?: string
-  ) => Promise<{ success: boolean; error?: string }>;
 
   // Warehouse Management
   addWarehouse: (data: Omit<Warehouse, 'id'>) => {
@@ -1300,6 +1272,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   };
 
   const logout = useCallback(() => {
+    signOutGoogle().catch(() => {});
     if (currentUser) {
       const cur = stateRef.current;
       const currentDeviceId = getDeviceId();
@@ -1394,6 +1367,163 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     [currentUser, pushCloudSyncImmediately]
   );
 
+  // Google Mail Authentication & User Authorization
+  const loginWithGoogle = useCallback(async (): Promise<{
+    success: boolean;
+    user?: User;
+    code?: 'SUCCESS' | 'NOT_AUTHORIZED' | 'ACCOUNT_LOCKED';
+    error?: string;
+  }> => {
+    try {
+      // 1. Luôn làm mới dữ liệu từ Firestore trước khi xác thực
+      try {
+        const remotePayload = await firebaseFirestoreService.fetchPayload();
+        if (remotePayload) {
+          applyRemotePayloadAdditive(remotePayload);
+        }
+      } catch (err) {
+        console.warn('Làm mới người dùng từ Firestore trước khi đăng nhập Google:', err);
+      }
+
+      // 2. Mở cửa sổ đăng nhập Google popup
+      const googleResult = await signInWithGoogle();
+      const email = googleResult.email.toLowerCase().trim();
+      const currentDeviceId = getDeviceId();
+      const currentDeviceName = getDeviceName();
+
+      let targetUser = stateRef.current.users.find(
+        u => (u.email && u.email.toLowerCase().trim() === email) ||
+             (u.username && u.username.toLowerCase().trim() === email)
+      );
+
+      // 3. Nếu là Admin tối cao (voduongphu@gmail.com): tự động cấp quyền Quản trị viên cao nhất
+      if (isAdminEmail(email)) {
+        const nowIso = new Date().toISOString();
+        if (!targetUser) {
+          // Tạo mới tài khoản Admin chính nếu chưa có trong danh sách
+          targetUser = {
+            id: 'USR-ADMIN-VODUONGPHU',
+            username: ADMIN_EMAIL,
+            fullName: googleResult.displayName || 'Võ Dương Phú (Admin)',
+            role: 'ADMIN',
+            email: ADMIN_EMAIL,
+            phone: '0901.156.220',
+            assignedWarehouseId: 'ALL',
+            status: 'ACTIVE',
+            createdAt: nowIso.replace('T', ' ').substring(0, 16),
+            authProvider: 'google',
+            googleUid: googleResult.user.uid,
+            avatarUrl: googleResult.photoURL || undefined,
+            activeDeviceId: currentDeviceId,
+            activeDeviceName: currentDeviceName,
+            lastLogin: nowIso.replace('T', ' ').substring(0, 16),
+            lastActiveAt: nowIso,
+            updatedAt: nowIso,
+          };
+          const cur = stateRef.current;
+          const nextUsers = [...cur.users, targetUser];
+          setUsers(nextUsers);
+          setCurrentUser(targetUser);
+          setSessionTerminatedReason(null);
+          try {
+            localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(nextUsers));
+            localStorage.setItem(STORAGE_KEYS.AUTH, JSON.stringify(targetUser));
+          } catch {}
+          pushCloudSyncImmediately(cur.items, cur.transactions, cur.warehouses, nextUsers, cur.deletedRegistry, 'admin-google-init');
+          return { success: true, user: targetUser, code: 'SUCCESS' };
+        } else {
+          // Cập nhật thông tin Admin hiện có
+          const updatedAdmin: User = {
+            ...targetUser,
+            role: 'ADMIN',
+            status: 'ACTIVE',
+            email: ADMIN_EMAIL,
+            authProvider: 'google',
+            googleUid: googleResult.user.uid,
+            avatarUrl: googleResult.photoURL || targetUser.avatarUrl,
+            activeDeviceId: currentDeviceId,
+            activeDeviceName: currentDeviceName,
+            lastLogin: nowIso.replace('T', ' ').substring(0, 16),
+            lastActiveAt: nowIso,
+            updatedAt: nowIso,
+          };
+          const cur = stateRef.current;
+          const nextUsers = cur.users.map(u => (u.id === targetUser!.id ? updatedAdmin : u));
+          setUsers(nextUsers);
+          setCurrentUser(updatedAdmin);
+          setSessionTerminatedReason(null);
+          try {
+            localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(nextUsers));
+            localStorage.setItem(STORAGE_KEYS.AUTH, JSON.stringify(updatedAdmin));
+          } catch {}
+          pushCloudSyncImmediately(cur.items, cur.transactions, cur.warehouses, nextUsers, cur.deletedRegistry, 'admin-google-login');
+          return { success: true, user: updatedAdmin, code: 'SUCCESS' };
+        }
+      }
+
+      // 4. Nếu là người dùng khác: kiểm tra xem đã được Quản trị viên voduongphu@gmail.com thêm vào chưa
+      if (!targetUser) {
+        await signOutGoogle();
+        return {
+          success: false,
+          code: 'NOT_AUTHORIZED',
+          error: `Tài khoản Google Mail "${email}" chưa được Quản trị viên (voduongphu@gmail.com) cấp quyền truy cập vào hệ thống. Vui lòng liên hệ Quản trị viên để được thêm vào danh sách người dùng.`,
+        };
+      }
+
+      // 5. Kiểm tra nếu tài khoản đang bị khóa
+      if (targetUser.status === 'LOCKED') {
+        await signOutGoogle();
+        return {
+          success: false,
+          code: 'ACCOUNT_LOCKED',
+          error: 'Tài khoản của bạn đã bị khóa bởi Quản trị viên.',
+        };
+      }
+
+      // 6. Đăng nhập thành công cho người dùng Google Mail đã được phê duyệt
+      const nowIso = nextMonotonicIso(targetUser.updatedAt, targetUser.lastActiveAt);
+      const updatedUser: User = {
+        ...targetUser,
+        authProvider: 'google',
+        googleUid: googleResult.user.uid,
+        avatarUrl: googleResult.photoURL || targetUser.avatarUrl,
+        activeDeviceId: currentDeviceId,
+        activeDeviceName: currentDeviceName,
+        lastLogin: nowIso.replace('T', ' ').substring(0, 16),
+        lastActiveAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      const cur = stateRef.current;
+      const nextUsers = cur.users.map(u => (u.id === targetUser!.id ? updatedUser : u));
+      setUsers(nextUsers);
+      setCurrentUser(updatedUser);
+      setSessionTerminatedReason(null);
+
+      try {
+        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(nextUsers));
+        localStorage.setItem(STORAGE_KEYS.AUTH, JSON.stringify(updatedUser));
+      } catch {}
+
+      pushCloudSyncImmediately(cur.items, cur.transactions, cur.warehouses, nextUsers, cur.deletedRegistry, 'google-user-login');
+      sessionBus.broadcast({
+        type: 'LOGIN',
+        userId: updatedUser.id,
+        deviceId: currentDeviceId,
+        deviceName: currentDeviceName,
+      });
+
+      return { success: true, user: updatedUser, code: 'SUCCESS' };
+    } catch (err: any) {
+      console.error('[GoogleAuth] Error during login:', err);
+      return {
+        success: false,
+        error: err?.message || 'Đăng nhập Google thất bại hoặc cửa sổ đăng nhập đã bị đóng.',
+      };
+    }
+  }, [applyRemotePayloadAdditive, pushCloudSyncImmediately]);
+
   // User Management
   const addUser = (userData: Omit<User, 'id' | 'createdAt'>): { success: boolean; error?: string } => {
     if (!currentUser || currentUser.role !== 'ADMIN') {
@@ -1402,19 +1532,26 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
     const cur = stateRef.current;
     const trimmedUsername = userData.username.trim().toLowerCase();
+    const trimmedEmail = (userData.email || '').trim().toLowerCase();
+
     if (cur.users.some(u => u.username.toLowerCase() === trimmedUsername)) {
-      return { success: false, error: `Tên đăng nhập "${userData.username}" đã tồn tại.` };
+      return { success: false, error: `Tên đăng nhập / Email "${userData.username}" đã tồn tại trong hệ thống.` };
+    }
+    if (trimmedEmail && cur.users.some(u => u.email && u.email.toLowerCase() === trimmedEmail)) {
+      return { success: false, error: `Địa chỉ Google Mail "${userData.email}" đã được gán cho một tài khoản khác.` };
     }
 
     const nowIso = nextMonotonicIso(
       cur.deletedRegistry[makeTombstoneKey('USER', trimmedUsername)],
-      cur.deletedRegistry[makeTombstoneKey('USER', 'usr-admin')],
+      cur.deletedRegistry[makeTombstoneKey('USER', trimmedEmail)],
       Object.values(cur.deletedRegistry)
     );
     const newUser: User = {
       ...userData,
       id: `USR-${Date.now()}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`,
       username: trimmedUsername,
+      email: trimmedEmail || (trimmedUsername.includes('@') ? trimmedUsername : ''),
+      authProvider: userData.authProvider || ((trimmedEmail.includes('@') || trimmedUsername.includes('@')) ? 'google' : 'local'),
       createdAt: nowIso.replace('T', ' ').substring(0, 16),
       updatedAt: nowIso,
     };
@@ -1423,8 +1560,8 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const nextReg = { ...cur.deletedRegistry };
     delete nextReg[makeTombstoneKey('USER', newUser.id)];
     delete nextReg[makeTombstoneKey('USER', trimmedUsername)];
-    if (trimmedUsername === 'admin') {
-      delete nextReg[makeTombstoneKey('USER', 'usr-admin')];
+    if (trimmedEmail) {
+      delete nextReg[makeTombstoneKey('USER', trimmedEmail)];
     }
     const legacy = extractLegacyDeletedArrays(nextReg);
 
@@ -1449,16 +1586,36 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
 
     const cur = stateRef.current;
+    const existingUser = cur.users.find(u => u.id === id);
+    if (!existingUser) {
+      return { success: false, error: 'Không tìm thấy tài khoản người dùng.' };
+    }
+
+    // Bảo vệ Quản trị viên tối cao: voduongphu@gmail.com
+    const isVoduongphu =
+      existingUser.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase() ||
+      existingUser.username?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase();
+
+    if (isVoduongphu) {
+      if (updates.role && updates.role !== 'ADMIN') {
+        return { success: false, error: 'Không thể hạ quyền Quản trị viên Hệ thống chính (voduongphu@gmail.com)!' };
+      }
+      if (updates.status && updates.status !== 'ACTIVE') {
+        return { success: false, error: 'Không thể khóa Quản trị viên Hệ thống chính (voduongphu@gmail.com)!' };
+      }
+    }
+
     if (updates.username) {
       const trimmed = updates.username.trim().toLowerCase();
       if (cur.users.some(u => u.id !== id && u.username.toLowerCase() === trimmed)) {
         return { success: false, error: `Tên đăng nhập "${updates.username}" đã bị trùng lặp.` };
       }
     }
-
-    const existingUser = cur.users.find(u => u.id === id);
-    if (!existingUser) {
-      return { success: false, error: 'Không tìm thấy tài khoản người dùng.' };
+    if (updates.email) {
+      const trimmedEmail = updates.email.trim().toLowerCase();
+      if (cur.users.some(u => u.id !== id && u.email && u.email.toLowerCase() === trimmedEmail)) {
+        return { success: false, error: `Địa chỉ Google Mail "${updates.email}" đã được gán cho một tài khoản khác.` };
+      }
     }
 
     const simulatedNextUser = { ...existingUser, ...updates };
@@ -1518,9 +1675,21 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return { success: false, error: 'Không tìm thấy tài khoản cần xóa.' };
     }
 
+    // Bảo vệ Quản trị viên tối cao: voduongphu@gmail.com
+    const isVoduongphu =
+      targetUser.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase() ||
+      targetUser.username?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase();
+
+    if (isVoduongphu) {
+      return { success: false, error: 'Không thể xóa tài khoản Quản trị viên Hệ thống chính (voduongphu@gmail.com)!' };
+    }
+
     const targetNormUsername = targetUser.username?.trim().toLowerCase();
+    const targetNormEmail = targetUser.email?.trim().toLowerCase();
     const updatedUsers = cur.users.filter(
-      u => u.id !== id && (!targetNormUsername || u.username.trim().toLowerCase() !== targetNormUsername)
+      u => u.id !== id &&
+           (!targetNormUsername || u.username.trim().toLowerCase() !== targetNormUsername) &&
+           (!targetNormEmail || u.email.trim().toLowerCase() !== targetNormEmail)
     );
 
     const remainingActiveAdmins = updatedUsers.filter(
@@ -1548,10 +1717,9 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
     if (targetNormUsername) {
       nextReg[makeTombstoneKey('USER', targetNormUsername)] = nowIso;
-      if (targetNormUsername === 'admin') {
-        nextReg[makeTombstoneKey('USER', 'usr-admin')] = nowIso;
-        nextReg[makeTombstoneKey('USER', 'admin')] = nowIso;
-      }
+    }
+    if (targetNormEmail) {
+      nextReg[makeTombstoneKey('USER', targetNormEmail)] = nowIso;
     }
     const legacy = extractLegacyDeletedArrays(nextReg);
 
@@ -3712,6 +3880,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         users,
         currentUser,
         login,
+        loginWithGoogle,
         forceLogoutOtherDeviceAndLogin,
         logout,
         revokeUserSession,

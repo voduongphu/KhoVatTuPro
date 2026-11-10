@@ -6,17 +6,15 @@ import {
   onAuthStateChanged,
 } from 'firebase/auth';
 import { auth } from './firebase';
-import { ADMIN_EMAIL } from './gmailNotificationService';
 
-// Cấu hình Google Auth Provider với scope Gmail send theo yêu cầu
+export const ADMIN_EMAIL = 'voduongphu@gmail.com';
+
+// Cấu hình Google Auth Provider đơn giản và nhanh chóng
 const provider = new GoogleAuthProvider();
-provider.addScope('https://www.googleapis.com/auth/gmail.send');
 provider.setCustomParameters({
   prompt: 'select_account',
 });
 
-// Cache access token trong bộ nhớ tạm (không lưu vào localStorage theo nguyên tắc bảo mật)
-let cachedAccessToken: string | null = null;
 let isSigningIn = false;
 
 export interface GoogleAuthResult {
@@ -24,12 +22,11 @@ export interface GoogleAuthResult {
   email: string;
   displayName: string;
   photoURL?: string | null;
-  accessToken?: string | null;
   isAdmin: boolean;
 }
 
 /**
- * Kiểm tra xem email có phải là quản trị viên hệ thống không
+ * Kiểm tra xem email có phải là quản trị viên hệ thống (voduongphu@gmail.com) không
  */
 export function isAdminEmail(email: string | null | undefined): boolean {
   if (!email) return false;
@@ -40,20 +37,15 @@ export function isAdminEmail(email: string | null | undefined): boolean {
  * Khởi tạo listener theo dõi trạng thái đăng nhập Firebase Auth
  */
 export function initGoogleAuthListener(
-  onUserChanged: (user: FirebaseUser | null, accessToken: string | null) => void
+  onUserChanged: (user: FirebaseUser | null) => void
 ): () => void {
   return onAuthStateChanged(auth, async (user: FirebaseUser | null) => {
-    if (!user) {
-      cachedAccessToken = null;
-      onUserChanged(null, null);
-    } else {
-      onUserChanged(user, cachedAccessToken);
-    }
+    onUserChanged(user);
   });
 }
 
 /**
- * Đăng nhập bằng Google Popup
+ * Đăng nhập bằng Google Mail Popup
  */
 export async function signInWithGoogle(): Promise<GoogleAuthResult> {
   if (isSigningIn) {
@@ -63,10 +55,7 @@ export async function signInWithGoogle(): Promise<GoogleAuthResult> {
   isSigningIn = true;
   try {
     const result = await signInWithPopup(auth, provider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    cachedAccessToken = credential?.accessToken || null;
-
-    const email = result.user.email || '';
+    const email = (result.user.email || '').trim().toLowerCase();
     const displayName = result.user.displayName || email.split('@')[0];
 
     return {
@@ -74,7 +63,6 @@ export async function signInWithGoogle(): Promise<GoogleAuthResult> {
       email,
       displayName,
       photoURL: result.user.photoURL,
-      accessToken: cachedAccessToken,
       isAdmin: isAdminEmail(email),
     };
   } catch (error: any) {
@@ -86,17 +74,9 @@ export async function signInWithGoogle(): Promise<GoogleAuthResult> {
 }
 
 /**
- * Lấy access token hiện tại được lưu trong bộ nhớ
- */
-export function getGoogleAccessToken(): string | null {
-  return cachedAccessToken;
-}
-
-/**
  * Đăng xuất tài khoản Google
  */
 export async function signOutGoogle(): Promise<void> {
-  cachedAccessToken = null;
   try {
     await signOut(auth);
   } catch (err) {
