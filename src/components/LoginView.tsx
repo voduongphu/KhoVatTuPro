@@ -15,7 +15,6 @@ import {
   Laptop,
   CheckCircle2,
   Info,
-  Zap,
 } from 'lucide-react';
 import { useInventory } from '../context/InventoryContext';
 import { formatDate } from '../utils/formatters';
@@ -30,7 +29,6 @@ interface SessionConflictInfo {
 export const LoginView: React.FC = () => {
   const {
     login,
-    loginWithGoogle,
     forceLogoutOtherDeviceAndLogin,
     sessionTerminatedReason,
     clearSessionTerminatedReason,
@@ -43,13 +41,6 @@ export const LoginView: React.FC = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [isGoogleLoading, setIsGoogleLoading] = useState(false);
-  const [googleNotice, setGoogleNotice] = useState<{
-    title: string;
-    message: string;
-    email?: string;
-    isError?: boolean;
-  } | null>(null);
 
   // Multi-device conflict dialog state
   const [conflictInfo, setConflictInfo] = useState<SessionConflictInfo | null>(null);
@@ -57,44 +48,9 @@ export const LoginView: React.FC = () => {
   const [conflictFeedback, setConflictFeedback] = useState<string | null>(null);
   const [simulatedNotice, setSimulatedNotice] = useState<string | null>(null);
 
-  const handleGoogleLogin = async () => {
-    setError('');
-    setGoogleNotice(null);
-    setConflictInfo(null);
-    setConflictFeedback(null);
-    setIsGoogleLoading(true);
-
-    try {
-      const res = await loginWithGoogle();
-      setIsGoogleLoading(false);
-
-      if (!res.success) {
-        if (res.code === 'NOT_AUTHORIZED') {
-          setGoogleNotice({
-            title: 'Tài khoản chưa được cấp quyền truy cập',
-            message: res.error || 'Tài khoản Google Mail này chưa được Quản trị viên (voduongphu@gmail.com) thêm vào hệ thống. Vui lòng liên hệ Quản trị viên để được cấp tài khoản.',
-            isError: true,
-          });
-        } else if (res.code === 'ACCOUNT_LOCKED') {
-          setGoogleNotice({
-            title: 'Tài khoản đang bị tạm khóa',
-            message: 'Tài khoản của bạn đã bị khóa bởi Quản trị viên. Vui lòng liên hệ Quản trị viên (voduongphu@gmail.com) để được mở khóa.',
-            isError: true,
-          });
-        } else {
-          setError(res.error || 'Đăng nhập bằng Google Mail không thành công.');
-        }
-      }
-    } catch (err: any) {
-      setIsGoogleLoading(false);
-      setError(err?.message || 'Có lỗi xảy ra khi kết nối tới Google Mail.');
-    }
-  };
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    setGoogleNotice(null);
     setConflictInfo(null);
     setConflictFeedback(null);
     setIsLoading(true);
@@ -107,37 +63,6 @@ export const LoginView: React.FC = () => {
         if (res.code === 'SESSION_ACTIVE_ON_ANOTHER_DEVICE') {
           setConflictInfo({
             username: username.trim(),
-            otherDeviceName: res.otherDevice?.name || 'Thiết bị khác',
-            otherDeviceId: res.otherDevice?.id,
-            lastActiveAt: res.otherDevice?.lastActiveAt,
-          });
-        } else {
-          setError(res.error || 'Đăng nhập không thành công.');
-        }
-      }
-    } catch {
-      setIsLoading(false);
-      setError('Đăng nhập không thành công.');
-    }
-  };
-
-  const handleQuickAdminLogin = async (adminUser: string, adminPass: string) => {
-    setUsername(adminUser);
-    setPassword(adminPass);
-    setError('');
-    setGoogleNotice(null);
-    setConflictInfo(null);
-    setConflictFeedback(null);
-    setIsLoading(true);
-
-    try {
-      const res = await login(adminUser, adminPass);
-      setIsLoading(false);
-
-      if (!res.success) {
-        if (res.code === 'SESSION_ACTIVE_ON_ANOTHER_DEVICE') {
-          setConflictInfo({
-            username: adminUser.trim(),
             otherDeviceName: res.otherDevice?.name || 'Thiết bị khác',
             otherDeviceId: res.otherDevice?.id,
             lastActiveAt: res.otherDevice?.lastActiveAt,
@@ -226,7 +151,7 @@ export const LoginView: React.FC = () => {
       <div className="mt-8 sm:mx-auto sm:w-full sm:max-w-md relative z-10">
         <div className="bg-slate-800/90 backdrop-blur-md py-8 px-6 shadow-2xl rounded-2xl border border-slate-700/80 sm:px-10">
           
-          {/* Banner: Session Terminated Notice (if user was kicked from another device or admin) */}
+          {/* Banner: Session Terminated Notice */}
           {sessionTerminatedReason && (
             <div className="mb-5 p-3.5 bg-amber-500/15 border border-amber-500/30 rounded-xl text-xs text-amber-200 flex items-start gap-2.5 animate-fadeIn">
               <ShieldAlert className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
@@ -237,7 +162,7 @@ export const LoginView: React.FC = () => {
               <button
                 type="button"
                 onClick={clearSessionTerminatedReason}
-                className="text-amber-400 hover:text-amber-200 p-0.5 shrink-0"
+                className="text-amber-400 hover:text-amber-200 p-0.5 shrink-0 cursor-pointer"
                 title="Đóng thông báo"
               >
                 <X className="w-4 h-4" />
@@ -245,140 +170,14 @@ export const LoginView: React.FC = () => {
             </div>
           )}
 
-          {/* Google Mail Notice (Unauthorized or locked) */}
-          {googleNotice && (
-            <div className="mb-5 p-4 bg-amber-500/15 border-2 border-amber-500/40 rounded-xl text-xs space-y-2.5 animate-fadeIn">
-              <div className="flex items-start gap-2.5">
-                <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-                <div className="flex-1">
-                  <div className="font-bold text-amber-300 text-sm mb-1">{googleNotice.title}</div>
-                  <div className="text-amber-100/90 leading-relaxed">{googleNotice.message}</div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setGoogleNotice(null)}
-                  className="text-amber-400 hover:text-amber-200 p-0.5"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-              <div className="p-2.5 bg-slate-900/80 rounded-lg border border-slate-700/80 text-[11px] text-slate-300 flex items-center justify-between">
-                <span>Quản trị viên hệ thống:</span>
-                <span className="font-mono text-amber-300 font-semibold">voduongphu@gmail.com</span>
-              </div>
-            </div>
-          )}
-
-          {/* Primary Action: Sign In With Google Mail */}
-          {!conflictInfo && (
-            <div className="mb-5 space-y-2">
-              <button
-                type="button"
-                onClick={handleGoogleLogin}
-                disabled={isGoogleLoading || isLoading}
-                className="w-full flex items-center justify-center gap-3 py-3 px-4 rounded-xl text-sm font-semibold text-slate-900 bg-white hover:bg-slate-100 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-white transition-all shadow-lg hover:shadow-xl disabled:opacity-50 cursor-pointer"
-              >
-                {isGoogleLoading ? (
-                  <>
-                    <RefreshCw className="w-4 h-4 animate-spin text-slate-700" />
-                    <span className="text-slate-700">Đang kết nối Google Mail...</span>
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-5 h-5 shrink-0" viewBox="0 0 24 24">
-                      <path
-                        fill="#4285F4"
-                        d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
-                      />
-                      <path
-                        fill="#34A853"
-                        d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-                      />
-                      <path
-                        fill="#FBBC05"
-                        d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"
-                      />
-                      <path
-                        fill="#EA4335"
-                        d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"
-                      />
-                    </svg>
-                    <span>Đăng nhập bằng Google Mail</span>
-                  </>
-                )}
-              </button>
-
-              <div className="flex items-center justify-between text-[11px] text-slate-400 px-1">
-                <span>Quản trị viên: <strong className="text-amber-300">voduongphu@gmail.com</strong></span>
-                <span className="text-emerald-400 font-medium flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                  Đồng bộ Cloud Supabase Realtime
-                </span>
-              </div>
-
-              {/* Quick 1-Click Admin Login Shortcut */}
-              <div className="mt-3.5 p-3 bg-gradient-to-r from-emerald-500/10 via-teal-500/10 to-indigo-500/10 border border-emerald-500/40 rounded-xl">
-                <div className="flex items-center justify-between gap-2 mb-2">
-                  <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-300">
-                    <Zap className="w-4 h-4 text-emerald-400 fill-emerald-400 shrink-0" />
-                    <span>Đăng nhập 1-Click Quản trị viên</span>
-                  </div>
-                  <span className="text-[10px] text-emerald-300 bg-emerald-950/80 px-2 py-0.5 rounded-full border border-emerald-500/30 font-medium">
-                    Toàn quyền
-                  </span>
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    disabled={isLoading}
-                    onClick={() => handleQuickAdminLogin('voduongphu@gmail.com', 'admin123')}
-                    className="flex items-center justify-between p-2 bg-slate-900/90 hover:bg-slate-800 border border-emerald-500/50 hover:border-emerald-400 rounded-lg text-left transition-all group cursor-pointer"
-                    title="Đăng nhập ngay lập tức với tài khoản Quản trị viên chính voduongphu@gmail.com"
-                  >
-                    <div>
-                      <div className="text-xs font-bold text-white group-hover:text-emerald-300 truncate">
-                        voduongphu@gmail.com
-                      </div>
-                      <div className="text-[10px] text-slate-400">
-                        Mật khẩu: <span className="font-mono text-emerald-400 font-semibold">admin123</span>
-                      </div>
-                    </div>
-                    <ArrowRight className="w-4 h-4 text-emerald-400 group-hover:translate-x-0.5 transition-transform shrink-0 ml-1" />
-                  </button>
-
-                  <button
-                    type="button"
-                    disabled={isLoading}
-                    onClick={() => handleQuickAdminLogin('phuvo', 'abc123')}
-                    className="flex items-center justify-between p-2 bg-slate-900/90 hover:bg-slate-800 border border-slate-700 hover:border-indigo-400 rounded-lg text-left transition-all group cursor-pointer"
-                    title="Đăng nhập với bí danh quản trị phuvo"
-                  >
-                    <div>
-                      <div className="text-xs font-bold text-white group-hover:text-indigo-300 truncate">
-                        phuvo (Admin bí danh)
-                      </div>
-                      <div className="text-[10px] text-slate-400">
-                        Mật khẩu: <span className="font-mono text-indigo-400 font-semibold">abc123</span>
-                      </div>
-                    </div>
-                    <ArrowRight className="w-4 h-4 text-indigo-400 group-hover:translate-x-0.5 transition-transform shrink-0 ml-1" />
-                  </button>
-                </div>
-              </div>
-
-              {/* Divider */}
-              <div className="relative my-4 pt-1 flex items-center justify-center">
-                <div className="border-t border-slate-700 w-full" />
-                <span className="bg-slate-800 px-3 text-[11px] text-slate-400 uppercase tracking-wider whitespace-nowrap">
-                  Hoặc tự nhập thông tin đăng nhập
-                </span>
-              </div>
-            </div>
-          )}
-
           {/* Form standard login */}
           {!conflictInfo ? (
             <form className="space-y-4" onSubmit={handleSubmit}>
+              <div className="pb-1 text-center">
+                <h3 className="text-base font-bold text-white">Đăng nhập tài khoản</h3>
+                <p className="text-xs text-slate-400 mt-0.5">Nhập thông tin truy cập hệ thống quản lý</p>
+              </div>
+
               {error && (
                 <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-xs text-rose-300 flex items-center gap-2.5">
                   <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
@@ -399,7 +198,7 @@ export const LoginView: React.FC = () => {
                     required
                     value={username}
                     onChange={e => setUsername(e.target.value)}
-                    placeholder="voduongphu@gmail.com hoặc tên đăng nhập..."
+                    placeholder="Nhập tên đăng nhập hoặc email..."
                     className="block w-full pl-10 pr-3.5 py-2.5 text-sm bg-slate-900/80 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-colors"
                   />
                 </div>
@@ -418,20 +217,20 @@ export const LoginView: React.FC = () => {
                     required
                     value={password}
                     onChange={e => setPassword(e.target.value)}
-                    placeholder="Nhập mật khẩu (admin123 cho admin)..."
+                    placeholder="Nhập mật khẩu..."
                     className="block w-full pl-10 pr-10 py-2.5 text-sm bg-slate-900/80 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-colors font-mono"
                   />
                   <button
                     type="button"
                     onClick={() => setShowPassword(!showPassword)}
-                    className="absolute inset-y-0 right-0 pr-3.5 flex items-center text-slate-400 hover:text-slate-200"
+                    className="absolute inset-y-0 right-0 pr-3.5 flex items-center text-slate-400 hover:text-slate-200 cursor-pointer"
                   >
                     {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                   </button>
                 </div>
               </div>
 
-              <div>
+              <div className="pt-1">
                 <button
                   type="submit"
                   disabled={isLoading}
@@ -449,22 +248,6 @@ export const LoginView: React.FC = () => {
                     </>
                   )}
                 </button>
-              </div>
-
-              {/* Helpful accounts reminder */}
-              <div className="p-3 bg-slate-900/60 rounded-xl border border-slate-700/60 text-[11px] text-slate-400 space-y-1">
-                <div className="flex items-center justify-between">
-                  <span>👑 Quản trị viên chính:</span>
-                  <strong className="text-emerald-400 font-mono">voduongphu@gmail.com / admin123</strong>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span>🔑 Admin dự phòng:</span>
-                  <span className="text-slate-300 font-mono">phuvo / abc123</span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span>📦 Thủ kho:</span>
-                  <span className="text-slate-300 font-mono">cuongvo hoặc hieunl / 1234567</span>
-                </div>
               </div>
             </form>
           ) : (

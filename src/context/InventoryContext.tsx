@@ -1344,7 +1344,7 @@ export const InventoryProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return {
         success: false,
         code: 'INVALID_CREDENTIALS',
-        error: 'Mật khẩu không chính xác. Mật khẩu Quản trị viên mặc định là admin123 (hoặc abc123).',
+        error: 'Mật khẩu không chính xác. Vui lòng kiểm tra lại.',
       };
     }
 

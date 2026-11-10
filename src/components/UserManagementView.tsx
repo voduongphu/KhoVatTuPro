@@ -110,16 +110,22 @@ export const UserManagementView: React.FC = () => {
 
     const finalEmail = email.trim().toLowerCase();
     const finalUsername = (username.trim() || finalEmail).toLowerCase();
-    const finalPassword = password.trim() || 'google-auth-user';
+    const enteredPassword = password.trim();
 
     if (!finalEmail && !finalUsername) {
-      setFormError('Vui lòng nhập địa chỉ Google Mail hoặc Tên đăng nhập.');
+      setFormError('Vui lòng nhập địa chỉ Email hoặc Tên đăng nhập.');
+      return;
+    }
+    if (!editingUser && !enteredPassword) {
+      setFormError('Vui lòng nhập mật khẩu cho tài khoản mới.');
       return;
     }
     if (!fullName.trim()) {
       setFormError('Vui lòng nhập họ và tên người sử dụng.');
       return;
     }
+
+    const finalPassword = enteredPassword || (editingUser?.password ?? '123456');
 
     if (editingUser) {
       const isMainAdmin = isAdminEmail(editingUser.email) || isAdminEmail(editingUser.username);
@@ -137,7 +143,7 @@ export const UserManagementView: React.FC = () => {
         phone: phone.trim(),
         assignedWarehouseId,
         status: isMainAdmin ? 'ACTIVE' : status,
-        authProvider: finalEmail.includes('@') ? 'google' : 'local',
+        authProvider: 'local',
       });
 
       if (!res.success) {
@@ -154,7 +160,7 @@ export const UserManagementView: React.FC = () => {
         phone: phone.trim(),
         assignedWarehouseId,
         status,
-        authProvider: finalEmail.includes('@') ? 'google' : 'local',
+        authProvider: 'local',
       });
 
       if (!res.success) {
@@ -249,7 +255,7 @@ export const UserManagementView: React.FC = () => {
           <div className="flex items-center gap-2 flex-wrap">
             <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
               <Users className="w-5 h-5 text-indigo-600" />
-              <span>Quản Lý Người Sử Dụng &amp; Google Mail</span>
+              <span>Quản Lý Người Sử Dụng Hệ Thống</span>
             </h2>
             <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-50 border border-emerald-200 text-emerald-700 shadow-2xs">
               <span className="relative flex h-2 w-2">
@@ -260,7 +266,7 @@ export const UserManagementView: React.FC = () => {
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-1">
-            Quản trị viên chính: <strong className="text-indigo-600">voduongphu@gmail.com</strong>. Cấp quyền truy cập cho nhân viên bằng địa chỉ Google Mail của họ để đăng nhập nhanh không cần mật khẩu. Toàn bộ tài khoản và quyền hạn được lưu trữ và đồng bộ đám mây Supabase hai chiều.
+            Quản trị viên chính: <strong className="text-indigo-600">voduongphu@gmail.com</strong>. Quản lý phân quyền và cấp tài khoản đăng nhập cho nhân viên trong hệ thống. Toàn bộ tài khoản và quyền hạn được lưu trữ và đồng bộ đám mây Supabase hai chiều.
           </p>
         </div>
 
@@ -439,19 +445,7 @@ export const UserManagementView: React.FC = () => {
 
                     {/* Contact */}
                     <td className="py-3.5 px-3 text-slate-500 whitespace-nowrap">
-                      <div className="flex items-center gap-1.5">
-                        {u.authProvider === 'google' || (u.email && u.email.includes('@')) ? (
-                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-red-50 text-red-700 border border-red-200 font-semibold">
-                            <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
-                            Google Mail
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-slate-100 text-slate-600 border border-slate-200">
-                            Nội bộ
-                          </span>
-                        )}
-                        <span className="text-slate-800 font-medium">{u.email || u.username}</span>
-                      </div>
+                      <div className="text-slate-800 font-medium">{u.email || u.username}</div>
                       <div className="text-[11px] text-slate-400">{u.phone || ''}</div>
                     </td>
 
@@ -608,13 +602,13 @@ export const UserManagementView: React.FC = () => {
               <div className="p-3 bg-indigo-50/70 border border-indigo-100 rounded-xl text-xs text-indigo-900 flex items-start gap-2.5">
                 <ShieldCheck className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
                 <div className="leading-relaxed">
-                  Nhập địa chỉ <strong>Google Mail</strong> của người dùng để cấp quyền truy cập. Người dùng chỉ cần nhấn nút <em>&quot;Đăng nhập bằng Google Mail&quot;</em> trên màn hình đăng nhập là có thể truy cập hệ thống ngay lập tức. Dữ liệu được lưu trữ và đồng bộ đám mây Supabase Realtime.
+                  Cấp tài khoản và mật khẩu cho người dùng để truy cập hệ thống. Người dùng sẽ đăng nhập bằng Tên đăng nhập / Email và Mật khẩu được thiết lập. Dữ liệu được lưu trữ và đồng bộ đám mây Supabase Realtime.
                 </div>
               </div>
 
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">
-                  Địa chỉ Google Mail của người dùng *
+                  Địa chỉ Email của người dùng *
                 </label>
                 <input
                   type="email"
@@ -711,18 +705,21 @@ export const UserManagementView: React.FC = () => {
               </div>
 
               <div>
-                <label className="block font-medium text-slate-700 mb-1">
-                  Mật khẩu đăng nhập nội bộ dự phòng (tùy chọn)
+                <label className="block font-semibold text-slate-700 mb-1">
+                  {editingUser ? 'Mật khẩu mới (để trống nếu giữ nguyên)' : 'Mật khẩu đăng nhập *'}
                 </label>
                 <input
                   type="text"
+                  required={!editingUser}
                   value={password}
                   onChange={e => setPassword(e.target.value)}
-                  placeholder="Để trống nếu người dùng chỉ đăng nhập bằng Google Mail..."
+                  placeholder={editingUser ? 'Để trống nếu giữ nguyên mật khẩu cũ...' : 'Nhập mật khẩu cho tài khoản...'}
                   className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none font-mono text-slate-800"
                 />
                 <span className="text-[11px] text-slate-400 mt-1 block">
-                  Người dùng có thể đăng nhập bằng Google Mail trực tiếp mà không cần nhớ mật khẩu này.
+                  {editingUser
+                    ? 'Chỉ nhập nếu bạn muốn thay đổi mật khẩu cho người dùng này.'
+                    : 'Mật khẩu dùng để đăng nhập vào hệ thống.'}
                 </span>
               </div>
 
@@ -817,18 +814,17 @@ export const UserManagementView: React.FC = () => {
           title="Xác nhận xóa toàn bộ dữ liệu & người dùng"
           message="Bạn có chắc chắn muốn xóa TOÀN BỘ dữ liệu hiện tại (bao gồm tất cả người dùng, vật tư và giao dịch) để bắt đầu lại từ đầu?"
           itemDetails={[
-            { label: 'Quản trị viên chính', value: 'voduongphu@gmail.com (Google Mail)' },
-            { label: 'Tài khoản nội bộ dự phòng', value: 'admin / admin123' },
+            { label: 'Quản trị viên chính', value: 'voduongphu@gmail.com' },
             { label: 'Dữ liệu vật tư & giao dịch', value: 'Xóa hoàn toàn về 0' },
             { label: 'Danh sách người dùng khác', value: 'Xóa toàn bộ' },
           ]}
-          warningNote="Hành động này sẽ xóa sạch dữ liệu trên toàn bộ hệ thống và thiết bị đồng bộ. Giữ lại Quản trị viên chính voduongphu@gmail.com và tài khoản admin nội bộ dự phòng."
+          warningNote="Hành động này sẽ xóa sạch dữ liệu trên toàn bộ hệ thống và thiết bị đồng bộ. Giữ lại Quản trị viên chính voduongphu@gmail.com."
           confirmLabel="Xác nhận xóa sạch & Bắt đầu lại"
           onConfirm={() => {
             resetToDefaultData();
             setShowResetAllModal(false);
             setNotification({
-              text: 'Đã xóa toàn bộ dữ liệu thành công. Quản trị viên chính: voduongphu@gmail.com (đăng nhập Google Mail).',
+              text: 'Đã xóa toàn bộ dữ liệu thành công. Quản trị viên chính: voduongphu@gmail.com.',
               type: 'success',
             });
           }}
