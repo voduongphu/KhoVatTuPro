@@ -21,7 +21,7 @@ import { useInventory } from '../context/InventoryContext';
 import { User, UserRole } from '../types/inventory';
 import { formatDate, getUserRoleLabel } from '../utils/formatters';
 import { ConfirmDeleteModal } from './ConfirmDeleteModal';
-import { ADMIN_EMAIL, isAdminEmail } from '../services/googleAuthService';
+import { isAdminEmail } from '../services/googleAuthService';
 
 export const UserManagementView: React.FC = () => {
   const {
@@ -128,9 +128,9 @@ export const UserManagementView: React.FC = () => {
     const finalPassword = enteredPassword || (editingUser?.password ?? '123456');
 
     if (editingUser) {
-      const isMainAdmin = isAdminEmail(editingUser.email) || isAdminEmail(editingUser.username);
+      const isMainAdmin = isAdminEmail(editingUser.username);
       if (isMainAdmin && role !== 'ADMIN') {
-        setFormError('Không thể hạ quyền Quản trị viên Hệ thống chính (voduongphu@gmail.com)!');
+        setFormError('Không thể hạ quyền Quản trị viên duy nhất (phuvo)!');
         return;
       }
 
@@ -176,9 +176,9 @@ export const UserManagementView: React.FC = () => {
   const [notification, setNotification] = useState<{ text: string; type: 'error' | 'success' } | null>(null);
 
   const handleToggleLock = (user: User) => {
-    if (isAdminEmail(user.email) || isAdminEmail(user.username)) {
+    if (isAdminEmail(user.username)) {
       setNotification({
-        text: 'Không thể khóa tài khoản Quản trị viên Hệ thống chính (voduongphu@gmail.com)!',
+        text: 'Không thể khóa tài khoản Quản trị viên duy nhất (phuvo)!',
         type: 'error',
       });
       return;
@@ -206,9 +206,9 @@ export const UserManagementView: React.FC = () => {
   };
 
   const handleDelete = (user: User) => {
-    if (isAdminEmail(user.email) || isAdminEmail(user.username)) {
+    if (isAdminEmail(user.username)) {
       setNotification({
-        text: 'Không thể xóa tài khoản Quản trị viên Hệ thống chính (voduongphu@gmail.com)!',
+        text: 'Không thể xóa tài khoản Quản trị viên duy nhất (phuvo)!',
         type: 'error',
       });
       return;
@@ -266,7 +266,7 @@ export const UserManagementView: React.FC = () => {
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-1">
-            Quản trị viên chính: <strong className="text-indigo-600">voduongphu@gmail.com</strong>. Quản lý phân quyền và cấp tài khoản đăng nhập cho nhân viên trong hệ thống. Toàn bộ tài khoản và quyền hạn được lưu trữ và đồng bộ đám mây Supabase hai chiều.
+            Quản trị viên chính: <strong className="text-indigo-600">phuvo</strong>. Quản lý phân quyền và cấp tài khoản đăng nhập cho nhân viên trong hệ thống. Toàn bộ tài khoản và quyền hạn được lưu trữ và đồng bộ đám mây Supabase hai chiều.
           </p>
         </div>
 
@@ -375,7 +375,7 @@ export const UserManagementView: React.FC = () => {
               {users.map(u => {
                 const assignedWh = warehouses.find(w => w.id === u.assignedWarehouseId);
                 const isCurrent = u.id === currentUser?.id;
-                const isMainAdmin = isAdminEmail(u.email) || isAdminEmail(u.username);
+                const isMainAdmin = isAdminEmail(u.username);
                 const isOnlyActiveAdmin =
                   u.role === 'ADMIN' && u.status === 'ACTIVE' && activeAdminCount <= 1;
 
@@ -525,7 +525,7 @@ export const UserManagementView: React.FC = () => {
                             }`}
                             title={
                               isMainAdmin
-                                ? 'Không thể khóa Quản trị viên Hệ thống chính (voduongphu@gmail.com)'
+                                ? 'Không thể khóa Quản trị viên duy nhất (phuvo)'
                                 : isCurrent
                                 ? 'Không thể khóa tài khoản đang đăng nhập'
                                 : isOnlyActiveAdmin
@@ -552,7 +552,7 @@ export const UserManagementView: React.FC = () => {
                             }`}
                             title={
                               isMainAdmin
-                                ? 'Không thể xóa tài khoản Quản trị viên Hệ thống chính (voduongphu@gmail.com)'
+                                ? 'Không thể xóa tài khoản Quản trị viên duy nhất (phuvo)'
                                 : isCurrent
                                 ? 'Không thể xóa tài khoản đang đăng nhập'
                                 : isOnlyActiveAdmin
@@ -648,7 +648,7 @@ export const UserManagementView: React.FC = () => {
                   <select
                     value={role}
                     onChange={e => setRole(e.target.value as UserRole)}
-                    disabled={editingUser ? isAdminEmail(editingUser.email) || isAdminEmail(editingUser.username) : false}
+                    disabled={editingUser ? isAdminEmail(editingUser.username) : false}
                     className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none bg-white font-medium disabled:bg-slate-100"
                   >
                     <option value="ADMIN">Quản trị viên (Toàn quyền)</option>
@@ -814,17 +814,17 @@ export const UserManagementView: React.FC = () => {
           title="Xác nhận xóa toàn bộ dữ liệu & người dùng"
           message="Bạn có chắc chắn muốn xóa TOÀN BỘ dữ liệu hiện tại (bao gồm tất cả người dùng, vật tư và giao dịch) để bắt đầu lại từ đầu?"
           itemDetails={[
-            { label: 'Quản trị viên chính', value: 'voduongphu@gmail.com' },
+            { label: 'Quản trị viên duy nhất', value: 'phuvo' },
             { label: 'Dữ liệu vật tư & giao dịch', value: 'Xóa hoàn toàn về 0' },
             { label: 'Danh sách người dùng khác', value: 'Xóa toàn bộ' },
           ]}
-          warningNote="Hành động này sẽ xóa sạch dữ liệu trên toàn bộ hệ thống và thiết bị đồng bộ. Giữ lại Quản trị viên chính voduongphu@gmail.com."
+          warningNote="Hành động này sẽ xóa sạch dữ liệu trên toàn bộ hệ thống và thiết bị đồng bộ. Giữ lại Quản trị viên duy nhất phuvo."
           confirmLabel="Xác nhận xóa sạch & Bắt đầu lại"
           onConfirm={() => {
             resetToDefaultData();
             setShowResetAllModal(false);
             setNotification({
-              text: 'Đã xóa toàn bộ dữ liệu thành công. Quản trị viên chính: voduongphu@gmail.com.',
+              text: 'Đã xóa toàn bộ dữ liệu thành công. Quản trị viên duy nhất: phuvo.',
               type: 'success',
             });
           }}

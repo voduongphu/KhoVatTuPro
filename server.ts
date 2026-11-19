@@ -8,9 +8,25 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = 3000;
+const PORT = process.env.NGINX_PORT
+  ? Number(process.env.DEFAULT_APP_PORT) || 3000
+  : Number(process.env.PORT) || 3000;
 const STATE_FILE = path.resolve(__dirname, '.sync-state.json');
 const LEGACY_TOMBSTONE_ISO = '1970-01-01T00:00:01.000Z';
+
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = 5000
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 type DeletedRegistry = Record<string, string>;
 
@@ -929,10 +945,11 @@ async function fetchRemoteSupabaseIfConfigured(
   };
 
   try {
-    // 1. Query lightweight Sharded V2 manifest row (< 20KB)
-    const v2Res = await fetch(
+    // 1. Query lightweight Sharded V2 manifest row (< 20KB) with timeout
+    const v2Res = await fetchWithTimeout(
       `${supabaseUrl}/rest/v1/inventory_state?id=eq.manifest_v2&select=data`,
-      { headers }
+      { headers },
+      5000
     );
     if (v2Res.ok) {
       const v2Rows = await v2Res.json();
@@ -951,9 +968,10 @@ async function fetchRemoteSupabaseIfConfigured(
         for (let i = 0; i < allShardIds.length; i += 5) {
           const chunk = allShardIds.slice(i, i + 5);
           const inList = chunk.map(id => `"${id}"`).join(',');
-          const sRes = await fetch(
+          const sRes = await fetchWithTimeout(
             `${supabaseUrl}/rest/v1/inventory_state?id=in.(${encodeURIComponent(inList)})&select=id,data`,
-            { headers }
+            { headers },
+            5000
           );
           if (sRes.ok) {
             const sRows = await sRes.json();
@@ -1188,25 +1206,13 @@ async function startServer() {
     console.warn('[server] Could not parse initial .sync-state.json:', err);
   }
 
-  // On boot, also reconcile with external Supabase if configured
-  try {
-    const hasLargeBootState = Array.isArray(memoryState?.items) && memoryState.items.length > 120;
-    const remoteBoot = await fetchRemoteSupabaseIfConfigured(
-      memoryState?.supabaseConfig,
-      hasLargeBootState
-    );
-    if (remoteBoot && Object.keys(remoteBoot).length > 0) {
-      memoryState = memoryState
-        ? mergeServerStateDeterministic(memoryState, remoteBoot)
-        : remoteBoot;
-      await fs.promises.writeFile(STATE_FILE, JSON.stringify(memoryState), 'utf-8');
-    }
-  } catch {
-    // ignore boot sync error
-  }
-
   // Connected SSE clients for instant <50ms multi-user real-time broadcast
   const sseClients = new Set<express.Response>();
+
+  // Health check endpoint for Cloud Run / reverse proxy readiness probes
+  app.get('/api/health', (_req, res) => {
+    res.status(200).json({ ok: true, status: 'ready', timestamp: new Date().toISOString() });
+  });
 
   const broadcastStateToClients = (payload: any) => {
     if (!payload) return;
@@ -1384,7 +1390,7 @@ async function startServer() {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
-        middlewareMode: hmrDisabled ? true : { server: httpServer },
+        middlewareMode: true,
         hmr: hmrDisabled ? false : { server: httpServer },
         ws: hmrDisabled ? false : undefined,
         watch: hmrDisabled ? null : {},
@@ -1417,13 +1423,51 @@ async function startServer() {
     const distPath = path.join(__dirname, 'dist');
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      const indexHtml = path.join(distPath, 'index.html');
+      if (fs.existsSync(indexHtml)) {
+        res.sendFile(indexHtml);
+      } else {
+        res.status(503).send('Build output (dist/index.html) not found. Please run npm run build.');
+      }
     });
   }
 
+  httpServer.on('error', err => {
+    console.error('[server] HTTP server error:', err);
+  });
+
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`[server] Full-stack Inventory Sync Server running on http://0.0.0.0:${PORT}`);
+
+    // Reconcile with external Supabase in background AFTER server is listening so startup never blocks
+    const hasLargeBootState = Array.isArray(memoryState?.items) && memoryState.items.length > 120;
+    fetchRemoteSupabaseIfConfigured(memoryState?.supabaseConfig, hasLargeBootState)
+      .then(async remoteBoot => {
+        if (remoteBoot && Object.keys(remoteBoot).length > 0) {
+          memoryState = memoryState
+            ? mergeServerStateDeterministic(memoryState, remoteBoot)
+            : remoteBoot;
+          broadcastStateToClients(memoryState);
+          const tmpFile = `${STATE_FILE}.tmp`;
+          await fs.promises.writeFile(tmpFile, JSON.stringify(memoryState), 'utf-8');
+          await fs.promises.rename(tmpFile, STATE_FILE);
+        }
+      })
+      .catch(err => {
+        console.warn('[server] Background Supabase boot sync skipped:', err?.message || err);
+      });
   });
 }
 
-startServer();
+process.on('unhandledRejection', reason => {
+  console.error('[server] Unhandled promise rejection:', reason);
+});
+
+process.on('uncaughtException', err => {
+  console.error('[server] Uncaught exception:', err);
+});
+
+startServer().catch(err => {
+  console.error('[server] Fatal startup error:', err);
+  process.exit(1);
+});
